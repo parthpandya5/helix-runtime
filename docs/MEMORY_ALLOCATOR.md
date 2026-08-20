@@ -2,16 +2,18 @@
 
 ## Validation status
 
-The allocator metadata core is **implemented, CPU-validated, sanitizer-validated,
-and host-resource benchmarked**. Commit `746d0a5` passes 12 focused allocator tests
-and the full 62-test CPU suite under normal and ASan/UBSan builds. The CUDA 12.6
-warnings-as-errors build compiles `CudaMemoryResource`, two hardware-gated GPU
+The allocator metadata and generic deferred-reclamation layers are **implemented,
+CPU-validated, sanitizer-validated, and host-resource benchmarked**. Eighteen
+focused allocator/deferred tests and the full 68-test CPU suite pass under normal
+and ASan/UBSan builds. A CUDA 12.6 warnings-as-errors build compiles
+`CudaMemoryResource`, `StreamOrderedAllocator`, three hardware-gated allocator
 tests, and native-CUDA comparison benchmarks, but no CUDA allocator code has run on
 a physical GPU.
 
-Most importantly, the current immediate reuse path is not stream-safe and is not
-wired into Tensor storage. CPU metadata validation does not prove asynchronous GPU
-lifetime safety. M8 adds event-backed reclamation before that integration.
+The event-backed adapter is therefore compile-validated rather than hardware-
+validated. It is deliberately not wired into Tensor storage: Tensor does not yet
+track all streams that use an allocation, so it cannot satisfy the release-stream
+contract automatically. CPU completion tests do not prove CUDA event semantics.
 
 ## Why cache device allocations?
 
@@ -92,11 +94,13 @@ accidentally free stale A
 ```
 
 Helix therefore returns an `Allocation` descriptor containing a monotonic 64-bit
-ID, pointer, requested/rounded bytes, alignment, and device. Deallocation validates
-the active ID and every descriptor field. A copied handle can trigger a clean
-double-free error, and an old handle cannot free a newer allocation at the same
-address. `Allocation` is not independently RAII because its valid lifetime depends
-on the owning allocator.
+allocation ID, a process-unique allocator-instance ID, pointer, requested/rounded
+bytes, alignment, and device. Deallocation validates the allocator identity, active
+allocation ID, and every descriptor field. A copied handle can trigger a clean
+double-free error, an old handle cannot free a newer allocation at the same address,
+and even two allocator instances deliberately backed by the same address cannot
+accept one another's handles. `Allocation` is not independently RAII because its
+valid lifetime depends on the owning allocator.
 
 ## Coalescing and explicit release
 
@@ -153,18 +157,56 @@ run concurrently. Destroying an allocator concurrently with any method is invali
 The coarse lock is a correctness baseline; sharded locks or per-device bins require
 contention measurements.
 
-## Stream-safety boundary
+## Deferred reclamation and stream safety
 
 Kernel launch completion is asynchronous. Returning allocation A to the free list
 immediately after enqueueing a kernel that uses A can let a second allocation reuse
 the same bytes while the first kernel is still executing. That is a use-after-free
 even if the host-side owner is gone.
 
-The current API assumes the caller has already synchronized all device uses before
-`deallocate`. Its GPU test uses synchronous memset/copy operations for exactly this
-reason. M8 will associate frees with CUDA events/streams, hold them in a pending
-state, reclaim only after completion, and add pending bytes/counters. Until then,
-Tensor CUDA storage retains direct allocation/free semantics.
+```mermaid
+sequenceDiagram
+    participant H as Host
+    participant S as CUDA stream
+    participant A as DeferredAllocator
+    H->>S: enqueue kernel using block P
+    H->>A: defer P with completion event
+    H->>A: allocate another block
+    Note over A: P remains active and unavailable
+    S-->>A: event becomes complete
+    H->>A: reclaim_ready / next allocate
+    Note over A: P may now re-enter the free list
+```
+
+`DeferredAllocator` composes a `HelixAllocator` with a small polymorphic
+`Completion` contract. Deferral transfers the allocation from client-owned to a
+pending list but intentionally leaves it active in the base allocator. Allocation
+opportunistically polls ready completions; callers can also call `reclaim_ready()`
+or the blocking `wait_and_reclaim_all()`. Destructor cleanup waits before returning
+blocks to the base pool. Query failures leave the pending entry unchanged.
+
+`DeferredAllocatorStats` separates client and pending allocation counts, reports
+pending requested/rounded bytes, and counts deferrals and successful reclamations.
+The base `AllocatorStats::bytes_allocated` includes pending blocks because those
+bytes are still physically unavailable for reuse.
+
+In CUDA builds, `StreamOrderedAllocator::defer_deallocate(allocation,
+release_stream)` records a timing-disabled event after work already queued on that
+stream. The event object owns its CUDA resource until reclamation. Device mismatch,
+moved-from stream, unknown handle, and duplicate deferral are rejected before the
+allocation can become reusable.
+
+The caller must ensure that **every use of the allocation happens-before the event
+recorded on the release stream**. If multiple streams used the block, the release
+stream must first wait on events from all of them. Merely passing any stream is not
+sufficient; Helix does not yet maintain a per-allocation stream-use ledger.
+
+The hardware-gated regression test queues a host callback that holds the release
+stream incomplete, defers a block, and verifies that a same-sized allocation gets a
+different address. Only after opening the gate and synchronizing the completion may
+the original address be reused. The test compiles, but it has not executed without
+an NVIDIA driver/device. Direct calls to base `HelixAllocator::deallocate` still
+require the caller to have completed all device uses.
 
 ## Benchmarks
 
@@ -184,8 +226,10 @@ published result.
 
 ## Current limitations
 
-- no stream/event-aware deferred free,
-- not integrated with Tensor storage,
+- CUDA event-backed reclamation is not hardware-validated,
+- Tensor storage has no record-stream/use-tracking integration,
+- correctness across multiple use streams depends on an explicit caller-created
+  dependency chain into the release stream,
 - CUDA runtime correctness and allocation latency unvalidated,
 - CUDA alignments above 256 bytes unsupported by the direct resource,
 - linear best-fit scan and vector rebuild may scale poorly with many blocks,

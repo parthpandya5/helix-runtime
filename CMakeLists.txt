@@ -111,13 +111,18 @@ target_include_directories(
 helix_configure_target(helix_tensor)
 
 add_library(helix_memory
+  src/memory/deferred_allocator.cpp
   src/memory/helix_allocator.cpp
   src/memory/system_memory_resource.cpp)
 add_library(helix::memory ALIAS helix_memory)
 target_compile_features(helix_memory PUBLIC cxx_std_20)
 target_link_libraries(helix_memory PUBLIC helix::core)
 if(HELIX_ENABLE_CUDA)
-  target_sources(helix_memory PRIVATE src/memory/cuda_memory_resource.cpp)
+  target_sources(
+    helix_memory
+    PRIVATE
+      src/memory/cuda_memory_resource.cpp
+      src/memory/stream_ordered_allocator.cpp)
   target_link_libraries(helix_memory PUBLIC helix::cuda_runtime)
 endif()
 target_include_directories(

@@ -174,6 +174,11 @@ reduction/softmax variant, and both M6 SGEMM implementations. Their CUDA 12.6
 compile validation is not a benchmark; result rows will be added only after
 execution on a named NVIDIA GPU and driver.
 
+M8's CUDA event-backed reclamation path likewise has correctness fixtures but no
+published timing. A future comparison must use equivalent stream dependencies and
+synchronization for direct `cudaMalloc/cudaFree`, Helix deferred reuse, and
+`cudaMallocAsync`; a compile-only fixture or CPU completion mock is not a result.
+
 ## Local benchmark commands
 
 ```bash

@@ -13,13 +13,13 @@ reproducible benchmark evidence.
 
 ## Current status
 
-Milestones 0–2 are implemented and CPU-validated. The repository contains the
-CPU-first build foundation, a checked contiguous tensor core, and Float32 reference
-kernels for elementwise math, reductions, stable softmax, matrix multiplication,
-RMSNorm, and SwiGLU, plus the CPU-testable M7 caching-allocator core. On
-2026-08-20, Apple Clang 17 built the project on macOS arm64 with warnings as errors;
-62/62 CPU tests passed in normal and ASan/UBSan configurations, and the formatting
-check passed.
+Milestones 0–2 and the host-testable portions of Milestones 7–8 are implemented
+and CPU-validated. The repository contains the CPU-first build foundation, a
+checked contiguous tensor core, Float32 reference kernels for elementwise math,
+reductions, stable softmax, matrix multiplication, RMSNorm, and SwiGLU, a caching
+allocator, and a completion-aware deferred-reclamation layer. On 2026-08-20,
+Apple Clang 17 built the project on macOS arm64 with warnings as errors; 68/68 CPU
+tests passed in normal and ASan/UBSan configurations.
 
 CUDA is optional at configure time. The current Apple Silicon development host has
 no NVIDIA GPU or native CUDA toolkit, so no CUDA execution or performance claim is
@@ -27,6 +27,8 @@ made. The M3 runtime layer, M4 manual Float32 elementwise kernels, M5 selectable
 reduction/stable-softmax baselines, and M6 naive/tiled SGEMM are separately
 compile-validated in an ARM64 CUDA 12.6 development container without a
 driver/device.
+The CUDA stream-ordered allocator adapter and its hardware-gated non-reuse test are
+also compile-validated, not runtime-validated.
 
 ## Architecture
 
@@ -147,15 +149,18 @@ cmake --build build --target helix_cpu_kernels_demo
 
 `helix::memory::HelixAllocator` is a backend-neutral, mutex-protected best-fit
 segment cache with alignment rounding, exact block splitting, adjacent coalescing,
-generation-tagged handles, reservation limits, explicit trimming, and internal/
-external fragmentation statistics. Its metadata core passes 12 CPU and sanitizer
-tests. A direct CUDA resource adapter and native-CUDA comparison fixtures compile,
-but have not run on a GPU.
+allocator-instance and generation-tagged handles, reservation limits, explicit
+trimming, and internal/external fragmentation statistics. `DeferredAllocator`
+keeps logically freed allocations active until a completion object reports ready;
+`StreamOrderedAllocator` implements that completion with timing-disabled CUDA
+events recorded on an explicit release stream. The allocator/deferred metadata
+passes 18 focused CPU and sanitizer tests. CUDA adapters and native-CUDA comparison
+fixtures compile, but have not run on a GPU.
 
-The allocator is not yet used by Tensor CUDA storage: immediate reuse would be
-unsafe while asynchronous kernels still reference a freed pointer. Stream/event-
-tracked reclamation is the next correctness gate. Design, measured host baselines,
-and limitations are in
+The allocator is not yet used by Tensor CUDA storage. Tensor does not yet record
+every stream that uses its storage, so it cannot prove that a chosen release event
+orders after all outstanding work. Design, measured host baselines, stream-ordering
+contract, and limitations are in
 [`docs/MEMORY_ALLOCATOR.md`](docs/MEMORY_ALLOCATOR.md).
 
 ## Supported hardware
@@ -168,11 +173,11 @@ and limitations are in
 
 ## Limitations
 
-The CUDA runtime, M4–M6 kernels, and CUDA allocator adapter are compile-validated
-only; physical GPU correctness, timing, and resource validation remain pending.
-Stream-aware allocator integration, attention, KV cache, scheduler, model
-execution, and generation are roadmap work and are not represented as complete.
-Float16 has no arithmetic path yet. Tensor execution is contiguous-only;
+The CUDA runtime, M4–M6 kernels, and M7–M8 CUDA allocator adapters are
+compile-validated only; physical GPU correctness, timing, and resource validation
+remain pending. Tensor allocator integration, attention, KV cache, scheduler,
+model execution, and generation are roadmap work and are not represented as
+complete. Float16 has no arithmetic path yet. Tensor execution is contiguous-only;
 broadcasting, slicing, and general strided kernels are intentionally deferred. CPU
 kernels are reference implementations, not optimized BLAS replacements.
 

@@ -4,6 +4,7 @@
 #include "helix/core/logging.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
@@ -64,6 +65,19 @@ std::string cleanup_message(const std::exception& exception) {
   return message.str();
 }
 
+std::uint64_t next_allocator_id() {
+  static std::atomic<std::uint64_t> next{1};
+  std::uint64_t current = next.load(std::memory_order_relaxed);
+  while (true) {
+    HELIX_CHECK(current != std::numeric_limits<std::uint64_t>::max(), ErrorCode::kResourceExhausted,
+                "HelixAllocator identity space exhausted");
+    if (next.compare_exchange_weak(current, current + 1, std::memory_order_relaxed,
+                                   std::memory_order_relaxed)) {
+      return current;
+    }
+  }
+}
+
 } // namespace
 
 struct HelixAllocator::Impl {
@@ -103,7 +117,7 @@ struct HelixAllocator::Impl {
   };
 
   Impl(std::shared_ptr<MemoryResource> upstream, AllocatorConfig allocator_config)
-      : resource(std::move(upstream)), config(allocator_config) {
+      : resource(std::move(upstream)), config(allocator_config), allocator_id(next_allocator_id()) {
     HELIX_CHECK(resource != nullptr, ErrorCode::kInvalidArgument,
                 "HelixAllocator requires a non-null memory resource");
     HELIX_CHECK(config.segment_bytes != 0, ErrorCode::kInvalidArgument,
@@ -230,7 +244,7 @@ struct HelixAllocator::Impl {
     ++allocation_count;
     assert_invariants();
     return Allocation(pointer, requested_bytes, allocated_bytes, alignment, allocation_id,
-                      resource->device());
+                      allocator_id, resource->device());
   }
 
   void assert_invariants() const {
@@ -305,6 +319,7 @@ struct HelixAllocator::Impl {
 
   std::shared_ptr<MemoryResource> resource;
   AllocatorConfig config;
+  const std::uint64_t allocator_id;
   mutable std::mutex mutex;
   std::vector<Segment> segments;
   std::unordered_map<std::uint64_t, ActiveRecord> active;
@@ -321,9 +336,10 @@ struct HelixAllocator::Impl {
 };
 
 Allocation::Allocation(void* pointer, std::size_t requested_bytes, std::size_t allocated_bytes,
-                       std::size_t alignment, std::uint64_t id, Device device) noexcept
+                       std::size_t alignment, std::uint64_t id, std::uint64_t allocator_id,
+                       Device device) noexcept
     : pointer_(pointer), requested_bytes_(requested_bytes), allocated_bytes_(allocated_bytes),
-      alignment_(alignment), id_(id), device_(device) {}
+      alignment_(alignment), id_(id), allocator_id_(allocator_id), device_(device) {}
 
 HelixAllocator::HelixAllocator(std::shared_ptr<MemoryResource> resource, AllocatorConfig config)
     : impl_(std::make_unique<Impl>(std::move(resource), config)) {}
@@ -365,6 +381,8 @@ void HelixAllocator::deallocate(const Allocation& allocation) {
   std::scoped_lock lock(impl_->mutex);
   HELIX_CHECK(allocation.id() != 0 && allocation.pointer() != nullptr, ErrorCode::kInvalidArgument,
               "HelixAllocator cannot deallocate an empty handle");
+  HELIX_CHECK(allocation.allocator_id_ == impl_->allocator_id, ErrorCode::kInvalidArgument,
+              "HelixAllocator allocation belongs to another allocator instance");
   const auto active_iterator = impl_->active.find(allocation.id());
   HELIX_CHECK(active_iterator != impl_->active.end(), ErrorCode::kInvalidArgument,
               "HelixAllocator allocation is unknown or was already freed");
@@ -411,6 +429,9 @@ void HelixAllocator::deallocate(const Allocation& allocation) {
 
 bool HelixAllocator::owns(const Allocation& allocation) const {
   std::scoped_lock lock(impl_->mutex);
+  if (allocation.allocator_id_ != impl_->allocator_id) {
+    return false;
+  }
   const auto iterator = impl_->active.find(allocation.id());
   return iterator != impl_->active.end() && iterator->second.pointer == allocation.pointer();
 }

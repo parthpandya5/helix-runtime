@@ -36,6 +36,17 @@ gtest_discover_tests(
   TEST_PREFIX "memory."
   DISCOVERY_MODE PRE_TEST)
 
+add_executable(helix_deferred_allocator_tests deferred_allocator_test.cpp)
+target_link_libraries(
+  helix_deferred_allocator_tests
+  PRIVATE helix::memory GTest::gtest_main)
+helix_configure_target(helix_deferred_allocator_tests)
+
+gtest_discover_tests(
+  helix_deferred_allocator_tests
+  TEST_PREFIX "deferred_memory."
+  DISCOVERY_MODE PRE_TEST)
+
 if(HELIX_ENABLE_CUDA)
   add_executable(helix_cuda_runtime_tests cuda_runtime_test.cpp)
   target_link_libraries(

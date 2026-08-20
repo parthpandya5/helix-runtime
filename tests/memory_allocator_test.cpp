@@ -84,6 +84,24 @@ private:
   bool fail_deallocations_ = false;
 };
 
+class AliasingResource final : public MemoryResource {
+public:
+  explicit AliasingResource(void* storage) : storage_(storage) {}
+
+  [[nodiscard]] void* allocate(std::size_t, std::size_t) override {
+    return storage_;
+  }
+
+  void deallocate(void*, std::size_t, std::size_t) override {}
+
+  [[nodiscard]] Device device() const noexcept override {
+    return Device::cpu();
+  }
+
+private:
+  void* storage_;
+};
+
 AllocatorConfig config(std::size_t segment_bytes = 1024,
                        std::size_t maximum_reserved_bytes = 4096) {
   return AllocatorConfig{segment_bytes, 64, maximum_reserved_bytes};
@@ -200,6 +218,28 @@ TEST(HelixAllocatorTest, DetectsDoubleFreeAndStaleHandleAbaReuse) {
   EXPECT_THROW(allocator.deallocate(stale_copy), Error);
   EXPECT_TRUE(allocator.owns(replacement));
   allocator.deallocate(replacement);
+}
+
+TEST(HelixAllocatorTest, RejectsHandleFromAnotherAllocatorWithSameAddressAndLocalId) {
+  alignas(64) std::byte shared_storage[1024];
+  auto first_resource = std::make_shared<AliasingResource>(shared_storage);
+  auto second_resource = std::make_shared<AliasingResource>(shared_storage);
+  HelixAllocator first_allocator(first_resource, config());
+  HelixAllocator second_allocator(second_resource, config());
+  const Allocation first = first_allocator.allocate(64);
+  const Allocation second = second_allocator.allocate(64);
+
+  ASSERT_EQ(first.pointer(), second.pointer());
+  ASSERT_EQ(first.id(), second.id());
+  EXPECT_FALSE(first_allocator.owns(second));
+  EXPECT_FALSE(second_allocator.owns(first));
+  EXPECT_THROW(first_allocator.deallocate(second), Error);
+  EXPECT_THROW(second_allocator.deallocate(first), Error);
+  EXPECT_TRUE(first_allocator.owns(first));
+  EXPECT_TRUE(second_allocator.owns(second));
+
+  first_allocator.deallocate(first);
+  second_allocator.deallocate(second);
 }
 
 TEST(HelixAllocatorTest, EnforcesReservationLimitTransactionally) {

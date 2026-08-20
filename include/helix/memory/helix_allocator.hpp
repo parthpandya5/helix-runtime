@@ -45,13 +45,15 @@ private:
   friend class HelixAllocator;
 
   Allocation(void* pointer, std::size_t requested_bytes, std::size_t allocated_bytes,
-             std::size_t alignment, std::uint64_t id, Device device) noexcept;
+             std::size_t alignment, std::uint64_t id, std::uint64_t allocator_id,
+             Device device) noexcept;
 
   void* pointer_ = nullptr;
   std::size_t requested_bytes_ = 0;
   std::size_t allocated_bytes_ = 0;
   std::size_t alignment_ = 0;
   std::uint64_t id_ = 0;
+  std::uint64_t allocator_id_ = 0;
   Device device_ = Device::cpu();
 };
 

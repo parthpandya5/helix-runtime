@@ -251,16 +251,25 @@ bytes are nonzero. Internal fragmentation is
 `(bytes_allocated - bytes_requested) / bytes_allocated` when allocated bytes are
 nonzero. Both are otherwise zero.
 
-Allocation handles carry a monotonic ID as well as pointer/size/alignment/device.
-Deallocation validates all fields and the active ID, so a stale copy cannot free a
-new allocation that reused the same address (the raw-pointer ABA problem). A mutex
+Allocation handles carry a process-unique allocator ID and monotonic local
+allocation ID as well as pointer/size/alignment/device. Deallocation validates all
+fields and both identities, so neither a stale copy nor a colliding handle from
+another pool can free an allocation (the raw-pointer ABA/cross-pool problem). A mutex
 serializes metadata and upstream calls. Debug builds re-derive segment coverage,
 block adjacency, counters, active mappings, and alignment after every mutation.
 
-The baseline allocator's immediate free-list reuse is unsafe if GPU work still
-uses the pointer. It is not wired into Tensor storage yet. M8 must add explicit
-stream/event lifetime tracking before integration; CPU metadata tests are not
-presented as proof of asynchronous CUDA safety.
+`DeferredAllocator` prevents immediate free-list reuse by holding an allocation in
+a pending state behind a `Completion`; pending blocks remain active in the base
+pool. `StreamOrderedAllocator` supplies CUDA-event completions recorded on an
+explicit same-device release stream. Reclamation is nonblocking when polling and
+blocking during explicit drain/destruction. This adapter is compile-validated, not
+GPU-runtime-validated.
+
+Tensor storage is not wired into the cache yet. A release event is safe only when
+all prior uses happen-before that event. Tensor currently has no per-storage stream
+ledger and therefore cannot construct the required dependency chain for
+multi-stream use automatically. CPU completion tests are not presented as proof of
+CUDA event behavior.
 
 ## Attention
 

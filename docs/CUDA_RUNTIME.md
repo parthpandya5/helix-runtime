@@ -8,8 +8,9 @@ the ARM64 `nvidia/cuda:12.6.3-devel-ubuntu24.04` container with warnings as erro
 All 49 hardware-independent tests passed in that CUDA-on build. Six GPU tests were
 built and then skipped because the container had no NVIDIA driver/device.
 
-The macOS CPU-only Debug and ASan/UBSan configurations continued to pass all 50
-locally discovered tests (including the benchmark smoke test). CUDA correctness,
+As later subsystems were added, the macOS CPU-only Debug and ASan/UBSan
+configurations reached 68 passing tests. The current CUDA-on build passes the same
+68 hardware-independent tests and registers 47 GPU tests. CUDA correctness,
 resource-leak, and timing behavior remains pending a physical NVIDIA GPU.
 
 ## Error handling
@@ -81,9 +82,12 @@ copies use D2D copies, and different-GPU transfers use `cudaMemcpyPeer`.
 Synchronous Tensor operations use synchronous CUDA copies/memset. The lower-level
 asynchronous memory functions enqueue work on a caller-owned `Stream`; the caller
 must keep source/destination memory alive until the stream/event dependency proves
-completion. The M7 caching allocator exists as a separate subsystem but is not used
-by Tensor storage until M8 makes reuse stream-safe, so every CUDA Tensor storage
-allocation is still directly freed and `cudaFree` may synchronize.
+completion. M8 now provides a separate CUDA-event-backed
+`StreamOrderedAllocator`, but Tensor storage still allocates directly because it
+does not record every stream that used a block. A caller using the allocator must
+order all such uses before the event on the chosen release stream. Every CUDA
+Tensor storage allocation is therefore still directly freed and `cudaFree` may
+synchronize.
 
 The current runtime objects are safe to move between host threads only when no
 other thread concurrently accesses the same object and the CUDA context rules are
@@ -110,8 +114,8 @@ compute-sanitizer --tool memcheck ./build-cuda/tests/helix_cuda_runtime_tests
 
 - No GPU runtime test has run in the current environment.
 - No pinned host allocator exists yet.
-- The allocator cache is not integrated here because stream-aware deferred free is
-  not implemented yet.
+- The allocator cache is not integrated with Tensor because multi-stream storage-use
+  tracking is not implemented yet; its event adapter is compile-only validated.
 - Tensor transfers are synchronous at the high-level API.
 - Peer copies require runtime/driver support and have not been hardware-validated.
 - Destructor failures can only be logged; callers needing explicit cleanup status

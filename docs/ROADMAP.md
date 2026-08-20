@@ -220,16 +220,18 @@ Implementation/validation record (2026-08-20, commit `746d0a5`): `HelixAllocator
 implements a mutex-protected, aligned best-fit segment cache over a pluggable
 upstream resource. It rounds sizes, accounts for alignment prefixes, splits exact
 remainders, coalesces adjacent free blocks, enforces a reservation ceiling,
-releases wholly free segments explicitly, and uses generation-tagged handles to
-detect double frees and stale-pointer ABA reuse. Stats define rounded/requested/
+releases wholly free segments explicitly, and uses allocator-instance plus
+generation-tagged handles to detect cross-pool frees, double frees, and stale-
+pointer ABA reuse. Stats define rounded/requested/
 free/peak bytes, largest free block, active/segment/call counters, and internal/
 external fragmentation. Debug builds re-derive metadata invariants after each
-mutation. Twelve allocator tests pass in normal and ASan/UBSan builds, covering
+mutation. Thirteen allocator tests pass in normal and ASan/UBSan builds, covering
 best fit, split/coalesce, alignments through 1,024 bytes on the host resource,
 transactional OOM/upstream failure, failed trim, destructor ownership, and
-concurrent callers; the total CPU suite is 62/62.
+concurrent callers. A deliberately aliased-resource test proves two pools with the
+same address and local allocation ID reject each other's handles.
 
-`CudaMemoryResource` and two hardware-gated allocator tests compile in the CUDA
+`CudaMemoryResource` and three hardware-gated allocator tests compile in the CUDA
 12.6 warnings-as-errors build. Direct `cudaMalloc` versus Helix fixed/mixed trace
 benchmarks also compile, but have not run. CPU-resource baselines were executed and
 honestly show workload-dependent overhead/reuse behavior in
@@ -238,13 +240,33 @@ small/large-heavy, bursty, and LLM-shaped GPU study remains pending. Immediate
 reuse is deliberately not integrated into Tensor storage because stream safety is
 an M8 correctness dependency. See `docs/MEMORY_ALLOCATOR.md`.
 
-### M8 — Stream-aware allocation — Planned; hardware pending
+### M8 — Implemented and CPU/compile-validated; GPU runtime validation pending
 
 - documented immediate-reuse race
 - event-backed deferred free/reclamation
 - explicit stream-recording contract
 - real-hardware test that would detect unsafe reuse
 - comparison with synchronized baseline and `cudaMallocAsync` where supported
+
+Implementation/validation record (2026-08-20): the backend-neutral
+`DeferredAllocator` retains logically freed blocks as active allocations behind a
+move-only `Completion` object, opportunistically polls on allocation/trim, supports
+explicit nonblocking and blocking reclamation, waits during destruction, and
+reports client-versus-pending bytes/counts. Five deterministic CPU tests cover
+non-reuse before completion, reuse afterward, blocking cleanup, invalid/duplicate
+deferral, failure preservation, and destructor waiting. Together with M7, the full
+normal and ASan/UBSan suite is 68/68.
+
+The CUDA-only `StreamOrderedAllocator` records a timing-disabled event on a
+same-device release stream and delegates lifetime to the generic state machine. A
+hardware-gated test holds the stream behind a host callback, verifies the pending
+address cannot be reused, releases the callback, then verifies reclamation/reuse.
+NVCC 12.6.85 compiles this adapter and test with warnings as errors; all 68
+hardware-independent tests pass in that build and 47 GPU tests are registered.
+There is no CUDA driver/device in the container, so the event test, GPU allocation
+latency, synchronized comparison, and `cudaMallocAsync` comparison remain pending.
+Tensor integration also remains pending a complete multi-stream use-recording
+contract; the adapter alone cannot infer outstanding work on other streams.
 
 ## Phase D: transformer primitives and memory
 
