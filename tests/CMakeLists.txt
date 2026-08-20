@@ -51,4 +51,28 @@ if(HELIX_ENABLE_CUDA)
     TEST_PREFIX "cuda_elementwise."
     DISCOVERY_MODE PRE_TEST
     PROPERTIES LABELS gpu TIMEOUT 120)
+
+  add_executable(helix_cuda_reduction_tests cuda_reduction_test.cpp)
+  target_link_libraries(
+    helix_cuda_reduction_tests
+    PRIVATE helix::cuda_kernels helix::cpu_kernels GTest::gtest_main)
+  helix_configure_target(helix_cuda_reduction_tests)
+
+  gtest_discover_tests(
+    helix_cuda_reduction_tests
+    TEST_PREFIX "cuda_reduction."
+    DISCOVERY_MODE PRE_TEST
+    PROPERTIES LABELS gpu TIMEOUT 120)
+
+  add_executable(helix_cuda_softmax_tests cuda_softmax_test.cpp)
+  target_link_libraries(
+    helix_cuda_softmax_tests
+    PRIVATE helix::cuda_kernels helix::cpu_kernels GTest::gtest_main)
+  helix_configure_target(helix_cuda_softmax_tests)
+
+  gtest_discover_tests(
+    helix_cuda_softmax_tests
+    TEST_PREFIX "cuda_softmax."
+    DISCOVERY_MODE PRE_TEST
+    PROPERTIES LABELS gpu TIMEOUT 120)
 endif()

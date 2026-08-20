@@ -111,7 +111,10 @@ target_include_directories(
 helix_configure_target(helix_tensor)
 
 if(HELIX_ENABLE_CUDA)
-  add_library(helix_cuda_kernels src/kernels/cuda/elementwise.cu)
+  add_library(helix_cuda_kernels
+    src/kernels/cuda/elementwise.cu
+    src/kernels/cuda/reduction.cu
+    src/kernels/cuda/softmax.cu)
   add_library(helix::cuda_kernels ALIAS helix_cuda_kernels)
   target_compile_features(helix_cuda_kernels PUBLIC cxx_std_20)
   target_link_libraries(helix_cuda_kernels PUBLIC helix::tensor helix::cuda_runtime)

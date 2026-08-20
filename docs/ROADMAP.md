@@ -157,12 +157,26 @@ CPU tests passed in that CUDA-on build. The GPU tests and benchmarks have not ru
 so no correctness, crossover, bandwidth, or speedup result is claimed. See
 `docs/CUDA_KERNELS.md`.
 
-### M5 — Reduction and softmax — Planned; hardware pending
+### M5 — Reduction and softmax — Implemented and compile-validated; GPU runtime validation pending
 
 - naive, shared-memory, and warp-assisted reduction variants
 - correct row-wise softmax followed by evidence-driven optimization
 - latency, throughput, and effective-bandwidth reporting where meaningful
 - documented thread layout, synchronization, and numerical behavior
+
+Implementation/validation record (2026-08-20): last-dimension Float32 reduction
+has selectable serial-per-row, shared-memory tree, and two-stage warp-shuffle
+implementations. Stable row-wise softmax has selectable serial-per-row and
+shared-memory block implementations, explicit NaN/infinity semantics matching the
+CPU oracle, empty-row launch suppression, and safe exact in-place execution.
+Deterministic GPU tests cover widths 0/1/31/257/513/1,023, multiple ranks,
+large-magnitude values, non-finite rows, shape retention, algorithm validation,
+aliasing, and dtype/rank errors. CUDA-event benchmarks warm up and time every
+variant at 32x128, 16x1,023, and 64x4,096. A clean NVCC 12.6.85 build promoted all
+CUDA warnings to errors and compiled all tests/benchmarks; 50 hardware-independent
+tests passed. Static `sm_52` compiler resource data is documented, but none of the
+GPU tests or benchmarks has run. No optimized-variant, bandwidth, or latency claim
+is made. See `docs/CUDA_KERNELS.md`.
 
 ### M6 — Matrix multiplication — Planned; hardware pending
 
