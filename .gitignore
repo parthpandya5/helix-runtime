@@ -29,8 +29,8 @@ compile_commands.json
 *.gcno
 *.nsys-rep
 *.ncu-rep
-core
-core.*
+/core
+/core.*
 
 # Models and generated benchmark output
 /models/
