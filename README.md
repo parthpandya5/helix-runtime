@@ -13,14 +13,15 @@ reproducible benchmark evidence.
 
 ## Current status
 
-Milestones 0–2, the host-testable portions of Milestones 7–8, and the CPU path of
-Milestone 9 are implemented and CPU-validated. The repository contains the
+Milestones 0–2, the host-testable portions of Milestones 7–8, and the CPU paths of
+Milestones 9–10 are implemented and CPU-validated. The repository contains the
 CPU-first build foundation, a checked contiguous tensor core, Float32 reference
 kernels for elementwise math, reductions, stable softmax, matrix multiplication,
-RMSNorm, SwiGLU, adjacent-pair RoPE, and linear projection, plus a caching allocator
-and completion-aware deferred reclamation. On 2026-08-20, Apple Clang 17 built the
-project on macOS arm64 with warnings as errors; 72/72 CPU tests passed in normal and
-ASan/UBSan configurations.
+RMSNorm, SwiGLU, adjacent-pair RoPE, linear projection, and causal scaled
+dot-product attention, plus a caching allocator and completion-aware deferred
+reclamation. On 2026-08-20, Apple Clang 17 built the project on macOS arm64 with
+warnings as errors; 76/76 CPU tests passed in normal and ASan/UBSan
+configurations.
 
 CUDA is optional at configure time. The current Apple Silicon development host has
 no NVIDIA GPU or native CUDA toolkit, so no CUDA execution or performance claim is
@@ -28,8 +29,9 @@ made. The M3 runtime layer, M4 manual Float32 elementwise kernels, M5 selectable
 reduction/stable-softmax baselines, and M6 naive/tiled SGEMM are separately
 compile-validated in an ARM64 CUDA 12.6 development container without a
 driver/device. The M8 stream-ordered allocator and M9 block-reduced RMSNorm,
-grid-stride SwiGLU, adjacent-pair RoPE, and projection adapter are also compile-
-validated, not runtime-validated.
+grid-stride SwiGLU, adjacent-pair RoPE, and projection adapter are also
+compile-validated, as is the M10 three-stage contiguous attention baseline. None is
+runtime-validated on a GPU.
 
 ## Architecture
 
@@ -167,6 +169,15 @@ orders after all outstanding work. Design, measured host baselines, stream-order
 contract, and limitations are in
 [`docs/MEMORY_ALLOCATOR.md`](docs/MEMORY_ALLOCATOR.md).
 
+## Contiguous attention
+
+The M10 baseline implements causal scaled dot-product attention over equal Q/K/V
+head counts. It exposes a reusable Float32 `[heads, queries, kv_tokens]` workspace,
+supports both prefill and decode through an explicit query-position offset, and
+keeps score, stable softmax, and probability-times-V stages visible. The CPU path
+is tested, sanitized, and benchmarked; the matching CUDA path and event fixtures
+are compile-validated only. See [`docs/ATTENTION.md`](docs/ATTENTION.md).
+
 ## Supported hardware
 
 - CPU foundation: validated with Apple Clang 17 on macOS arm64; Linux GCC/Clang
@@ -177,9 +188,9 @@ contract, and limitations are in
 
 ## Limitations
 
-The CUDA runtime, M4–M6/M9 kernels, and M7–M8 CUDA allocator adapters are
+The CUDA runtime, M4–M6/M9–M10 kernels, and M7–M8 CUDA allocator adapters are
 compile-validated only; physical GPU correctness, timing, and resource validation
-remain pending. Tensor allocator integration, attention, KV cache, scheduler,
+remain pending. Tensor allocator integration, KV cache, paged attention, scheduler,
 model execution, and generation are roadmap work and are not represented as
 complete. Float16 has no arithmetic path yet. Tensor execution is contiguous-only;
 broadcasting, slicing, and general strided kernels are intentionally deferred. CPU
@@ -191,6 +202,7 @@ kernels are reference implementations, not optimized BLAS replacements.
 - [Roadmap and validation gates](docs/ROADMAP.md)
 - [CUDA runtime ownership and validation](docs/CUDA_RUNTIME.md)
 - [CUDA kernel design and validation](docs/CUDA_KERNELS.md)
+- [Contiguous attention design](docs/ATTENTION.md)
 - [Caching allocator design and fragmentation](docs/MEMORY_ALLOCATOR.md)
 - [Performance methodology](docs/PERFORMANCE.md)
 - [Contributor/agent rules](AGENTS.md)

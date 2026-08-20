@@ -2,9 +2,10 @@
 
 ## Validation status
 
-The Milestone 4 elementwise, Milestone 5 reduction/softmax, Milestone 6 SGEMM, and
-Milestone 9 transformer kernels are **CUDA compile-validated, not GPU runtime-
-validated**. NVCC 12.6.85 and GCC 13.2 compiled the implementations, hardware-gated
+The Milestone 4 elementwise, Milestone 5 reduction/softmax, Milestone 6 SGEMM,
+Milestone 9 transformer kernels, and Milestone 10 attention baseline are **CUDA
+compile-validated, not GPU runtime-validated**. NVCC 12.6.85 and GCC 13.2 compiled
+the implementations, hardware-gated
 correctness tests, and CUDA-event benchmarks in the ARM64 CUDA 12.6 development
 container with CUDA and host warnings promoted to errors. The container has no
 NVIDIA driver or device, so the tests and benchmarks have not executed. This
@@ -214,6 +215,8 @@ measurements, and may change with architecture/toolchain:
 | RMSNorm warp-reduced | 21 | 32 B | 0 B |
 | SwiGLU | 17 | 0 B | 0 B |
 | RoPE adjacent-pair | 27 | 0 B | 0 B |
+| attention score/scale/mask | 29 | 0 B | 0 B |
+| attention probabilities x V | 32 | 0 B | 0 B |
 
 This table helps make occupancy/resource hypotheses concrete, but occupancy cannot
 be concluded from registers/shared memory alone; launch geometry, architecture
@@ -362,6 +365,24 @@ same-stream CUDA events with stop-event synchronization. RMSNorm uses 1x4,096 an
 32x4,096 rows, SwiGLU uses 4,096 and 131,072 values, and RoPE uses decode-shaped
 1x32x128 and prefill-shaped 128x32x128 inputs. Projection uses the existing M6 GEMM
 fixtures. No result or optimization conclusion is recorded without hardware.
+
+## Contiguous attention baseline
+
+Milestone 10 preserves score/scale/causal-mask, stable softmax, and
+probability-times-V as three separate same-stream stages. The score and value
+kernels are intentionally serial per output coordinate, while softmax reuses the
+M5 shared-memory implementation. This exposes the `4*H*Q*K` Float32 workspace and
+the naive score kernel's strided-across-warp K access rather than hiding either
+behind a fused or library call. Static `sm_52` inspection reports 29 and 32
+registers/thread for the custom stages with no shared memory or spills; the
+softmax stage retains its documented 5,120-byte shared scratch.
+
+CPU-oracle GPU tests cover known causal values/probabilities, one-token decode,
+odd dimensions through head width 37/value width 41, empty queries, contracts, and
+alias rejection. Ten-warmup event fixtures time the full three-stage sequence at
+decode, odd, and prefill shapes, but have not executed. Tensor layout, causal
+offset semantics, memory traffic, CPU baselines, and limitations are detailed in
+`docs/ATTENTION.md`.
 
 ## Planned evolution
 

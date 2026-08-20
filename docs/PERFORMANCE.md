@@ -26,6 +26,7 @@ Every recorded experiment must include:
 | M2 CPU reference kernels | No earlier implementation | Clear single-threaded Float32 correctness paths with preallocated output | Representative median CPU times: add 1,048,576 values 121.685 us; softmax 32x128 21.172 us; matmul 128x128x128 1.521 ms (2.758 GFLOP/s); RMSNorm 32x4096 132.403 us | These establish correctness-oracle baselines. They are not optimized CPU-library comparisons, and allocation is excluded through `_out` APIs. |
 | M7 host-resource allocator baseline | Direct aligned C++ allocation/free | Route identical fixed and 16-allocation mixed traces through the best-fit cache | Median CPU time per fixed pair: direct/Helix 22.6/87.1 ns (256 B), 22.0/88.6 ns (4 KiB), 548/88.2 ns (1 MiB); mixed trace 1.657/2.016 us | Host allocation already caches small blocks, so Helix metadata loses on small/mixed traces but avoids repeated upstream work for 1 MiB. This does not predict `cudaMalloc` behavior. |
 | M9 CPU transformer primitives | No earlier RoPE fixture; M2 provided scalar SiLU only | Add preallocated SwiGLU and adjacent-pair RoPE reference paths | Median CPU time: SwiGLU 4,096 values 44.602 us and 131,072 values 1.512 ms; RoPE 1x32x128 1.904 us and 128x32x128 187.894 us | These are single-threaded correctness baselines, not optimized CPU or GPU comparisons. High host load makes wall-time variation substantial. |
+| M10 contiguous CPU attention | No earlier attention path | Materialize scaled/masked scores, stable softmax in place, then probabilities x V with reusable output/workspace | Median CPU time: 8x1x128x64x64 76.371 us; 8x1x1,024x64x64 825.128 us; 3x17x29x37x41 46.284 us; 8x128x128x64x64 8.164 ms | Workspace is exactly `4*H*Q*K` bytes. These single-threaded results include softmax but the reported dot FLOP/s numerator does not; they are correctness baselines. |
 
 ## M1 CPU tensor baseline — 2026-08-20
 
@@ -199,6 +200,47 @@ Neither fixture includes cache generation or Tensor allocation. The unusually hi
 load produced 9–19% real-time coefficients of variation even though CPU-time
 variation was lower; these values are retained as local baselines and should be
 remeasured on an idle host before optimization conclusions.
+
+## M10 contiguous CPU attention baseline — 2026-08-20
+
+Environment:
+
+- source: commit `c8ac20d`
+- host: Apple M3 Pro, 12 CPU cores, 18 GB RAM
+- OS/compiler/build: macOS 26.0.1 arm64, Apple Clang 17.0.0, Release,
+  `HELIX_ENABLE_CUDA=OFF`, Float32
+- Google Benchmark: 1.9.1
+- output and `[H,Q,K]` score/probability workspace: preallocated and reused
+- warmup: time-based 0.1 seconds per case
+- measurement: time-based minimum 0.2 seconds per repetition, five repetitions;
+  median CPU time reported
+- one-minute load average at start: 15.64; affinity and CPU-frequency metadata were
+  unavailable
+
+| H x Q x K x D x DV | Median CPU time | Score workspace | Dot-product rate |
+|---|---:|---:|---:|
+| 8 x 1 x 128 x 64 x 64 | 76.371 us | 4,096 B | 3.433 GFLOP/s |
+| 8 x 1 x 1,024 x 64 x 64 | 825.128 us | 32,768 B | 2.542 GFLOP/s |
+| 3 x 17 x 29 x 37 x 41 | 46.284 us | 5,916 B | 4.985 GFLOP/s |
+| 8 x 128 x 128 x 64 x 64 | 8.164 ms | 524,288 B | 4.110 GFLOP/s |
+
+Command:
+
+```bash
+./build-release/benchmarks/helix_benchmarks \
+  --benchmark_filter=BM_CpuContiguousAttention \
+  --benchmark_min_warmup_time=0.1 \
+  --benchmark_min_time=0.2s \
+  --benchmark_repetitions=5 \
+  --benchmark_report_aggregates_only=true
+```
+
+The reported rate counts only the multiply-add work in QK and probability-times-V,
+`2*H*Q*K*(D+DV)`. Stable softmax and masking are included in elapsed time but not
+that FLOP numerator. Decode latency scales with KV history in these two samples,
+and prefill exposes the quadratic score workspace; neither observation is a speedup
+claim. CUDA fixtures use identical shapes, ten warmups, and same-stream event
+timing, but have not executed on a GPU.
 
 ## Timing rules
 

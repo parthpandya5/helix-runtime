@@ -283,7 +283,8 @@ CUDA event behavior.
 
 ## Attention
 
-The first scaled dot-product attention path materializes the understandable stages:
+The implemented contiguous scaled dot-product attention path materializes the
+understandable stages:
 
 ```text
 scores = Q * transpose(K)
@@ -292,9 +293,19 @@ probabilities = softmax(scores)
 output = probabilities * V
 ```
 
-This path establishes correctness and memory-cost baselines. Fusion or paged
-attention follows only after profiling identifies the relevant traffic and launch
-costs.
+Q/K/V layouts are `[heads, query_tokens, head_dimension]`,
+`[heads, kv_tokens, head_dimension]`, and
+`[heads, kv_tokens, value_dimension]`. An explicit query-position offset defines
+causal masking for prefill and decode. The caller-owned score workspace is
+`[heads, query_tokens, kv_tokens]`, or exactly `4*H*Q*K` bytes for Float32; softmax
+reuses it in place.
+
+The CPU implementation is the double-accumulating oracle. The CUDA baseline uses
+one serial-dot-product thread per score, the existing stable block softmax, and one
+serial-KV-reduction thread per output coordinate. This deliberately visible path
+establishes correctness and memory-cost baselines. Fusion or paged attention
+follows only after hardware validation and profiling identify the relevant traffic
+and launch costs. Q/K/V heads must currently match; GQA is not implied.
 
 ## KV cache
 

@@ -301,11 +301,35 @@ inspection reports no spills; it is documented separately and is not runtime
 evidence. CPU SwiGLU/RoPE baselines are recorded in `docs/PERFORMANCE.md`; GPU
 correctness and timing await NVIDIA hardware.
 
-### M10 — Contiguous attention baseline — Planned
+### M10 — CPU-validated and CUDA compile-validated; GPU runtime validation pending
 
 - scaled QK-transpose, causal mask, softmax, probability-times-V stages
 - CPU reference and explicit temporary-memory accounting
 - CUDA correctness validation before fusion work
+
+Implementation/validation record (2026-08-20, commit `c8ac20d`): contiguous
+Float32 attention defines `Q[H,Q,D]`, `K[H,K,D]`, `V[H,K,DV]`, and output
+`[H,Q,DV]`. An explicit query-position offset gives one causal contract for full
+prefill, chunked prefill, and single-token decode. The baseline materializes one
+caller-owned `[H,Q,K]` score/probability workspace and exposes its exact
+`4*H*Q*K` byte cost; `_out` calls can reuse both workspace and output.
+
+The CPU oracle performs double-accumulating scaled QK products, writes the causal
+negative-infinity mask, runs stable softmax in place, and computes the double-
+accumulating probability-times-V stage. Four tests cover hand-computed causal
+values, decode offset semantics, odd multi-head dimensions, zero work, resource
+formulas, invalid shapes/ranges/dtypes, and alias rejection. Normal and ASan/UBSan
+suites pass 76/76.
+
+The CUDA baseline deliberately retains three visible same-stream stages: one
+serial-dot-product thread per score, the M5 shared-memory softmax, and one serial-
+KV-reduction thread per output value. Four CPU-oracle GPU tests and CUDA-event
+fixtures compile with NVCC 12.6.85; the CUDA build passes all 76 independent tests
+and registers 57 hardware-gated GPU tests. Static `sm_52` inspection reports 29
+and 32 registers/thread for score and value kernels with no spills, but GPU
+correctness and timing remain unvalidated. Reproducible CPU baselines and the
+quadratic workspace cost are recorded in `docs/ATTENTION.md` and
+`docs/PERFORMANCE.md`. No fusion or speedup claim is made.
 
 ### M11 — Contiguous KV cache — Planned
 
