@@ -13,12 +13,13 @@ reproducible benchmark evidence.
 
 ## Current status
 
-Milestone 0 is implemented and CPU-validated. The repository contains the target
-architecture and roadmap plus a CPU-first CMake foundation, core device/dtype
-types, contextual errors, logging, GoogleTest/Google Benchmark wiring, sanitizer
-options, and CPU CI. On 2026-08-20, Apple Clang 17 built the project on macOS arm64
-with warnings as errors; 12/12 tests passed in both the normal and ASan/UBSan
-configurations, and the formatting check passed.
+Milestones 0 and 1 are implemented and CPU-validated. The repository contains the
+CPU-first build foundation and a checked contiguous tensor core with aligned CPU
+storage, shape/stride metadata, scalar and zero-sized tensors, deterministic
+initialization, safe reshape/views, deep copy, and guarded device transfer. On
+2026-08-20, Apple Clang 17 built the project on macOS arm64 with warnings as errors;
+29/29 tests passed in both the normal and ASan/UBSan configurations, and the
+formatting check passed.
 
 CUDA is optional at configure time. The current Apple Silicon development host has
 no NVIDIA GPU or CUDA toolkit, so no CUDA execution or performance claim is made.
@@ -98,9 +99,23 @@ cmake --build build-release -j
 ./build-release/benchmarks/helix_benchmarks
 ```
 
-The initial benchmark is an infrastructure smoke test. There are no published
-optimization results yet. Methodology and future measured experiments live in
+The first release-mode `Tensor::zeros` baseline is recorded without an optimization
+claim. Methodology and future measured experiments live in
 [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md).
+
+## Tensor runtime
+
+`helix::Tensor` is a shallow-copy handle over shared RAII storage. It tracks a
+signed 64-bit shape and canonical row-major strides, dtype, device, logical bytes,
+storage bytes, and byte offset. Size multiplication is checked before allocation.
+`reshape`/`view` share storage only when safe; `clone` and same-device `to` create
+independent storage. Float32 is executable, while Float16 currently supports only
+metadata, allocation, zeroing, and bytewise copy.
+
+```bash
+cmake --build build --target helix_tensor_demo
+./build/examples/helix_tensor_demo
+```
 
 ## Supported hardware
 
@@ -112,9 +127,10 @@ optimization results yet. Methodology and future measured experiments live in
 
 ## Limitations
 
-Tensor storage, mathematical kernels, allocator, attention, KV cache, scheduler,
+Mathematical kernels, CUDA runtime, allocator, attention, KV cache, scheduler,
 model execution, and generation are roadmap work and are not represented as
-complete. Float16 currently has metadata only; no Float16 arithmetic path exists.
+complete. Float16 has no arithmetic path yet. Tensor execution is contiguous-only;
+broadcasting, slicing, and general strided kernels are intentionally deferred.
 
 ## Engineering notes
 

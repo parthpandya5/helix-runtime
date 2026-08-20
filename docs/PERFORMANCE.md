@@ -22,7 +22,41 @@ Every recorded experiment must include:
 
 | Experiment | Baseline | Change | Result | Interpretation |
 |---|---|---|---|---|
-| No optimization experiments recorded yet | — | — | — | Milestone 0 establishes the harness; performance work starts from executable subsystem baselines. |
+| M1 `Tensor::zeros` baseline | No earlier implementation | Allocate 64-byte-aligned CPU storage and zero it | Median CPU time: 191 ns (1 float), 240 ns (1,024 floats), 23.589 us (1,048,576 floats) | This measures allocation, tensor metadata construction, and zeroing together. It is a starting point, not evidence of an optimization or a standalone memory-bandwidth result. |
+
+## M1 CPU tensor baseline — 2026-08-20
+
+Environment:
+
+- source: commit `2887901`
+- host: Apple M3 Pro, 12 CPU cores, 18 GB RAM
+- OS: macOS 26.0.1 arm64
+- compiler: Apple Clang 17.0.0
+- CMake: 4.2.3
+- Google Benchmark: 1.9.1
+- build: `Release`, `HELIX_ENABLE_CUDA=OFF`, Float32
+- workload: construct `Tensor::zeros({N})`; allocation and destruction are included
+- warmup: time-based 0.1 seconds per benchmark case
+- measurement: time-based minimum 0.2 seconds per repetition, five repetitions;
+  median CPU time reported
+- concurrency: one benchmark thread
+
+Command:
+
+```bash
+./build-release/benchmarks/helix_benchmarks \
+  --benchmark_filter=BM_TensorZeros \
+  --benchmark_min_warmup_time=0.1 \
+  --benchmark_min_time=0.2s \
+  --benchmark_repetitions=5 \
+  --benchmark_report_aggregates_only=true
+```
+
+The host load average was high (14.05 one-minute) and Google Benchmark could not
+read Apple Silicon clock-rate metadata or set affinity. These results are retained
+as an honest local baseline and should not be used for cross-machine comparisons.
+The apparent bytes/second counter is intentionally omitted because allocation,
+page state, cache reuse, and zeroing are combined in this fixture.
 
 ## Timing rules
 
@@ -45,5 +79,5 @@ cmake --build build-release -j
 ./build-release/benchmarks/helix_benchmarks
 ```
 
-The Milestone 0 dtype-metadata benchmark is a harness smoke test, not a runtime
-performance claim.
+The dtype-metadata benchmark is a harness smoke test, not a runtime performance
+claim.

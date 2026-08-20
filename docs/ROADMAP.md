@@ -57,7 +57,7 @@ CUDA compilation and runtime execution remain unvalidated because this host has 
 CUDA toolkit or NVIDIA device. Local clang-tidy execution is pending tool
 availability; CPU CI installs and runs it separately.
 
-### M1 — Tensor core — In progress
+### M1 — Tensor core — Implemented and CPU-validated
 
 Deliverables:
 
@@ -76,7 +76,16 @@ Tests:
 - copy independence and alignment
 - device/dtype/access validation
 
-### M2 — CPU reference kernels — Planned
+Validation record (2026-08-20, commit `2887901`): contiguous Float32 tensors,
+Float16 byte storage, scalar/zero-sized shapes, aligned CPU storage, deterministic
+random fill, zeroing, shallow views, deep clones/copies, and CPU-to-CPU transfer
+passed normal and ASan/UBSan suites. Shape, stride, and byte overflow; negative
+dimensions; invalid alignment; incompatible reshape/copy; and unavailable CUDA
+storage are covered. The full suite contains 29 discovered tests including the
+benchmark smoke test. A release-mode `Tensor::zeros` allocation-plus-zero baseline
+is recorded in `docs/PERFORMANCE.md`.
+
+### M2 — CPU reference kernels — In progress
 
 Deliverables, in dependency order:
 
