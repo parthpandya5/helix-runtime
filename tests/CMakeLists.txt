@@ -27,6 +27,15 @@ gtest_discover_tests(
   TEST_PREFIX "cpu_kernels."
   DISCOVERY_MODE PRE_TEST)
 
+add_executable(helix_attention_tests attention_test.cpp)
+target_link_libraries(helix_attention_tests PRIVATE helix::attention GTest::gtest_main)
+helix_configure_target(helix_attention_tests)
+
+gtest_discover_tests(
+  helix_attention_tests
+  TEST_PREFIX "attention."
+  DISCOVERY_MODE PRE_TEST)
+
 add_executable(helix_memory_tests memory_allocator_test.cpp)
 target_link_libraries(helix_memory_tests PRIVATE helix::memory GTest::gtest_main)
 helix_configure_target(helix_memory_tests)
@@ -117,6 +126,18 @@ if(HELIX_ENABLE_CUDA)
   gtest_discover_tests(
     helix_cuda_transformer_tests
     TEST_PREFIX "cuda_transformer."
+    DISCOVERY_MODE PRE_TEST
+    PROPERTIES LABELS gpu TIMEOUT 180)
+
+  add_executable(helix_cuda_attention_tests cuda_attention_test.cpp)
+  target_link_libraries(
+    helix_cuda_attention_tests
+    PRIVATE helix::attention helix::cuda_runtime GTest::gtest_main)
+  helix_configure_target(helix_cuda_attention_tests)
+
+  gtest_discover_tests(
+    helix_cuda_attention_tests
+    TEST_PREFIX "cuda_attention."
     DISCOVERY_MODE PRE_TEST
     PROPERTIES LABELS gpu TIMEOUT 180)
 

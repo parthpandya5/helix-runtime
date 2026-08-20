@@ -1,15 +1,17 @@
 add_executable(helix_benchmarks
   allocator_benchmarks.cpp
+  attention_benchmarks.cpp
   core_benchmarks.cpp
   cpu_kernel_benchmarks.cpp
   tensor_benchmarks.cpp)
 target_link_libraries(
   helix_benchmarks
-  PRIVATE helix::cpu_kernels helix::memory benchmark::benchmark_main)
+  PRIVATE helix::attention helix::cpu_kernels helix::memory benchmark::benchmark_main)
 if(HELIX_ENABLE_CUDA)
   target_sources(
     helix_benchmarks
     PRIVATE
+      cuda_attention_benchmarks.cpp
       cuda_elementwise_benchmarks.cpp
       cuda_allocator_benchmarks.cpp
       cuda_matmul_benchmarks.cpp

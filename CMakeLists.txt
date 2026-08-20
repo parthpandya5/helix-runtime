@@ -164,6 +164,22 @@ target_include_directories(
     $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
 helix_configure_target(helix_cpu_kernels)
 
+add_library(helix_attention src/attention/reference.cpp)
+add_library(helix::attention ALIAS helix_attention)
+target_compile_features(helix_attention PUBLIC cxx_std_20)
+target_link_libraries(helix_attention PUBLIC helix::cpu_kernels)
+if(HELIX_ENABLE_CUDA)
+  target_sources(helix_attention PRIVATE src/attention/cuda.cu)
+  target_link_libraries(helix_attention PUBLIC helix::cuda_kernels helix::cuda_runtime)
+endif()
+target_include_directories(
+  helix_attention
+  PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+    $<BUILD_INTERFACE:${HELIX_GENERATED_INCLUDE_DIR}>
+    $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
+helix_configure_target(helix_attention)
+
 helix_add_format_targets()
 
 if(HELIX_BUILD_TESTS)
@@ -183,7 +199,7 @@ if(HELIX_BUILD_EXAMPLES)
   add_subdirectory(examples EXCLUDE_FROM_ALL)
 endif()
 
-set(HELIX_INSTALL_TARGETS helix_core helix_tensor helix_memory helix_cpu_kernels)
+set(HELIX_INSTALL_TARGETS helix_core helix_tensor helix_memory helix_cpu_kernels helix_attention)
 if(HELIX_ENABLE_CUDA)
   list(APPEND HELIX_INSTALL_TARGETS helix_cuda_runtime helix_cuda_kernels)
 endif()
