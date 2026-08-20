@@ -75,4 +75,16 @@ if(HELIX_ENABLE_CUDA)
     TEST_PREFIX "cuda_softmax."
     DISCOVERY_MODE PRE_TEST
     PROPERTIES LABELS gpu TIMEOUT 120)
+
+  add_executable(helix_cuda_matmul_tests cuda_matmul_test.cpp)
+  target_link_libraries(
+    helix_cuda_matmul_tests
+    PRIVATE helix::cuda_kernels helix::cpu_kernels GTest::gtest_main)
+  helix_configure_target(helix_cuda_matmul_tests)
+
+  gtest_discover_tests(
+    helix_cuda_matmul_tests
+    TEST_PREFIX "cuda_matmul."
+    DISCOVERY_MODE PRE_TEST
+    PROPERTIES LABELS gpu TIMEOUT 180)
 endif()

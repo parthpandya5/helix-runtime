@@ -2,13 +2,13 @@
 
 ## Validation status
 
-The Milestone 4 elementwise and Milestone 5 reduction/softmax kernels are **CUDA
-compile-validated, not GPU runtime-validated**. NVCC 12.6.85 and GCC 13.2 compiled
-the implementations, hardware-gated correctness tests, and CUDA-event benchmarks
-in the ARM64 CUDA 12.6 development container with CUDA and host warnings promoted
-to errors. The container has no NVIDIA driver or device, so the tests and
-benchmarks have not executed. This document therefore contains no GPU latency,
-bandwidth, CPU/GPU crossover, or speedup claim.
+The Milestone 4 elementwise, Milestone 5 reduction/softmax, and Milestone 6 SGEMM
+kernels are **CUDA compile-validated, not GPU runtime-validated**. NVCC 12.6.85 and
+GCC 13.2 compiled the implementations, hardware-gated correctness tests, and
+CUDA-event benchmarks in the ARM64 CUDA 12.6 development container with CUDA and
+host warnings promoted to errors. The container has no NVIDIA driver or device, so
+the tests and benchmarks have not executed. This document therefore contains no
+GPU latency, bandwidth, CPU/GPU crossover, or speedup claim.
 
 ## Implemented operations
 
@@ -208,13 +208,83 @@ measurements, and may change with architecture/toolchain:
 | reduction warp shuffle | 18 | 32 B | 0 B |
 | softmax naive | 33 | 0 B | 0 B |
 | softmax shared | 25 | 5,120 B | 0 B |
+| SGEMM naive | 32 | 0 B | 0 B |
+| SGEMM tiled 16x16 | 48 | 2,048 B | 0 B |
 
 This table helps make occupancy/resource hypotheses concrete, but occupancy cannot
 be concluded from registers/shared memory alone; launch geometry, architecture
 limits, instruction mix, and achieved scheduling must be measured on the target.
 
+## SGEMM progression
+
+Helix defines row-major `C[M,N] = A[M,K] * B[K,N]` for contiguous Float32 rank-two
+tensors. Both custom paths compute one Float32 accumulator per output and reject
+output aliasing with either input. The CPU oracle accumulates in double, so GPU
+tests use an inner-dimension-aware tolerance. A fused multiply-add counts as two
+floating-point operations; the benchmark reports `2*M*N*K` FLOPs.
+
+### Version 1: one output per thread
+
+A 16x16 block maps thread `(x,y)` to one output `(column,row)`. The two-dimensional
+grid is capped independently in each dimension, and blocks/threads use grid-stride
+loops so the mapping remains correct beyond the cap. Each thread walks all `K`
+values and writes one output.
+
+For a fixed reduction index, adjacent `x` lanes read adjacent values of `B` and
+write adjacent values of `C`; their `A` value is common within a row and can use
+the hardware's broadcast/cache behavior. However, the same `A` and `B` elements
+are redundantly loaded by many output threads. Ignoring caches, one output performs
+`2K` FLOPs, reads `2K` Float32 values, and writes one, for approximately
+`2K / (8K + 4)` FLOP/byte. This is intentionally a transparent baseline.
+
+### Version 2: 16x16 shared-memory tiling
+
+Each block owns a 16x16 output tile. On every `K` tile:
+
+1. threads cooperatively load one `A` tile and one `B` tile into two 16x16 shared
+   arrays,
+2. out-of-range edge positions contribute zero,
+3. a block barrier makes both tiles visible,
+4. each thread performs 16 multiply-adds from shared memory,
+5. a second barrier prevents the next loads from replacing data still in use.
+
+Both cooperative global loads are contiguous along `threadIdx.x`, including for
+non-multiple dimensions before bounds masking. The compiler unrolls the fixed
+16-step inner loop. A full tile performs `2*T^3` FLOPs from `2*T^2` Float32 global
+loads, giving an ideal load-only arithmetic intensity of `T/4 = 4` FLOP/byte at
+`T=16`, before accounting for the output write and cache effects. This model
+explains the reuse opportunity; it is not a measured achieved bandwidth or speedup.
+
+If `K` is zero and `M,N` are nonzero, both kernels still launch and write zero to
+every output without dereferencing the null zero-byte input allocations. If `M` or
+`N` is zero, there is no output storage and no launch. The tiled block's nested
+grid-stride tile loops are uniform across all threads, so every barrier is reached
+by the entire block.
+
+### Correctness and measurement gate
+
+The GPU suite covers a hand-computed 2x3 by 3x2 product; 1x1, 3x5x4, 17x19x23,
+31x33x29, and zero-dimension problems; and invalid rank, inner dimension, dtype,
+alias, and algorithm contracts. Both variants are compared elementwise with
+`cpu::matmul`. These tests have compiled but not executed on a GPU.
+
+The event benchmark performs ten warmups and times preallocated-output calls for
+31x29x37, 64 cubed, 128 cubed, and 256 cubed shapes. A valid hardware study must
+run the exact same problems, record GPU/driver/architecture, and compare the naive
+and tiled results before describing one as faster. A cuBLAS SGEMM baseline will be
+added and checked for equivalent row-major/precision semantics on that hardware;
+the project does not imply that either educational kernel should beat cuBLAS.
+
+The static `sm_52` compiler inspection reports 32 registers/thread for Version 1
+and 48 registers/thread plus 2,048 bytes shared/block for Version 2. Those inputs
+alone do not determine occupancy. Version 3 techniques such as register tiling,
+vectorized loads, or alternative tile shapes are deliberately deferred until
+profiling identifies a limiting resource.
+
 ## Planned evolution
 
-Milestone 6 adds naive and shared-memory tiled GEMM as distinct selectable
-implementations. Optimized variants will not replace their educational baselines,
-and no variant will be called faster without comparable event-timed measurements.
+Milestone 7 introduces the caching device allocator while retaining direct
+`cudaMalloc`/`cudaFree` as its benchmark baseline. Later transformer kernels may
+select a clearly named cuBLAS production path while keeping both custom GEMMs for
+education and measurement. No variant will be called faster without comparable
+event-timed measurements.

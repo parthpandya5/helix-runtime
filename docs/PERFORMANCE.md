@@ -119,9 +119,10 @@ stream as the measured work. End-to-end host latency, transfer latency, and kern
 execution time are reported separately. A kernel launch measured without the
 required synchronization is never reported as execution latency.
 
-CUDA event fixtures now exist for M4 elementwise kernels and every M5
-reduction/softmax variant. Their CUDA 12.6 compile validation is not a benchmark;
-result rows will be added only after execution on a named NVIDIA GPU and driver.
+CUDA event fixtures now exist for M4 elementwise kernels, every M5
+reduction/softmax variant, and both M6 SGEMM implementations. Their CUDA 12.6
+compile validation is not a benchmark; result rows will be added only after
+execution on a named NVIDIA GPU and driver.
 
 ## Local benchmark commands
 

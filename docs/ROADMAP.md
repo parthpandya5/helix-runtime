@@ -178,13 +178,29 @@ tests passed. Static `sm_52` compiler resource data is documented, but none of t
 GPU tests or benchmarks has run. No optimized-variant, bandwidth, or latency claim
 is made. See `docs/CUDA_KERNELS.md`.
 
-### M6 — Matrix multiplication — Planned; hardware pending
+### M6 — Matrix multiplication — Implemented and compile-validated; GPU runtime validation pending
 
 - one-output-element-per-thread naive SGEMM
 - shared-memory tiled SGEMM supporting edge tiles
 - further tiling/vectorization only after profiling
 - honest cuBLAS SGEMM comparison when available
 - FLOP count, traffic model, arithmetic-intensity, and occupancy analysis
+
+Implementation/validation record (2026-08-20): rank-two row-major Float32 GEMM has
+selectable one-output-per-thread and 16x16 shared-memory tiled implementations.
+Both use capped two-dimensional grid-stride tile traversal, checked shape/device/
+stream contracts, explicit alias rejection, asynchronous launches, zero-output
+launch suppression, and correct zero-inner-dimension output. The tiled path
+zero-pads every edge tile and synchronizes before consuming and replacing its two
+shared tiles. GPU tests compare both variants with the double-accumulating CPU
+oracle for known values, zero dimensions, and shapes including 17x19x23 and
+31x33x29; contract tests cover rank, inner dimension, dtype, alias, and invalid
+algorithm errors. Event fixtures cover odd, 64, 128, and 256 square/near-square
+problems. NVCC 12.6.85 compiled all targets with warnings as errors; 50 independent
+tests passed, while 44 GPU tests remain hardware-gated. Static `sm_52` resource
+data and the traffic model are documented. GPU correctness/timing, cuBLAS
+comparison, and any version-three optimization remain pending real hardware. See
+`docs/CUDA_KERNELS.md`.
 
 ## Phase C: device memory systems
 

@@ -8,6 +8,7 @@ if(HELIX_ENABLE_CUDA)
     helix_benchmarks
     PRIVATE
       cuda_elementwise_benchmarks.cpp
+      cuda_matmul_benchmarks.cpp
       cuda_reduction_benchmarks.cpp)
   target_link_libraries(helix_benchmarks PRIVATE helix::cuda_kernels)
 endif()

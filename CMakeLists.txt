@@ -113,6 +113,7 @@ helix_configure_target(helix_tensor)
 if(HELIX_ENABLE_CUDA)
   add_library(helix_cuda_kernels
     src/kernels/cuda/elementwise.cu
+    src/kernels/cuda/matmul.cu
     src/kernels/cuda/reduction.cu
     src/kernels/cuda/softmax.cu)
   add_library(helix::cuda_kernels ALIAS helix_cuda_kernels)

@@ -22,9 +22,10 @@ configurations, and the formatting check passed.
 
 CUDA is optional at configure time. The current Apple Silicon development host has
 no NVIDIA GPU or native CUDA toolkit, so no CUDA execution or performance claim is
-made. The M3 runtime layer, M4 manual Float32 elementwise kernels, and M5 selectable
-reduction/stable-softmax baselines are separately compile-validated in an ARM64
-CUDA 12.6 development container without a driver/device.
+made. The M3 runtime layer, M4 manual Float32 elementwise kernels, M5 selectable
+reduction/stable-softmax baselines, and M6 naive/tiled SGEMM are separately
+compile-validated in an ARM64 CUDA 12.6 development container without a
+driver/device.
 
 ## Architecture
 
@@ -76,9 +77,9 @@ ctest --test-dir build-cuda --output-on-failure
 The CUDA-on build contains checked device, stream, event, allocation, copy, and
 Tensor-storage paths, manual elementwise kernels, CUDA-event benchmarks, and
 hardware-gated correctness tests. Reduction includes naive, shared-memory, and
-warp-shuffle paths; softmax includes naive and shared-memory paths. The build is
-compile-validated, but those tests and benchmarks have not executed on a physical
-NVIDIA GPU.
+warp-shuffle paths; softmax includes naive and shared-memory paths; SGEMM includes
+one-output-per-thread and 16x16 tiled paths. The build is compile-validated, but
+those tests and benchmarks have not executed on a physical NVIDIA GPU.
 
 ### Sanitizers and analysis
 
@@ -151,7 +152,7 @@ cmake --build build --target helix_cpu_kernels_demo
 
 ## Limitations
 
-The CUDA runtime and M4–M5 kernels are compile-validated only; physical GPU
+The CUDA runtime and M4–M6 kernels are compile-validated only; physical GPU
 correctness, timing, and resource validation remain pending. The caching allocator,
 attention, KV cache, scheduler, model execution, and generation are roadmap work
 and are not represented as complete. Float16 has no arithmetic path yet. Tensor
