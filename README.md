@@ -13,13 +13,12 @@ reproducible benchmark evidence.
 
 ## Current status
 
-Milestones 0 and 1 are implemented and CPU-validated. The repository contains the
-CPU-first build foundation and a checked contiguous tensor core with aligned CPU
-storage, shape/stride metadata, scalar and zero-sized tensors, deterministic
-initialization, safe reshape/views, deep copy, and guarded device transfer. On
-2026-08-20, Apple Clang 17 built the project on macOS arm64 with warnings as errors;
-29/29 tests passed in both the normal and ASan/UBSan configurations, and the
-formatting check passed.
+Milestones 0–2 are implemented and CPU-validated. The repository contains the
+CPU-first build foundation, a checked contiguous tensor core, and Float32 reference
+kernels for elementwise math, reductions, stable softmax, matrix multiplication,
+RMSNorm, and SwiGLU. On 2026-08-20, Apple Clang 17 built the project on macOS arm64
+with warnings as errors; 50/50 tests passed in Debug, Release, and ASan/UBSan
+configurations, and the formatting check passed.
 
 CUDA is optional at configure time. The current Apple Silicon development host has
 no NVIDIA GPU or CUDA toolkit, so no CUDA execution or performance claim is made.
@@ -100,7 +99,9 @@ cmake --build build-release -j
 ```
 
 The first release-mode `Tensor::zeros` baseline is recorded without an optimization
-claim. Methodology and future measured experiments live in
+claim. Allocation-free CPU reference-kernel baselines are also recorded, including
+odd-width softmax and odd-dimension/standard-square matmul. Methodology and actual
+measurements live in
 [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md).
 
 ## Tensor runtime
@@ -117,6 +118,22 @@ cmake --build build --target helix_tensor_demo
 ./build/examples/helix_tensor_demo
 ```
 
+## CPU reference kernels
+
+The `helix::cpu` backend provides add, multiply, ReLU, SiLU, full and last-axis
+sum, row-wise softmax, rank-two matmul, RMSNorm, and SwiGLU. Each operation has a
+convenient allocating form and a preallocated `_out` form used for benchmarking
+and eventual GPU-oracle comparisons. Broadcasting is deliberately rejected.
+
+Reductions, GEMM, softmax denominators, and RMS statistics use wider accumulation
+where helpful. Softmax subtracts the row maximum and explicitly defines NaN,
+positive-infinity, and all-negative-infinity behavior.
+
+```bash
+cmake --build build --target helix_cpu_kernels_demo
+./build/examples/helix_cpu_kernels_demo
+```
+
 ## Supported hardware
 
 - CPU foundation: validated with Apple Clang 17 on macOS arm64; Linux GCC/Clang
@@ -127,10 +144,11 @@ cmake --build build --target helix_tensor_demo
 
 ## Limitations
 
-Mathematical kernels, CUDA runtime, allocator, attention, KV cache, scheduler,
-model execution, and generation are roadmap work and are not represented as
-complete. Float16 has no arithmetic path yet. Tensor execution is contiguous-only;
-broadcasting, slicing, and general strided kernels are intentionally deferred.
+The CUDA runtime, allocator, attention, KV cache, scheduler, model execution, and
+generation are roadmap work and are not represented as complete. Float16 has no
+arithmetic path yet. Tensor execution is contiguous-only; broadcasting, slicing,
+and general strided kernels are intentionally deferred. CPU kernels are reference
+implementations, not optimized BLAS replacements.
 
 ## Engineering notes
 

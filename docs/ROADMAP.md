@@ -85,7 +85,7 @@ storage are covered. The full suite contains 29 discovered tests including the
 benchmark smoke test. A release-mode `Tensor::zeros` allocation-plus-zero baseline
 is recorded in `docs/PERFORMANCE.md`.
 
-### M2 — CPU reference kernels — In progress
+### M2 — CPU reference kernels — Implemented, CPU-validated, and benchmarked
 
 Deliverables, in dependency order:
 
@@ -106,9 +106,18 @@ Measurements:
 
 - release-mode latency/throughput baselines labeled as CPU reference results
 
+Validation record (2026-08-20, commit `1488acb`): add, multiply, ReLU, stable
+SiLU, full/last-dimension reduction, stable row-wise softmax, rank-two matmul,
+RMSNorm, and SwiGLU passed Debug, Release, and ASan/UBSan suites. The 50 discovered
+tests cover odd GEMM dimensions, zero-sized reductions/GEMM, alias rules, wide
+accumulation, numerical extremes/non-finite softmax rows, shape/dtype errors, and
+RMSNorm contracts. Allocation-free `_out` baselines were measured in Release mode
+and are recorded in `docs/PERFORMANCE.md`. These kernels intentionally remain clear
+single-threaded correctness oracles; no CPU optimization claim is made.
+
 ## Phase B: CUDA execution and kernel engineering
 
-### M3 — CUDA runtime layer — Planned; hardware pending
+### M3 — CUDA runtime layer — In progress; compilation/runtime hardware pending
 
 - checked CUDA errors with operation context
 - move-only device guard, stream, and event wrappers
