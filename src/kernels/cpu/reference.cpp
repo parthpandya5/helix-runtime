@@ -371,4 +371,78 @@ Tensor swiglu(const Tensor& gate, const Tensor& up) {
   return output;
 }
 
+void rope_out(const Tensor& input, const Tensor& cosine, const Tensor& sine, Tensor& output) {
+  constexpr std::string_view kOperation = "cpu::rope_out";
+  require_reference_tensor(input, "input", kOperation);
+  require_reference_tensor(cosine, "cosine", kOperation);
+  require_reference_tensor(sine, "sine", kOperation);
+  require_output(output, input.shape(), kOperation);
+  HELIX_CHECK(input.rank() >= 2, ErrorCode::kInvalidArgument,
+              tensor_contract_message(kOperation, "input", "must have rank at least two"));
+
+  const auto tokens = static_cast<std::size_t>(input.shape().front());
+  const auto head_dimension = static_cast<std::size_t>(input.shape().back());
+  HELIX_CHECK(head_dimension != 0 && head_dimension % 2 == 0, ErrorCode::kInvalidArgument,
+              tensor_contract_message(kOperation, "last dimension", "must be positive and even"));
+  const std::size_t pairs = head_dimension / 2;
+  const Shape cache_shape{input.shape().front(), static_cast<Dimension>(pairs)};
+  require_shape(cosine, cache_shape, "cosine", kOperation);
+  require_shape(sine, cache_shape, "sine", kOperation);
+  require_distinct_output(cosine, output, kOperation, "cosine");
+  require_distinct_output(sine, output, kOperation, "sine");
+
+  if (tokens == 0 || input.numel() == 0) {
+    return;
+  }
+  const std::size_t vectors_per_token = (input.numel() / tokens) / head_dimension;
+  const auto* input_values = input.data_as<float>();
+  const auto* cosine_values = cosine.data_as<float>();
+  const auto* sine_values = sine.data_as<float>();
+  auto* output_values = output.data_as<float>();
+
+  for (std::size_t token = 0; token < tokens; ++token) {
+    for (std::size_t vector = 0; vector < vectors_per_token; ++vector) {
+      const std::size_t vector_offset = (token * vectors_per_token + vector) * head_dimension;
+      const std::size_t cache_offset = token * pairs;
+      for (std::size_t pair = 0; pair < pairs; ++pair) {
+        const float first = input_values[vector_offset + 2 * pair];
+        const float second = input_values[vector_offset + 2 * pair + 1];
+        const float pair_cosine = cosine_values[cache_offset + pair];
+        const float pair_sine = sine_values[cache_offset + pair];
+        output_values[vector_offset + 2 * pair] = first * pair_cosine - second * pair_sine;
+        output_values[vector_offset + 2 * pair + 1] = first * pair_sine + second * pair_cosine;
+      }
+    }
+  }
+}
+
+Tensor rope(const Tensor& input, const Tensor& cosine, const Tensor& sine) {
+  Tensor output = Tensor::empty(input.shape(), DType::kFloat32, Device::cpu());
+  rope_out(input, cosine, sine, output);
+  return output;
+}
+
+void linear_out(const Tensor& input, const Tensor& weight, Tensor& output) {
+  constexpr std::string_view kOperation = "cpu::linear_out";
+  require_reference_tensor(input, "input", kOperation);
+  require_reference_tensor(weight, "weight", kOperation);
+  HELIX_CHECK(input.rank() == 2, ErrorCode::kInvalidArgument,
+              tensor_contract_message(kOperation, "input", "must have rank two"));
+  HELIX_CHECK(weight.rank() == 2, ErrorCode::kInvalidArgument,
+              tensor_contract_message(kOperation, "weight", "must have rank two"));
+  HELIX_CHECK(input.shape()[1] == weight.shape()[0], ErrorCode::kInvalidArgument,
+              "cpu::linear_out input width must equal weight input features");
+  require_output(output, Shape{input.shape()[0], weight.shape()[1]}, kOperation);
+  matmul_out(input, weight, output);
+}
+
+Tensor linear(const Tensor& input, const Tensor& weight) {
+  HELIX_CHECK(input.rank() == 2 && weight.rank() == 2, ErrorCode::kInvalidArgument,
+              "cpu::linear requires rank-two input and weight");
+  Tensor output =
+      Tensor::empty({input.shape()[0], weight.shape()[1]}, DType::kFloat32, Device::cpu());
+  linear_out(input, weight, output);
+  return output;
+}
+
 } // namespace helix::cpu

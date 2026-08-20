@@ -138,7 +138,8 @@ if(HELIX_ENABLE_CUDA)
     src/kernels/cuda/elementwise.cu
     src/kernels/cuda/matmul.cu
     src/kernels/cuda/reduction.cu
-    src/kernels/cuda/softmax.cu)
+    src/kernels/cuda/softmax.cu
+    src/kernels/cuda/transformer.cu)
   add_library(helix::cuda_kernels ALIAS helix_cuda_kernels)
   target_compile_features(helix_cuda_kernels PUBLIC cxx_std_20)
   target_link_libraries(helix_cuda_kernels PUBLIC helix::tensor helix::cuda_runtime)

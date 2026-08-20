@@ -108,6 +108,18 @@ if(HELIX_ENABLE_CUDA)
     DISCOVERY_MODE PRE_TEST
     PROPERTIES LABELS gpu TIMEOUT 180)
 
+  add_executable(helix_cuda_transformer_tests cuda_transformer_test.cpp)
+  target_link_libraries(
+    helix_cuda_transformer_tests
+    PRIVATE helix::cuda_kernels helix::cpu_kernels GTest::gtest_main)
+  helix_configure_target(helix_cuda_transformer_tests)
+
+  gtest_discover_tests(
+    helix_cuda_transformer_tests
+    TEST_PREFIX "cuda_transformer."
+    DISCOVERY_MODE PRE_TEST
+    PROPERTIES LABELS gpu TIMEOUT 180)
+
   add_executable(helix_cuda_allocator_tests cuda_allocator_test.cpp)
   target_link_libraries(
     helix_cuda_allocator_tests

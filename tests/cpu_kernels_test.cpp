@@ -256,5 +256,66 @@ TEST(SwiGluTest, RejectsShapeMismatch) {
   EXPECT_THROW(static_cast<void>(swiglu(Tensor::zeros({2, 3}), Tensor::zeros({6}))), Error);
 }
 
+TEST(RopeTest, RotatesAdjacentPairsForEveryTokenAndHead) {
+  const Tensor input = Tensor::from_values(
+      {2, 2, 4}, std::array{1.0F, 2.0F, 3.0F, 4.0F, 5.0F, 6.0F, 7.0F, 8.0F, 9.0F, 10.0F, 11.0F,
+                            12.0F, 13.0F, 14.0F, 15.0F, 16.0F});
+  const Tensor cosine = Tensor::from_values({2, 2}, std::array{1.0F, 1.0F, 0.0F, 0.0F});
+  const Tensor sine = Tensor::from_values({2, 2}, std::array{0.0F, 0.0F, 1.0F, 1.0F});
+
+  const Tensor output = rope(input, cosine, sine);
+  expect_values_near(output, std::array{1.0F, 2.0F, 3.0F, 4.0F, 5.0F, 6.0F, 7.0F, 8.0F, -10.0F,
+                                        9.0F, -12.0F, 11.0F, -14.0F, 13.0F, -16.0F, 15.0F});
+}
+
+TEST(RopeTest, SupportsOddWorkCountsEmptyTokensAndExactInPlaceExecution) {
+  Tensor input = Tensor::random_uniform({3, 3, 6}, 9'001, -2.0F, 2.0F);
+  std::array<float, 9> cosine_values{};
+  std::array<float, 9> sine_values{};
+  for (std::size_t index = 0; index < cosine_values.size(); ++index) {
+    const float angle = static_cast<float>(index) * 0.17F;
+    cosine_values[index] = std::cos(angle);
+    sine_values[index] = std::sin(angle);
+  }
+  const Tensor cosine = Tensor::from_values({3, 3}, cosine_values);
+  const Tensor sine = Tensor::from_values({3, 3}, sine_values);
+  const Tensor expected = rope(input, cosine, sine);
+
+  rope_out(input, cosine, sine, input);
+  expect_values_near(input, std::span<const float>(expected.data_as<float>(), expected.numel()),
+                     1.0e-6F);
+
+  const Tensor empty = rope(Tensor::zeros({0, 3, 6}), Tensor::zeros({0, 3}), Tensor::zeros({0, 3}));
+  EXPECT_EQ(empty.shape(), (Shape{0, 3, 6}));
+  EXPECT_EQ(empty.numel(), 0U);
+}
+
+TEST(RopeTest, RejectsInvalidRankWidthCachesAndOutputShape) {
+  EXPECT_THROW(
+      static_cast<void>(rope(Tensor::zeros({4}), Tensor::zeros({4, 2}), Tensor::zeros({4, 2}))),
+      Error);
+  EXPECT_THROW(
+      static_cast<void>(rope(Tensor::zeros({2, 5}), Tensor::zeros({2, 2}), Tensor::zeros({2, 2}))),
+      Error);
+  EXPECT_THROW(
+      static_cast<void>(rope(Tensor::zeros({2, 0}), Tensor::zeros({2, 0}), Tensor::zeros({2, 0}))),
+      Error);
+  EXPECT_THROW(
+      static_cast<void>(rope(Tensor::zeros({2, 4}), Tensor::zeros({1, 2}), Tensor::zeros({2, 2}))),
+      Error);
+
+  const Tensor input = Tensor::zeros({2, 4});
+  Tensor wrong_output = Tensor::zeros({2, 2});
+  EXPECT_THROW(rope_out(input, Tensor::zeros({2, 2}), Tensor::zeros({2, 2}), wrong_output), Error);
+}
+
+TEST(LinearTest, UsesInputByOutputFeatureWeightLayout) {
+  const Tensor input = Tensor::from_values({2, 3}, std::array{1.0F, 2.0F, 3.0F, 4.0F, 5.0F, 6.0F});
+  const Tensor weight =
+      Tensor::from_values({3, 2}, std::array{7.0F, 8.0F, 9.0F, 10.0F, 11.0F, 12.0F});
+  expect_values_near(linear(input, weight), std::array{58.0F, 64.0F, 139.0F, 154.0F});
+  EXPECT_THROW(static_cast<void>(linear(input, Tensor::zeros({4, 2}))), Error);
+}
+
 } // namespace
 } // namespace helix::cpu

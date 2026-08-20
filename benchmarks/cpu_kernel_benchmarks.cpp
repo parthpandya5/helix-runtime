@@ -1,7 +1,10 @@
 #include "helix/kernels/cpu/reference.hpp"
 
 #include <benchmark/benchmark.h>
+#include <cmath>
+#include <cstddef>
 #include <cstdint>
+#include <vector>
 
 namespace helix::cpu {
 namespace {
@@ -78,11 +81,49 @@ void BM_CpuRmsNorm(benchmark::State& state) {
   finish_elementwise_iteration(state, state.range(0) * state.range(1), 3);
 }
 
+void BM_CpuSwiGlu(benchmark::State& state) {
+  const auto elements = static_cast<Dimension>(state.range(0));
+  const Tensor gate = Tensor::random_uniform({elements}, 909, -8.0F, 8.0F);
+  const Tensor up = Tensor::random_uniform({elements}, 1'010, -2.0F, 2.0F);
+  Tensor output = Tensor::empty({elements});
+  for ([[maybe_unused]] auto iteration : state) {
+    swiglu_out(gate, up, output);
+    benchmark::ClobberMemory();
+  }
+  finish_elementwise_iteration(state, state.range(0), 3);
+}
+
+void BM_CpuRope(benchmark::State& state) {
+  const auto tokens = static_cast<Dimension>(state.range(0));
+  const auto heads = static_cast<Dimension>(state.range(1));
+  const auto head_dimension = static_cast<Dimension>(state.range(2));
+  const Tensor input = Tensor::random_uniform({tokens, heads, head_dimension}, 1'111);
+  const auto cache_elements =
+      static_cast<std::size_t>(tokens) * static_cast<std::size_t>(head_dimension / 2);
+  std::vector<float> cosine_values(cache_elements);
+  std::vector<float> sine_values(cache_elements);
+  for (std::size_t index = 0; index < cache_elements; ++index) {
+    const float angle = static_cast<float>(index) * 0.001F;
+    cosine_values[index] = std::cos(angle);
+    sine_values[index] = std::sin(angle);
+  }
+  const Tensor cosine = Tensor::from_values({tokens, head_dimension / 2}, cosine_values);
+  const Tensor sine = Tensor::from_values({tokens, head_dimension / 2}, sine_values);
+  Tensor output = Tensor::empty(input.shape());
+  for ([[maybe_unused]] auto iteration : state) {
+    rope_out(input, cosine, sine, output);
+    benchmark::ClobberMemory();
+  }
+  finish_elementwise_iteration(state, state.range(0) * state.range(1) * state.range(2), 3);
+}
+
 BENCHMARK(BM_CpuAdd)->Arg(1)->Arg(1024)->Arg(1 << 20);
 BENCHMARK(BM_CpuSilu)->Arg(1)->Arg(1024)->Arg(1 << 20);
 BENCHMARK(BM_CpuSoftmax)->Args({1, 128})->Args({32, 128})->Args({16, 1023});
 BENCHMARK(BM_CpuMatmul)->Args({31, 29, 37})->Args({64, 64, 64})->Args({128, 128, 128});
 BENCHMARK(BM_CpuRmsNorm)->Args({1, 4096})->Args({32, 4096});
+BENCHMARK(BM_CpuSwiGlu)->Arg(4096)->Arg(32 * 4096);
+BENCHMARK(BM_CpuRope)->Args({1, 32, 128})->Args({128, 32, 128});
 
 } // namespace
 } // namespace helix::cpu
