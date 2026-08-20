@@ -110,6 +110,24 @@ target_include_directories(
     $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
 helix_configure_target(helix_tensor)
 
+add_library(helix_memory
+  src/memory/helix_allocator.cpp
+  src/memory/system_memory_resource.cpp)
+add_library(helix::memory ALIAS helix_memory)
+target_compile_features(helix_memory PUBLIC cxx_std_20)
+target_link_libraries(helix_memory PUBLIC helix::core)
+if(HELIX_ENABLE_CUDA)
+  target_sources(helix_memory PRIVATE src/memory/cuda_memory_resource.cpp)
+  target_link_libraries(helix_memory PUBLIC helix::cuda_runtime)
+endif()
+target_include_directories(
+  helix_memory
+  PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+    $<BUILD_INTERFACE:${HELIX_GENERATED_INCLUDE_DIR}>
+    $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
+helix_configure_target(helix_memory)
+
 if(HELIX_ENABLE_CUDA)
   add_library(helix_cuda_kernels
     src/kernels/cuda/elementwise.cu
@@ -159,7 +177,7 @@ if(HELIX_BUILD_EXAMPLES)
   add_subdirectory(examples EXCLUDE_FROM_ALL)
 endif()
 
-set(HELIX_INSTALL_TARGETS helix_core helix_tensor helix_cpu_kernels)
+set(HELIX_INSTALL_TARGETS helix_core helix_tensor helix_memory helix_cpu_kernels)
 if(HELIX_ENABLE_CUDA)
   list(APPEND HELIX_INSTALL_TARGETS helix_cuda_runtime helix_cuda_kernels)
 endif()

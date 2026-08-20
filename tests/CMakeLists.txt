@@ -27,6 +27,15 @@ gtest_discover_tests(
   TEST_PREFIX "cpu_kernels."
   DISCOVERY_MODE PRE_TEST)
 
+add_executable(helix_memory_tests memory_allocator_test.cpp)
+target_link_libraries(helix_memory_tests PRIVATE helix::memory GTest::gtest_main)
+helix_configure_target(helix_memory_tests)
+
+gtest_discover_tests(
+  helix_memory_tests
+  TEST_PREFIX "memory."
+  DISCOVERY_MODE PRE_TEST)
+
 if(HELIX_ENABLE_CUDA)
   add_executable(helix_cuda_runtime_tests cuda_runtime_test.cpp)
   target_link_libraries(
@@ -87,4 +96,16 @@ if(HELIX_ENABLE_CUDA)
     TEST_PREFIX "cuda_matmul."
     DISCOVERY_MODE PRE_TEST
     PROPERTIES LABELS gpu TIMEOUT 180)
+
+  add_executable(helix_cuda_allocator_tests cuda_allocator_test.cpp)
+  target_link_libraries(
+    helix_cuda_allocator_tests
+    PRIVATE helix::memory helix::cuda_runtime GTest::gtest_main)
+  helix_configure_target(helix_cuda_allocator_tests)
+
+  gtest_discover_tests(
+    helix_cuda_allocator_tests
+    TEST_PREFIX "cuda_allocator."
+    DISCOVERY_MODE PRE_TEST
+    PROPERTIES LABELS gpu TIMEOUT 120)
 endif()
