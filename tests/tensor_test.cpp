@@ -1,3 +1,4 @@
+#include "helix/core/config.hpp"
 #include "helix/tensor/shape.hpp"
 #include "helix/tensor/storage.hpp"
 #include "helix/tensor/tensor.hpp"
@@ -72,7 +73,9 @@ TEST(StorageTest, RejectsInvalidAlignmentAndUnavailableCuda) {
   EXPECT_THROW(static_cast<void>(Storage::allocate(16, Device::cpu(), 0)), Error);
   EXPECT_THROW(static_cast<void>(Storage::allocate(16, Device::cpu(), 24)), Error);
   EXPECT_THROW(static_cast<void>(Storage::allocate(16, Device::cpu(), kTooSmallAlignment)), Error);
+#if !HELIX_ENABLE_CUDA
   EXPECT_THROW(static_cast<void>(Storage::allocate(16, Device::cuda())), Error);
+#endif
 }
 
 TEST(TensorTest, OwnsCanonicalContiguousMetadata) {
@@ -189,8 +192,10 @@ TEST(TensorTest, CopyValidatesShapeDTypeAndDeviceTransfer) {
 
   EXPECT_THROW(static_cast<void>(destination.copy_from(wrong_shape)), Error);
   EXPECT_THROW(static_cast<void>(destination.copy_from(wrong_dtype)), Error);
+#if !HELIX_ENABLE_CUDA
   EXPECT_THROW(static_cast<void>(destination.to(Device::cuda())), Error);
   EXPECT_THROW(static_cast<void>(Tensor({1}, DType::kFloat32, Device::cuda())), Error);
+#endif
 }
 
 TEST(TensorTest, FromValuesValidatesElementCount) {

@@ -26,3 +26,17 @@ gtest_discover_tests(
   helix_cpu_kernel_tests
   TEST_PREFIX "cpu_kernels."
   DISCOVERY_MODE PRE_TEST)
+
+if(HELIX_ENABLE_CUDA)
+  add_executable(helix_cuda_runtime_tests cuda_runtime_test.cpp)
+  target_link_libraries(
+    helix_cuda_runtime_tests
+    PRIVATE helix::cuda_runtime helix::tensor GTest::gtest_main)
+  helix_configure_target(helix_cuda_runtime_tests)
+
+  gtest_discover_tests(
+    helix_cuda_runtime_tests
+    TEST_PREFIX "cuda_runtime."
+    DISCOVERY_MODE PRE_TEST
+    PROPERTIES LABELS gpu TIMEOUT 60)
+endif()

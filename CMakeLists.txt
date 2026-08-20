@@ -70,12 +70,27 @@ target_include_directories(
     $<BUILD_INTERFACE:${HELIX_GENERATED_INCLUDE_DIR}>
     $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
 
-if(HELIX_ENABLE_CUDA)
-  target_sources(helix_core PRIVATE src/core/cuda_build_probe.cu)
-  set_target_properties(helix_core PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
-endif()
-
 helix_configure_target(helix_core)
+
+if(HELIX_ENABLE_CUDA)
+  add_library(helix_cuda_runtime
+    src/core/cuda_build_probe.cu
+    src/runtime/cuda/device.cpp
+    src/runtime/cuda/error.cpp
+    src/runtime/cuda/event.cpp
+    src/runtime/cuda/memory.cpp
+    src/runtime/cuda/stream.cpp)
+  add_library(helix::cuda_runtime ALIAS helix_cuda_runtime)
+  target_compile_features(helix_cuda_runtime PUBLIC cxx_std_20)
+  target_link_libraries(helix_cuda_runtime PUBLIC helix::core CUDA::cudart)
+  target_include_directories(
+    helix_cuda_runtime
+    PUBLIC
+      $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+      $<BUILD_INTERFACE:${HELIX_GENERATED_INCLUDE_DIR}>
+      $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
+  helix_configure_target(helix_cuda_runtime)
+endif()
 
 add_library(helix_tensor
   src/tensor/shape.cpp
@@ -84,6 +99,9 @@ add_library(helix_tensor
 add_library(helix::tensor ALIAS helix_tensor)
 target_compile_features(helix_tensor PUBLIC cxx_std_20)
 target_link_libraries(helix_tensor PUBLIC helix::core)
+if(HELIX_ENABLE_CUDA)
+  target_link_libraries(helix_tensor PRIVATE helix::cuda_runtime)
+endif()
 target_include_directories(
   helix_tensor
   PUBLIC
@@ -123,8 +141,12 @@ if(HELIX_BUILD_EXAMPLES)
   add_subdirectory(examples EXCLUDE_FROM_ALL)
 endif()
 
+set(HELIX_INSTALL_TARGETS helix_core helix_tensor helix_cpu_kernels)
+if(HELIX_ENABLE_CUDA)
+  list(APPEND HELIX_INSTALL_TARGETS helix_cuda_runtime)
+endif()
 install(
-  TARGETS helix_core helix_tensor helix_cpu_kernels
+  TARGETS ${HELIX_INSTALL_TARGETS}
   EXPORT HelixTargets
   ARCHIVE DESTINATION "${CMAKE_INSTALL_LIBDIR}"
   LIBRARY DESTINATION "${CMAKE_INSTALL_LIBDIR}"

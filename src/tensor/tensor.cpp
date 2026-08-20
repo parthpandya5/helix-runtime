@@ -1,5 +1,12 @@
 #include "helix/tensor/tensor.hpp"
 
+#include "helix/core/config.hpp"
+
+#if HELIX_ENABLE_CUDA
+#include "helix/runtime/cuda/device.hpp"
+#include "helix/runtime/cuda/memory.hpp"
+#endif
+
 #include <cmath>
 #include <cstring>
 #include <limits>
@@ -50,20 +57,20 @@ Tensor Tensor::zeros(Shape shape, DType dtype, Device device) {
 
 Tensor Tensor::random_uniform(Shape shape, std::uint64_t seed, float lower, float upper,
                               DType dtype, Device device) {
-  Tensor result(std::move(shape), dtype, device);
+  const Device initialization_device = device.is_cpu() ? device : Device::cpu();
+  Tensor result(std::move(shape), dtype, initialization_device);
   result.random_uniform_(seed, lower, upper);
-  return result;
+  return device == initialization_device ? result : result.to(device);
 }
 
 Tensor Tensor::from_values(Shape shape, std::span<const float> values, Device device) {
   HELIX_CHECK(values.size() == checked_numel(shape), ErrorCode::kInvalidArgument,
               "value count does not match tensor element count");
-  Tensor result(std::move(shape), DType::kFloat32, device);
-  result.require_cpu("Tensor::from_values");
+  Tensor result(std::move(shape), DType::kFloat32, Device::cpu());
   if (!values.empty()) {
     std::memcpy(result.data(), values.data(), result.nbytes());
   }
-  return result;
+  return device.is_cpu() ? result : result.to(device);
 }
 
 bool Tensor::is_contiguous() const {
@@ -86,11 +93,17 @@ const void* Tensor::data() const noexcept {
 }
 
 Tensor& Tensor::zero_() {
-  require_cpu("Tensor::zero_");
   HELIX_CHECK(is_contiguous(), ErrorCode::kUnsupported,
               "Tensor::zero_ currently requires contiguous storage");
-  if (nbytes_ != 0) {
+  if (device_.is_cpu() && nbytes_ != 0) {
     std::memset(data(), 0, nbytes_);
+  } else if (device_.is_cuda()) {
+#if HELIX_ENABLE_CUDA
+    cuda::DeviceGuard guard(device_.index());
+    cuda::set_device_bytes(data(), 0, nbytes_);
+#else
+    throw_error(ErrorCode::kUnsupported, "Tensor::zero_ requires a CUDA-enabled build");
+#endif
   }
   return *this;
 }
@@ -124,12 +137,21 @@ Tensor& Tensor::copy_from(const Tensor& source) {
   HELIX_CHECK(dtype_ == source.dtype_, ErrorCode::kInvalidArgument,
               "tensor copy requires equal dtypes");
   HELIX_CHECK(device_ == source.device_, ErrorCode::kInvalidArgument,
-              "tensor copy requires equal devices");
+              "tensor copy requires equal devices; use Tensor::to for transfers");
   HELIX_CHECK(is_contiguous() && source.is_contiguous(), ErrorCode::kUnsupported,
               "tensor copy currently requires contiguous tensors");
-  require_cpu("Tensor::copy_from");
-  if (nbytes_ != 0 && data() != source.data()) {
+  if (nbytes_ == 0 || data() == source.data()) {
+    return *this;
+  }
+  if (device_.is_cpu()) {
     std::memmove(data(), source.data(), nbytes_);
+  } else {
+#if HELIX_ENABLE_CUDA
+    cuda::DeviceGuard guard(device_.index());
+    cuda::copy_device_to_device(data(), source.data(), nbytes_);
+#else
+    throw_error(ErrorCode::kUnsupported, "Tensor::copy_from requires a CUDA-enabled build");
+#endif
   }
   return *this;
 }
@@ -144,9 +166,30 @@ Tensor Tensor::to(Device target) const {
   if (target == device_) {
     return clone();
   }
+#if HELIX_ENABLE_CUDA
+  Tensor result(shape_, dtype_, target);
+  if (nbytes_ == 0) {
+    return result;
+  }
+  if (device_.is_cpu() && target.is_cuda()) {
+    cuda::DeviceGuard guard(target.index());
+    cuda::copy_host_to_device(result.data(), data(), nbytes_);
+    return result;
+  }
+  if (device_.is_cuda() && target.is_cpu()) {
+    cuda::DeviceGuard guard(device_.index());
+    cuda::copy_device_to_host(result.data(), data(), nbytes_);
+    return result;
+  }
+  if (device_.is_cuda() && target.is_cuda()) {
+    cuda::copy_device_to_device_peer(result.data(), target.index(), data(), device_.index(),
+                                     nbytes_);
+    return result;
+  }
+#endif
   std::ostringstream message;
   message << "device transfer from " << device_ << " to " << target
-          << " is unavailable until the CUDA runtime layer is implemented";
+          << " is unavailable in this build";
   throw_error(ErrorCode::kUnsupported, message.str());
 }
 

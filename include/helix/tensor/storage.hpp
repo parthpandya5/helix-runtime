@@ -14,7 +14,7 @@ public:
   [[nodiscard]] static std::shared_ptr<Storage>
   allocate(std::size_t size_bytes, Device device, std::size_t alignment = kDefaultStorageAlignment);
 
-  ~Storage() = default;
+  ~Storage();
 
   Storage(const Storage&) = delete;
   Storage& operator=(const Storage&) = delete;
@@ -22,10 +22,10 @@ public:
   Storage& operator=(Storage&&) = delete;
 
   [[nodiscard]] void* data() noexcept {
-    return data_.get();
+    return data_;
   }
   [[nodiscard]] const void* data() const noexcept {
-    return data_.get();
+    return data_;
   }
   [[nodiscard]] std::size_t size_bytes() const noexcept {
     return size_bytes_;
@@ -38,17 +38,9 @@ public:
   }
 
 private:
-  struct AlignedDeleter {
-    std::size_t alignment{kDefaultStorageAlignment};
-    void operator()(std::byte* pointer) const noexcept;
-  };
+  Storage(void* data, std::size_t size_bytes, Device device, std::size_t alignment) noexcept;
 
-  using AlignedPointer = std::unique_ptr<std::byte, AlignedDeleter>;
-
-  Storage(AlignedPointer data, std::size_t size_bytes, Device device,
-          std::size_t alignment) noexcept;
-
-  AlignedPointer data_;
+  void* data_;
   std::size_t size_bytes_;
   Device device_;
   std::size_t alignment_;
