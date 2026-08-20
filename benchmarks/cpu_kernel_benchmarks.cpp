@@ -78,8 +78,8 @@ void BM_CpuRmsNorm(benchmark::State& state) {
   finish_elementwise_iteration(state, state.range(0) * state.range(1), 3);
 }
 
-BENCHMARK(BM_CpuAdd)->Arg(1024)->Arg(1 << 20);
-BENCHMARK(BM_CpuSilu)->Arg(1024)->Arg(1 << 20);
+BENCHMARK(BM_CpuAdd)->Arg(1)->Arg(1024)->Arg(1 << 20);
+BENCHMARK(BM_CpuSilu)->Arg(1)->Arg(1024)->Arg(1 << 20);
 BENCHMARK(BM_CpuSoftmax)->Args({1, 128})->Args({32, 128})->Args({16, 1023});
 BENCHMARK(BM_CpuMatmul)->Args({31, 29, 37})->Args({64, 64, 64})->Args({128, 128, 128});
 BENCHMARK(BM_CpuRmsNorm)->Args({1, 4096})->Args({32, 4096});

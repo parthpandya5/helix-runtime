@@ -110,6 +110,20 @@ target_include_directories(
     $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
 helix_configure_target(helix_tensor)
 
+if(HELIX_ENABLE_CUDA)
+  add_library(helix_cuda_kernels src/kernels/cuda/elementwise.cu)
+  add_library(helix::cuda_kernels ALIAS helix_cuda_kernels)
+  target_compile_features(helix_cuda_kernels PUBLIC cxx_std_20)
+  target_link_libraries(helix_cuda_kernels PUBLIC helix::tensor helix::cuda_runtime)
+  target_include_directories(
+    helix_cuda_kernels
+    PUBLIC
+      $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+      $<BUILD_INTERFACE:${HELIX_GENERATED_INCLUDE_DIR}>
+      $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
+  helix_configure_target(helix_cuda_kernels)
+endif()
+
 add_library(helix_cpu_kernels src/kernels/cpu/reference.cpp)
 add_library(helix::cpu_kernels ALIAS helix_cpu_kernels)
 target_compile_features(helix_cpu_kernels PUBLIC cxx_std_20)
@@ -143,7 +157,7 @@ endif()
 
 set(HELIX_INSTALL_TARGETS helix_core helix_tensor helix_cpu_kernels)
 if(HELIX_ENABLE_CUDA)
-  list(APPEND HELIX_INSTALL_TARGETS helix_cuda_runtime)
+  list(APPEND HELIX_INSTALL_TARGETS helix_cuda_runtime helix_cuda_kernels)
 endif()
 install(
   TARGETS ${HELIX_INSTALL_TARGETS}

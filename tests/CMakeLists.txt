@@ -39,4 +39,16 @@ if(HELIX_ENABLE_CUDA)
     TEST_PREFIX "cuda_runtime."
     DISCOVERY_MODE PRE_TEST
     PROPERTIES LABELS gpu TIMEOUT 60)
+
+  add_executable(helix_cuda_elementwise_tests cuda_elementwise_test.cpp)
+  target_link_libraries(
+    helix_cuda_elementwise_tests
+    PRIVATE helix::cuda_kernels helix::cpu_kernels GTest::gtest_main)
+  helix_configure_target(helix_cuda_elementwise_tests)
+
+  gtest_discover_tests(
+    helix_cuda_elementwise_tests
+    TEST_PREFIX "cuda_elementwise."
+    DISCOVERY_MODE PRE_TEST
+    PROPERTIES LABELS gpu TIMEOUT 120)
 endif()

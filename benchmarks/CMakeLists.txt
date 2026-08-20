@@ -3,6 +3,10 @@ add_executable(helix_benchmarks
   cpu_kernel_benchmarks.cpp
   tensor_benchmarks.cpp)
 target_link_libraries(helix_benchmarks PRIVATE helix::cpu_kernels benchmark::benchmark_main)
+if(HELIX_ENABLE_CUDA)
+  target_sources(helix_benchmarks PRIVATE cuda_elementwise_benchmarks.cpp)
+  target_link_libraries(helix_benchmarks PRIVATE helix::cuda_kernels)
+endif()
 helix_configure_target(helix_benchmarks)
 
 add_test(

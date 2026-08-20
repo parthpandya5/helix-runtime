@@ -9,6 +9,7 @@ on:
       - "include/**"
       - "src/**"
       - "tests/**"
+      - "benchmarks/**"
       - ".github/workflows/cuda-compile.yml"
 
 permissions:
@@ -24,14 +25,14 @@ jobs:
       - name: Install build dependencies
         run: |
           apt-get update
-          DEBIAN_FRONTEND=noninteractive apt-get install --yes cmake ninja-build g++ libgtest-dev
+          DEBIAN_FRONTEND=noninteractive apt-get install --yes cmake ninja-build g++ libbenchmark-dev libgtest-dev
       - name: Configure CUDA build
         run: >-
           cmake -S . -B build-cuda -G Ninja
           -DCMAKE_BUILD_TYPE=Release
           -DHELIX_ENABLE_CUDA=ON
           -DHELIX_BUILD_TESTS=ON
-          -DHELIX_BUILD_BENCHMARKS=OFF
+          -DHELIX_BUILD_BENCHMARKS=ON
           -DHELIX_BUILD_EXAMPLES=OFF
           -DHELIX_FETCH_DEPENDENCIES=OFF
           -DHELIX_WARNINGS_AS_ERRORS=ON

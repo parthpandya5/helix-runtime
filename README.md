@@ -22,8 +22,9 @@ configurations, and the formatting check passed.
 
 CUDA is optional at configure time. The current Apple Silicon development host has
 no NVIDIA GPU or native CUDA toolkit, so no CUDA execution or performance claim is
-made. The M3 runtime layer is separately compile-validated in an ARM64 CUDA 12.6
-development container without a driver/device.
+made. The M3 runtime layer and M4 manual Float32 add, multiply, ReLU, and SiLU
+kernels are separately compile-validated in an ARM64 CUDA 12.6 development
+container without a driver/device.
 
 ## Architecture
 
@@ -73,8 +74,9 @@ ctest --test-dir build-cuda --output-on-failure
 ```
 
 The CUDA-on build contains checked device, stream, event, allocation, copy, and
-Tensor-storage paths plus hardware-gated runtime tests. It is compile-validated,
-but those tests have not executed on a physical NVIDIA GPU.
+Tensor-storage paths, manual elementwise kernels, CUDA-event benchmarks, and
+hardware-gated correctness tests. It is compile-validated, but those tests and
+benchmarks have not executed on a physical NVIDIA GPU.
 
 ### Sanitizers and analysis
 
@@ -147,17 +149,20 @@ cmake --build build --target helix_cpu_kernels_demo
 
 ## Limitations
 
-The CUDA runtime, allocator, attention, KV cache, scheduler, model execution, and
-generation are roadmap work and are not represented as complete. Float16 has no
-arithmetic path yet. Tensor execution is contiguous-only; broadcasting, slicing,
-and general strided kernels are intentionally deferred. CPU kernels are reference
-implementations, not optimized BLAS replacements.
+The CUDA runtime and basic elementwise kernels are compile-validated only; physical
+GPU correctness and resource validation remain pending. The caching allocator,
+attention, KV cache, scheduler, model execution, and generation are roadmap work
+and are not represented as complete. Float16 has no arithmetic path yet. Tensor
+execution is contiguous-only; broadcasting, slicing, and general strided kernels
+are intentionally deferred. CPU kernels are reference implementations, not
+optimized BLAS replacements.
 
 ## Engineering notes
 
 - [Architecture](docs/ARCHITECTURE.md)
 - [Roadmap and validation gates](docs/ROADMAP.md)
 - [CUDA runtime ownership and validation](docs/CUDA_RUNTIME.md)
+- [CUDA kernel design and validation](docs/CUDA_KERNELS.md)
 - [Performance methodology](docs/PERFORMANCE.md)
 - [Contributor/agent rules](AGENTS.md)
 

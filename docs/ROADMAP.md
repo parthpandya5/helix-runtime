@@ -138,12 +138,24 @@ CPU Debug and ASan/UBSan regression suites remained green. Real GPU correctness,
 leak, timing, and peer-copy validation is still required, so M3 is not labeled
 hardware-complete. See `docs/CUDA_RUNTIME.md`.
 
-### M4 — Basic CUDA kernels — In progress; GPU runtime validation pending
+### M4 — Basic CUDA kernels — Implemented and compile-validated; GPU runtime validation pending
 
 - manual vector add, multiply, ReLU, and SiLU
 - CPU-oracle comparisons across non-block-aligned sizes
 - event-timed CPU/CUDA comparisons with warmups
 - documentation of launch-overhead crossover behavior from measured data
+
+Implementation/validation record (2026-08-20): manually implemented Float32 add,
+multiply, ReLU, and numerically stable SiLU use 256-thread grid-stride kernels,
+checked launch errors, explicit stream/device matching, contiguous layout contracts,
+and zero-size launch suppression. Deterministic GPU tests compare against the CPU
+oracles at sizes 0, 1, 31, 257, 4,099, and 65,539 and exercise in-place aliasing,
+extreme SiLU inputs, and contract failures. CUDA-event benchmarks share sizes with
+the CPU benchmarks and perform ten warmup launches. NVCC 12.6.85/GCC 13.2 compiled
+the kernels, GPU tests, and benchmarks with warnings as errors; all 49 independent
+CPU tests passed in that CUDA-on build. The GPU tests and benchmarks have not run,
+so no correctness, crossover, bandwidth, or speedup result is claimed. See
+`docs/CUDA_KERNELS.md`.
 
 ### M5 — Reduction and softmax — Planned; hardware pending
 
