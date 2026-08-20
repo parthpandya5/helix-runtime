@@ -270,11 +270,36 @@ contract; the adapter alone cannot infer outstanding work on other streams.
 
 ## Phase D: transformer primitives and memory
 
-### M9 — Transformer kernels — Planned
+### M9 — CPU-validated and CUDA compile-validated; GPU runtime validation pending
 
 - CPU and CUDA RMSNorm, RoPE, SwiGLU, and projection paths
 - custom educational GEMM remains selectable
 - cuBLAS production path is separately named and documented if added
+
+Implementation/validation record (2026-08-20, commit `bd5a1ab`): CPU and CUDA
+interfaces now cover RMSNorm, SwiGLU, full-dimension adjacent-pair RoPE, and
+bias-free linear projection with row-major `[input_features, output_features]`
+weights. RoPE consumes preselected Float32 cosine/sine rows shaped
+`[tokens, head_dimension/2]`, so packed requests can provide arbitrary positions
+without adding an integer Tensor dtype. The CPU path is the correctness oracle and
+supports exact in-place RMSNorm/RoPE where safe.
+
+The CUDA RMSNorm assigns a 256-thread block to each row, uses warp shuffles plus
+32 bytes of shared memory for its sum-of-squares reduction, and permits exact
+input/output aliasing only after the block-wide statistic is complete. SwiGLU is a
+stable grid-stride pointwise kernel. RoPE assigns one thread to each adjacent pair,
+loads both coordinates before writing either, and therefore supports exact
+in-place rotation with pair-adjacent coalescing. Linear projection delegates to
+the selectable naive/tiled M6 SGEMM; no library path is mislabeled as custom.
+
+Four new CPU tests bring the normal and ASan/UBSan suite to 72/72. Six GPU tests
+compare deterministic outputs with CPU references at empty, odd, boundary, and
+non-tile-aligned shapes and validate contracts. NVCC 12.6.85 compiles all kernels,
+tests, and ten-warmup CUDA-event fixtures with warnings as errors; the CUDA build
+passes 72 independent tests and registers 53 GPU tests. Static `sm_52` compiler
+inspection reports no spills; it is documented separately and is not runtime
+evidence. CPU SwiGLU/RoPE baselines are recorded in `docs/PERFORMANCE.md`; GPU
+correctness and timing await NVIDIA hardware.
 
 ### M10 — Contiguous attention baseline — Planned
 

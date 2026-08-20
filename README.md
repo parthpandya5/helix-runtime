@@ -13,22 +13,23 @@ reproducible benchmark evidence.
 
 ## Current status
 
-Milestones 0–2 and the host-testable portions of Milestones 7–8 are implemented
-and CPU-validated. The repository contains the CPU-first build foundation, a
-checked contiguous tensor core, Float32 reference kernels for elementwise math,
-reductions, stable softmax, matrix multiplication, RMSNorm, and SwiGLU, a caching
-allocator, and a completion-aware deferred-reclamation layer. On 2026-08-20,
-Apple Clang 17 built the project on macOS arm64 with warnings as errors; 68/68 CPU
-tests passed in normal and ASan/UBSan configurations.
+Milestones 0–2, the host-testable portions of Milestones 7–8, and the CPU path of
+Milestone 9 are implemented and CPU-validated. The repository contains the
+CPU-first build foundation, a checked contiguous tensor core, Float32 reference
+kernels for elementwise math, reductions, stable softmax, matrix multiplication,
+RMSNorm, SwiGLU, adjacent-pair RoPE, and linear projection, plus a caching allocator
+and completion-aware deferred reclamation. On 2026-08-20, Apple Clang 17 built the
+project on macOS arm64 with warnings as errors; 72/72 CPU tests passed in normal and
+ASan/UBSan configurations.
 
 CUDA is optional at configure time. The current Apple Silicon development host has
 no NVIDIA GPU or native CUDA toolkit, so no CUDA execution or performance claim is
 made. The M3 runtime layer, M4 manual Float32 elementwise kernels, M5 selectable
 reduction/stable-softmax baselines, and M6 naive/tiled SGEMM are separately
 compile-validated in an ARM64 CUDA 12.6 development container without a
-driver/device.
-The CUDA stream-ordered allocator adapter and its hardware-gated non-reuse test are
-also compile-validated, not runtime-validated.
+driver/device. The M8 stream-ordered allocator and M9 block-reduced RMSNorm,
+grid-stride SwiGLU, adjacent-pair RoPE, and projection adapter are also compile-
+validated, not runtime-validated.
 
 ## Architecture
 
@@ -81,8 +82,10 @@ The CUDA-on build contains checked device, stream, event, allocation, copy, and
 Tensor-storage paths, manual elementwise kernels, CUDA-event benchmarks, and
 hardware-gated correctness tests. Reduction includes naive, shared-memory, and
 warp-shuffle paths; softmax includes naive and shared-memory paths; SGEMM includes
-one-output-per-thread and 16x16 tiled paths. The build is compile-validated, but
-those tests and benchmarks have not executed on a physical NVIDIA GPU.
+one-output-per-thread and 16x16 tiled paths. Transformer primitives add custom
+RMSNorm, SwiGLU, and RoPE kernels while projection delegates to the selectable
+custom SGEMM. The build is compile-validated, but those tests and benchmarks have
+not executed on a physical NVIDIA GPU.
 
 ### Sanitizers and analysis
 
@@ -111,8 +114,8 @@ cmake --build build-release -j
 
 The first release-mode `Tensor::zeros` baseline is recorded without an optimization
 claim. Allocation-free CPU reference-kernel baselines are also recorded, including
-odd-width softmax and odd-dimension/standard-square matmul. Methodology and actual
-measurements live in
+odd-width softmax, odd-dimension/standard-square matmul, SwiGLU, and decode/prefill-
+shaped RoPE. Methodology and actual measurements live in
 [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md).
 
 ## Tensor runtime
@@ -132,9 +135,10 @@ cmake --build build --target helix_tensor_demo
 ## CPU reference kernels
 
 The `helix::cpu` backend provides add, multiply, ReLU, SiLU, full and last-axis
-sum, row-wise softmax, rank-two matmul, RMSNorm, and SwiGLU. Each operation has a
-convenient allocating form and a preallocated `_out` form used for benchmarking
-and eventual GPU-oracle comparisons. Broadcasting is deliberately rejected.
+sum, row-wise softmax, rank-two matmul, RMSNorm, SwiGLU, adjacent-pair RoPE, and a
+model-layout linear wrapper. Each operation has a convenient allocating form and a
+preallocated `_out` form used for benchmarking and GPU-oracle comparisons.
+Broadcasting is deliberately rejected.
 
 Reductions, GEMM, softmax denominators, and RMS statistics use wider accumulation
 where helpful. Softmax subtracts the row maximum and explicitly defines NaN,
@@ -173,7 +177,7 @@ contract, and limitations are in
 
 ## Limitations
 
-The CUDA runtime, M4–M6 kernels, and M7–M8 CUDA allocator adapters are
+The CUDA runtime, M4–M6/M9 kernels, and M7–M8 CUDA allocator adapters are
 compile-validated only; physical GPU correctness, timing, and resource validation
 remain pending. Tensor allocator integration, attention, KV cache, scheduler,
 model execution, and generation are roadmap work and are not represented as

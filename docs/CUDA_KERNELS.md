@@ -2,13 +2,14 @@
 
 ## Validation status
 
-The Milestone 4 elementwise, Milestone 5 reduction/softmax, and Milestone 6 SGEMM
-kernels are **CUDA compile-validated, not GPU runtime-validated**. NVCC 12.6.85 and
-GCC 13.2 compiled the implementations, hardware-gated correctness tests, and
-CUDA-event benchmarks in the ARM64 CUDA 12.6 development container with CUDA and
-host warnings promoted to errors. The container has no NVIDIA driver or device, so
-the tests and benchmarks have not executed. This document therefore contains no
-GPU latency, bandwidth, CPU/GPU crossover, or speedup claim.
+The Milestone 4 elementwise, Milestone 5 reduction/softmax, Milestone 6 SGEMM, and
+Milestone 9 transformer kernels are **CUDA compile-validated, not GPU runtime-
+validated**. NVCC 12.6.85 and GCC 13.2 compiled the implementations, hardware-gated
+correctness tests, and CUDA-event benchmarks in the ARM64 CUDA 12.6 development
+container with CUDA and host warnings promoted to errors. The container has no
+NVIDIA driver or device, so the tests and benchmarks have not executed. This
+document therefore contains no GPU latency, bandwidth, CPU/GPU crossover, or
+speedup claim.
 
 ## Implemented operations
 
@@ -210,6 +211,9 @@ measurements, and may change with architecture/toolchain:
 | softmax shared | 25 | 5,120 B | 0 B |
 | SGEMM naive | 32 | 0 B | 0 B |
 | SGEMM tiled 16x16 | 48 | 2,048 B | 0 B |
+| RMSNorm warp-reduced | 21 | 32 B | 0 B |
+| SwiGLU | 17 | 0 B | 0 B |
+| RoPE adjacent-pair | 27 | 0 B | 0 B |
 
 This table helps make occupancy/resource hypotheses concrete, but occupancy cannot
 be concluded from registers/shared memory alone; launch geometry, architecture
@@ -281,10 +285,87 @@ alone do not determine occupancy. Version 3 techniques such as register tiling,
 vectorized loads, or alternative tile shapes are deliberately deferred until
 profiling identifies a limiting resource.
 
+## Transformer primitives
+
+Milestone 9 adds Float32 RMSNorm, SwiGLU, and RoPE kernels in
+`src/kernels/cuda/transformer.cu`. The bias-free linear API uses row-major weights
+shaped `[input_features, output_features]` and delegates to the explicitly selected
+M6 naive or tiled SGEMM. No cuBLAS or framework implementation is hidden behind
+these entry points.
+
+### RMSNorm
+
+Input is interpreted as contiguous rows over the last dimension. One 256-thread
+block owns a row and each thread accumulates squares at columns `threadIdx.x +
+k*256`, giving adjacent lanes adjacent global loads. Eight warp-local shuffle sums
+are reduced by the first warp through 32 bytes of shared memory. Thread zero stores
+the reciprocal RMS in that shared array; after a barrier, all threads apply the
+scale and per-column weight.
+
+Exact input/output aliasing is safe because every thread finishes the collective
+sum-of-squares read before any thread writes the row. Output/weight aliasing is
+rejected. A final barrier prevents a grid-striding block from replacing shared
+state while peers finish the previous row. Accumulation and `rsqrtf` are Float32;
+the CPU oracle accumulates in double, so tests use a numerical tolerance rather
+than bit equality. Empty outer dimensions suppress the launch, while a zero-width
+row is rejected because its mean square is undefined.
+
+This layout has modest static resource demand in the `sm_52` compiler inspection:
+21 registers/thread, 32 bytes of shared memory, and no spills. That does not prove
+occupancy or performance on a target GPU.
+
+### SwiGLU
+
+SwiGLU computes `silu(gate[i]) * up[i]` with a 256-thread grid-stride loop. It uses
+the same overflow-resistant positive/negative SiLU branches as the standalone
+elementwise implementation. Adjacent lanes read adjacent gate/up values and write
+adjacent outputs, so the three arrays have coalescing-friendly access. Exact output
+aliasing with either input is safe because a thread loads both values before its
+single write. Static inspection reports 17 registers/thread and no shared memory or
+spills.
+
+### RoPE
+
+Helix uses an explicit adjacent-pair convention over the complete even last
+dimension:
+
+```text
+y[2p]     = x[2p] * cos[t,p] - x[2p+1] * sin[t,p]
+y[2p + 1] = x[2p] * sin[t,p] + x[2p+1] * cos[t,p]
+```
+
+Input layout is `[tokens, ..., head_dimension]`; the intervening dimensions are
+independent vectors/heads. Cosine and sine are preselected Float32 caches shaped
+`[tokens, head_dimension/2]`. Selecting cache rows outside this kernel permits a
+future packed batch to use unrelated token positions. It also makes the kernel a
+pure rotation oracle without embedding an integer position representation into the
+Tensor core.
+
+One thread owns one pair. Pair index varies fastest, so adjacent threads consume
+adjacent two-Float regions within a head; cache reads are adjacent and reused across
+heads through normal caching. Each thread loads both coordinates before writing
+either, making exact in-place rotation race-free. The grid-stride launch supports
+odd pair-task counts and caps the grid at 65,535 blocks. Static `sm_52` inspection
+reports 27 registers/thread, no shared memory, and no spills.
+
+### Correctness and benchmark gate
+
+CPU tests cover known quarter-turn rotations, three tokens by three heads with an
+odd 27-pair task count, exact in-place execution, empty tokens, invalid rank, odd or
+zero head width, cache shape, and output shape. GPU tests compare RMSNorm widths 1,
+37, and 513; SwiGLU sizes 0, 1, 31, 257, and 4,099; RoPE shapes through 5x7x34;
+both linear GEMM variants; exact in-place paths; and invalid contracts. The GPU
+tests compile and are hardware-gated; they have not executed here.
+
+CUDA benchmarks preallocate all storage, perform ten warmup launches, then use
+same-stream CUDA events with stop-event synchronization. RMSNorm uses 1x4,096 and
+32x4,096 rows, SwiGLU uses 4,096 and 131,072 values, and RoPE uses decode-shaped
+1x32x128 and prefill-shaped 128x32x128 inputs. Projection uses the existing M6 GEMM
+fixtures. No result or optimization conclusion is recorded without hardware.
+
 ## Planned evolution
 
-Milestone 7 introduces the caching device allocator while retaining direct
-`cudaMalloc`/`cudaFree` as its benchmark baseline. Later transformer kernels may
-select a clearly named cuBLAS production path while keeping both custom GEMMs for
-education and measurement. No variant will be called faster without comparable
-event-timed measurements.
+The caching device allocator retains direct `cudaMalloc`/`cudaFree` as its benchmark
+baseline. A later production projection path may select clearly named cuBLAS while
+keeping both custom GEMMs for education and measurement. No variant will be called
+faster without comparable event-timed measurements.

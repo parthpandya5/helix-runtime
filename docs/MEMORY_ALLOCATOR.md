@@ -4,7 +4,7 @@
 
 The allocator metadata and generic deferred-reclamation layers are **implemented,
 CPU-validated, sanitizer-validated, and host-resource benchmarked**. Eighteen
-focused allocator/deferred tests and the full 68-test CPU suite pass under normal
+focused allocator/deferred tests and the full 72-test CPU suite pass under normal
 and ASan/UBSan builds. A CUDA 12.6 warnings-as-errors build compiles
 `CudaMemoryResource`, `StreamOrderedAllocator`, three hardware-gated allocator
 tests, and native-CUDA comparison benchmarks, but no CUDA allocator code has run on

@@ -25,6 +25,7 @@ Every recorded experiment must include:
 | M1 `Tensor::zeros` baseline | No earlier implementation | Allocate 64-byte-aligned CPU storage and zero it | Median CPU time: 191 ns (1 float), 240 ns (1,024 floats), 23.589 us (1,048,576 floats) | This measures allocation, tensor metadata construction, and zeroing together. It is a starting point, not evidence of an optimization or a standalone memory-bandwidth result. |
 | M2 CPU reference kernels | No earlier implementation | Clear single-threaded Float32 correctness paths with preallocated output | Representative median CPU times: add 1,048,576 values 121.685 us; softmax 32x128 21.172 us; matmul 128x128x128 1.521 ms (2.758 GFLOP/s); RMSNorm 32x4096 132.403 us | These establish correctness-oracle baselines. They are not optimized CPU-library comparisons, and allocation is excluded through `_out` APIs. |
 | M7 host-resource allocator baseline | Direct aligned C++ allocation/free | Route identical fixed and 16-allocation mixed traces through the best-fit cache | Median CPU time per fixed pair: direct/Helix 22.6/87.1 ns (256 B), 22.0/88.6 ns (4 KiB), 548/88.2 ns (1 MiB); mixed trace 1.657/2.016 us | Host allocation already caches small blocks, so Helix metadata loses on small/mixed traces but avoids repeated upstream work for 1 MiB. This does not predict `cudaMalloc` behavior. |
+| M9 CPU transformer primitives | No earlier RoPE fixture; M2 provided scalar SiLU only | Add preallocated SwiGLU and adjacent-pair RoPE reference paths | Median CPU time: SwiGLU 4,096 values 44.602 us and 131,072 values 1.512 ms; RoPE 1x32x128 1.904 us and 128x32x128 187.894 us | These are single-threaded correctness baselines, not optimized CPU or GPU comparisons. High host load makes wall-time variation substantial. |
 
 ## M1 CPU tensor baseline — 2026-08-20
 
@@ -157,6 +158,47 @@ Command:
 The relevant production question is native `cudaMalloc/cudaFree` versus the CUDA-
 backed cache under GPU allocation traces. Those fixtures compile, but the current
 machine cannot execute them; no CUDA allocation latency or speedup is reported.
+
+## M9 CPU transformer-primitive baseline — 2026-08-20
+
+Environment:
+
+- source: commit `bd5a1ab`
+- host: Apple M3 Pro, 12 CPU cores, 18 GB RAM
+- OS/compiler/build: macOS 26.0.1 arm64, Apple Clang 17.0.0, Release,
+  `HELIX_ENABLE_CUDA=OFF`, Float32
+- Google Benchmark: 1.9.1
+- output allocation and cosine/sine construction: excluded from timed regions
+- warmup: time-based 0.1 seconds per case
+- measurement: time-based minimum 0.2 seconds per repetition, five repetitions;
+  median CPU time reported
+- one-minute load average at start: 29.32; affinity and CPU-frequency metadata were
+  unavailable
+
+| Operation and shape | Median CPU time | Derived value rate |
+|---|---:|---:|
+| SwiGLU, 4,096 values | 44.602 us | 91.84 million values/s |
+| SwiGLU, 131,072 values | 1.512 ms | 86.66 million values/s |
+| RoPE, 1 token x 32 heads x 128 | 1.904 us | 2.152 billion values/s |
+| RoPE, 128 tokens x 32 heads x 128 | 187.894 us | 2.790 billion values/s |
+
+Command:
+
+```bash
+./build-release/benchmarks/helix_benchmarks \
+  --benchmark_filter='BM_Cpu(SwiGlu|Rope)' \
+  --benchmark_min_warmup_time=0.1 \
+  --benchmark_min_time=0.2s \
+  --benchmark_repetitions=5 \
+  --benchmark_report_aggregates_only=true
+```
+
+SwiGLU evaluates the stable SiLU branch plus multiplication, while RoPE consumes
+already selected cosine/sine cache rows and rotates adjacent coordinate pairs.
+Neither fixture includes cache generation or Tensor allocation. The unusually high
+load produced 9–19% real-time coefficients of variation even though CPU-time
+variation was lower; these values are retained as local baselines and should be
+remeasured on an idle host before optimization conclusions.
 
 ## Timing rules
 

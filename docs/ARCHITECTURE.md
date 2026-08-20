@@ -190,7 +190,8 @@ loops and numerically stable formulas. Parallelism and SIMD may be explored only
 after baselines are retained and measured.
 
 The reference set grows in dependency order: elementwise operations, activations,
-reduction, softmax, matrix multiplication, RMSNorm, and SwiGLU.
+reduction, softmax, matrix multiplication, RMSNorm, SwiGLU, adjacent-pair RoPE,
+and bias-free linear projection.
 
 ## CUDA backend
 
@@ -213,6 +214,15 @@ Educational kernels remain separately selectable and benchmarkable:
 
 cuBLAS/cuBLASLt may later provide an optimized GEMM path. It will be labeled as a
 library backend and compared honestly with custom kernels.
+
+The implemented transformer primitives retain the same separation. CUDA RMSNorm
+uses a block/warp reduction, SwiGLU uses a pointwise grid-stride kernel, and RoPE
+maps one thread to each adjacent coordinate pair. RoPE input is
+`[tokens, ..., head_dimension]`, with preselected cosine/sine rows shaped
+`[tokens, head_dimension/2]`; this keeps position selection outside the math kernel
+and supports packed nonuniform positions later. Linear projection is a named
+adapter over the selectable custom SGEMM and uses row-major
+`[input_features, output_features]` weights.
 
 ## Memory allocator
 
