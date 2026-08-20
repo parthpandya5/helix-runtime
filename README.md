@@ -21,7 +21,9 @@ with warnings as errors; 50/50 tests passed in Debug, Release, and ASan/UBSan
 configurations, and the formatting check passed.
 
 CUDA is optional at configure time. The current Apple Silicon development host has
-no NVIDIA GPU or CUDA toolkit, so no CUDA execution or performance claim is made.
+no NVIDIA GPU or native CUDA toolkit, so no CUDA execution or performance claim is
+made. The M3 runtime layer is separately compile-validated in an ARM64 CUDA 12.6
+development container without a driver/device.
 
 ## Architecture
 
@@ -70,8 +72,9 @@ cmake --build build-cuda -j
 ctest --test-dir build-cuda --output-on-failure
 ```
 
-At present this performs a real CUDA translation-unit compile but does not claim a
-completed CUDA runtime or GPU-tested kernels.
+The CUDA-on build contains checked device, stream, event, allocation, copy, and
+Tensor-storage paths plus hardware-gated runtime tests. It is compile-validated,
+but those tests have not executed on a physical NVIDIA GPU.
 
 ### Sanitizers and analysis
 
@@ -154,6 +157,7 @@ implementations, not optimized BLAS replacements.
 
 - [Architecture](docs/ARCHITECTURE.md)
 - [Roadmap and validation gates](docs/ROADMAP.md)
+- [CUDA runtime ownership and validation](docs/CUDA_RUNTIME.md)
 - [Performance methodology](docs/PERFORMANCE.md)
 - [Contributor/agent rules](AGENTS.md)
 

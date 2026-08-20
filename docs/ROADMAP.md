@@ -117,7 +117,7 @@ single-threaded correctness oracles; no CPU optimization claim is made.
 
 ## Phase B: CUDA execution and kernel engineering
 
-### M3 — CUDA runtime layer — In progress; compilation/runtime hardware pending
+### M3 — CUDA runtime layer — Compile-validated; GPU runtime validation pending
 
 - checked CUDA errors with operation context
 - move-only device guard, stream, and event wrappers
@@ -128,7 +128,17 @@ single-threaded correctness oracles; no CPU optimization claim is made.
 Exit criteria include leak-free resource tests on real NVIDIA hardware. Compile-only
 validation is tracked separately.
 
-### M4 — Basic CUDA kernels — Planned; hardware pending
+Implementation/validation record (2026-08-20, commit `ebb3585`): checked CUDA
+errors, device guards, move-only streams/events/buffers, synchronous/asynchronous
+copies, event timing, direct CUDA Tensor storage, zeroing, cloning, and device
+transfer compiled with NVCC 12.6.85/GCC 13.2 in an ARM64 CUDA 12.6 development
+container. The CUDA-on warnings-as-errors build and 49 hardware-independent tests
+passed. Six GPU tests compiled and skipped due the explicitly absent driver/device.
+CPU Debug and ASan/UBSan regression suites remained green. Real GPU correctness,
+leak, timing, and peer-copy validation is still required, so M3 is not labeled
+hardware-complete. See `docs/CUDA_RUNTIME.md`.
+
+### M4 — Basic CUDA kernels — In progress; GPU runtime validation pending
 
 - manual vector add, multiply, ReLU, and SiLU
 - CPU-oracle comparisons across non-block-aligned sizes
