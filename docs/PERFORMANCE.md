@@ -24,6 +24,7 @@ Every recorded experiment must include:
 |---|---|---|---|---|
 | M1 `Tensor::zeros` baseline | No earlier implementation | Allocate 64-byte-aligned CPU storage and zero it | Median CPU time: 191 ns (1 float), 240 ns (1,024 floats), 23.589 us (1,048,576 floats) | This measures allocation, tensor metadata construction, and zeroing together. It is a starting point, not evidence of an optimization or a standalone memory-bandwidth result. |
 | M2 CPU reference kernels | No earlier implementation | Clear single-threaded Float32 correctness paths with preallocated output | Representative median CPU times: add 1,048,576 values 121.685 us; softmax 32x128 21.172 us; matmul 128x128x128 1.521 ms (2.758 GFLOP/s); RMSNorm 32x4096 132.403 us | These establish correctness-oracle baselines. They are not optimized CPU-library comparisons, and allocation is excluded through `_out` APIs. |
+| M7 host-resource allocator baseline | Direct aligned C++ allocation/free | Route identical fixed and 16-allocation mixed traces through the best-fit cache | Median CPU time per fixed pair: direct/Helix 22.6/87.1 ns (256 B), 22.0/88.6 ns (4 KiB), 548/88.2 ns (1 MiB); mixed trace 1.657/2.016 us | Host allocation already caches small blocks, so Helix metadata loses on small/mixed traces but avoids repeated upstream work for 1 MiB. This does not predict `cudaMalloc` behavior. |
 
 ## M1 CPU tensor baseline — 2026-08-20
 
@@ -107,6 +108,55 @@ cross-machine claims. The declining naive-matmul rate as size grows is expected
 from its unblocked `i,j,k` loop and strided access down columns of the right-hand
 matrix. That observation motivates the separate tiled CUDA progression; the CPU
 oracle is kept simple and numerically conservative with double accumulation.
+
+## M7 host-resource allocator baseline — 2026-08-20
+
+Environment:
+
+- source: commit `746d0a5`
+- host: Apple M3 Pro, 12 CPU cores, 18 GB RAM
+- OS/compiler/build: macOS 26.0.1 arm64, Apple Clang 17.0.0, Release,
+  `HELIX_ENABLE_CUDA=OFF`, warnings as errors
+- Google Benchmark: 1.9.1
+- repetitions: five; each repetition executes exactly 200,000 benchmark iterations
+- warmup: time-based 0.05 seconds per case
+- reported metric: median CPU time; one benchmark thread
+- host load average at start: 13.30, 12.74, 12.46; affinity and CPU-frequency
+  metadata were unavailable
+
+Fixed-size results time one allocate/deallocate pair. `SystemMemoryResource` calls
+aligned C++ `operator new/delete` every iteration; the Helix path retains a 64 MiB
+default segment and uses its mutex-protected metadata cache after one upstream
+allocation.
+
+| Requested size | Direct resource | Helix cache | Observed outcome |
+|---:|---:|---:|---|
+| 256 B | 22.6 ns | 87.1 ns | Helix is 3.85x slower on this host path. |
+| 4 KiB | 22.0 ns | 88.6 ns | Helix is 4.03x slower on this host path. |
+| 1 MiB | 548 ns | 88.2 ns | Helix is 6.21x lower latency after cache warmup. |
+
+The mixed trace allocates 16 blocks from 64 B through 256 KiB, then frees them in
+reverse order. Direct allocation took 1.657 us per trace; Helix took 2.016 us and
+retained 67,108,864 bytes with one upstream allocation. The cache was 21.7% slower
+here, and the retained/requested ratio exposes that the GPU-oriented 64 MiB default
+segment is excessive for this small host trace. These unfavorable results are
+kept because they identify the mutex/vector/map bookkeeping cost and demonstrate
+that caching is not intrinsically faster.
+
+Command:
+
+```bash
+./build-release/benchmarks/helix_benchmarks \
+  --benchmark_filter='BM_(SystemResource|HelixAllocator)' \
+  --benchmark_min_warmup_time=0.05 \
+  --benchmark_min_time=200000x \
+  --benchmark_repetitions=5 \
+  --benchmark_report_aggregates_only=true
+```
+
+The relevant production question is native `cudaMalloc/cudaFree` versus the CUDA-
+backed cache under GPU allocation traces. Those fixtures compile, but the current
+machine cannot execute them; no CUDA allocation latency or speedup is reported.
 
 ## Timing rules
 

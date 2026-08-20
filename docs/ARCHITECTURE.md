@@ -157,7 +157,8 @@ producing wrong results.
 
 ### Ownership
 
-- Owning factory operations allocate `Storage` through the backend allocator.
+- Owning factory operations allocate `Storage` through a backend-specific storage
+  routine. CUDA storage remains direct until the cache is stream-safe.
 - Views retain shared storage ownership.
 - A non-owning external-buffer tensor, if added, requires an explicit lifetime
   token/deleter; it will not masquerade as owning memory.
@@ -215,39 +216,51 @@ library backend and compared honestly with custom kernels.
 
 ## Memory allocator
 
-`HelixAllocator` owns device segments obtained from CUDA and suballocates aligned
-blocks. The baseline design uses best-fit selection because LLM workloads mix a
-small number of long-lived weight/KV allocations with transient buffers; choosing
-the smallest sufficient free block limits avoidable remainder growth. Benchmarks
-will compare this hypothesis with allocation traces rather than treating it as
-settled fact.
+`HelixAllocator` owns segments obtained from a pluggable `MemoryResource` and
+suballocates aligned blocks. `SystemMemoryResource` makes the complete metadata
+algorithm executable under CPU-only builds; `CudaMemoryResource` is the direct
+`cudaMalloc`/`cudaFree` adapter. The baseline uses best-fit selection because LLM
+workloads mix long-lived allocations with transient buffers, but benchmarks must
+test that hypothesis rather than assuming it.
 
-Each segment maintains address-ordered blocks for adjacency/merging and a
-size-oriented free index for lookup. Allocation splits a block only when the
-remainder can satisfy alignment and minimum-block constraints. Freeing merges
-adjacent free blocks within the same underlying CUDA segment.
+Each segment stores a vector of address-ordered blocks. The current baseline scans
+all free blocks linearly, including alignment padding, then selects the candidate
+with the smallest remainder and deterministic segment/address tie breaking. This
+is intentionally simpler and easier to audit than a second size index; profiling
+must justify a more complex index. Requested sizes round to the effective power-of-
+two alignment, and allocation splits exact prefix/suffix remainders. Freeing
+rebuilds the affected address-ordered list and merges every adjacent free block in
+the same segment.
 
 ```mermaid
 flowchart LR
     Need[Aligned request] --> Find[Best-fit free block]
     Find --> Split{Useful remainder?}
-    Split -->|yes| Used[Allocated prefix]
-    Split -->|yes| Free[Free remainder]
-    Split -->|no| Whole[Allocate whole block]
-    Release[Release block] --> Deferred[Stream-safe deferred list]
-    Deferred --> Reclaim[Event complete]
-    Reclaim --> Merge[Merge adjacent free blocks]
+    Split --> Prefix[Optional alignment prefix]
+    Split --> Used[Generation-tagged allocated block]
+    Split --> Suffix[Optional free suffix]
+    Release[Validated allocation handle] --> Merge[Merge adjacent free blocks]
+    Merge --> Cache[Reusable cached segment]
+    Cache --> Trim[Explicitly release wholly free segment]
 ```
 
-The allocator reports reserved, allocated, reusable free, peak allocated,
-allocation/reuse counts, and underlying CUDA allocation count. External
-fragmentation is defined as `1 - largest_free_block / total_free_bytes` when free
-bytes are nonzero; otherwise it is zero. Alignment waste and unsplittable tails
-are reported separately as internal fragmentation when implemented.
+The allocator reports reserved, rounded allocated, requested, free, peak, largest
+free block, active/segment counts, cache reuse, and upstream allocation/release
+counts. External fragmentation is `1 - largest_free_block / bytes_free` when free
+bytes are nonzero. Internal fragmentation is
+`(bytes_allocated - bytes_requested) / bytes_allocated` when allocated bytes are
+nonzero. Both are otherwise zero.
 
-The baseline allocator is explicitly single-stream or synchronization-requiring.
-Stream-aware reuse adds CUDA event-tracked deferred frees; it is not simulated by
-blind immediate reuse.
+Allocation handles carry a monotonic ID as well as pointer/size/alignment/device.
+Deallocation validates all fields and the active ID, so a stale copy cannot free a
+new allocation that reused the same address (the raw-pointer ABA problem). A mutex
+serializes metadata and upstream calls. Debug builds re-derive segment coverage,
+block adjacency, counters, active mappings, and alignment after every mutation.
+
+The baseline allocator's immediate free-list reuse is unsafe if GPU work still
+uses the pointer. It is not wired into Tensor storage yet. M8 must add explicit
+stream/event lifetime tracking before integration; CPU metadata tests are not
+presented as proof of asynchronous CUDA safety.
 
 ## Attention
 

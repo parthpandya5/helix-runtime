@@ -16,9 +16,10 @@ reproducible benchmark evidence.
 Milestones 0–2 are implemented and CPU-validated. The repository contains the
 CPU-first build foundation, a checked contiguous tensor core, and Float32 reference
 kernels for elementwise math, reductions, stable softmax, matrix multiplication,
-RMSNorm, and SwiGLU. On 2026-08-20, Apple Clang 17 built the project on macOS arm64
-with warnings as errors; 50/50 tests passed in Debug, Release, and ASan/UBSan
-configurations, and the formatting check passed.
+RMSNorm, and SwiGLU, plus the CPU-testable M7 caching-allocator core. On
+2026-08-20, Apple Clang 17 built the project on macOS arm64 with warnings as errors;
+62/62 CPU tests passed in normal and ASan/UBSan configurations, and the formatting
+check passed.
 
 CUDA is optional at configure time. The current Apple Silicon development host has
 no NVIDIA GPU or native CUDA toolkit, so no CUDA execution or performance claim is
@@ -142,6 +143,21 @@ cmake --build build --target helix_cpu_kernels_demo
 ./build/examples/helix_cpu_kernels_demo
 ```
 
+## Caching allocator
+
+`helix::memory::HelixAllocator` is a backend-neutral, mutex-protected best-fit
+segment cache with alignment rounding, exact block splitting, adjacent coalescing,
+generation-tagged handles, reservation limits, explicit trimming, and internal/
+external fragmentation statistics. Its metadata core passes 12 CPU and sanitizer
+tests. A direct CUDA resource adapter and native-CUDA comparison fixtures compile,
+but have not run on a GPU.
+
+The allocator is not yet used by Tensor CUDA storage: immediate reuse would be
+unsafe while asynchronous kernels still reference a freed pointer. Stream/event-
+tracked reclamation is the next correctness gate. Design, measured host baselines,
+and limitations are in
+[`docs/MEMORY_ALLOCATOR.md`](docs/MEMORY_ALLOCATOR.md).
+
 ## Supported hardware
 
 - CPU foundation: validated with Apple Clang 17 on macOS arm64; Linux GCC/Clang
@@ -152,13 +168,13 @@ cmake --build build --target helix_cpu_kernels_demo
 
 ## Limitations
 
-The CUDA runtime and M4–M6 kernels are compile-validated only; physical GPU
-correctness, timing, and resource validation remain pending. The caching allocator,
-attention, KV cache, scheduler, model execution, and generation are roadmap work
-and are not represented as complete. Float16 has no arithmetic path yet. Tensor
-execution is contiguous-only; broadcasting, slicing, and general strided kernels
-are intentionally deferred. CPU kernels are reference implementations, not
-optimized BLAS replacements.
+The CUDA runtime, M4–M6 kernels, and CUDA allocator adapter are compile-validated
+only; physical GPU correctness, timing, and resource validation remain pending.
+Stream-aware allocator integration, attention, KV cache, scheduler, model
+execution, and generation are roadmap work and are not represented as complete.
+Float16 has no arithmetic path yet. Tensor execution is contiguous-only;
+broadcasting, slicing, and general strided kernels are intentionally deferred. CPU
+kernels are reference implementations, not optimized BLAS replacements.
 
 ## Engineering notes
 
@@ -166,6 +182,7 @@ optimized BLAS replacements.
 - [Roadmap and validation gates](docs/ROADMAP.md)
 - [CUDA runtime ownership and validation](docs/CUDA_RUNTIME.md)
 - [CUDA kernel design and validation](docs/CUDA_KERNELS.md)
+- [Caching allocator design and fragmentation](docs/MEMORY_ALLOCATOR.md)
 - [Performance methodology](docs/PERFORMANCE.md)
 - [Contributor/agent rules](AGENTS.md)
 

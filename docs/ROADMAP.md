@@ -204,7 +204,7 @@ comparison, and any version-three optimization remain pending real hardware. See
 
 ## Phase C: device memory systems
 
-### M7 — Caching GPU allocator — Planned; hardware pending
+### M7 — Allocator core CPU-validated and benchmarked; CUDA adapter compile-validated
 
 - aligned best-fit baseline with segment/block metadata
 - split and same-segment adjacent merge
@@ -215,6 +215,28 @@ comparison, and any version-three optimization remain pending real hardware. See
 
 Workloads include fixed, randomized, small-heavy, large-heavy, bursty, and
 LLM-shaped traces. Strategy conclusions depend on measurements.
+
+Implementation/validation record (2026-08-20, commit `746d0a5`): `HelixAllocator`
+implements a mutex-protected, aligned best-fit segment cache over a pluggable
+upstream resource. It rounds sizes, accounts for alignment prefixes, splits exact
+remainders, coalesces adjacent free blocks, enforces a reservation ceiling,
+releases wholly free segments explicitly, and uses generation-tagged handles to
+detect double frees and stale-pointer ABA reuse. Stats define rounded/requested/
+free/peak bytes, largest free block, active/segment/call counters, and internal/
+external fragmentation. Debug builds re-derive metadata invariants after each
+mutation. Twelve allocator tests pass in normal and ASan/UBSan builds, covering
+best fit, split/coalesce, alignments through 1,024 bytes on the host resource,
+transactional OOM/upstream failure, failed trim, destructor ownership, and
+concurrent callers; the total CPU suite is 62/62.
+
+`CudaMemoryResource` and two hardware-gated allocator tests compile in the CUDA
+12.6 warnings-as-errors build. Direct `cudaMalloc` versus Helix fixed/mixed trace
+benchmarks also compile, but have not run. CPU-resource baselines were executed and
+honestly show workload-dependent overhead/reuse behavior in
+`docs/PERFORMANCE.md`; they are not CUDA evidence. The broader randomized,
+small/large-heavy, bursty, and LLM-shaped GPU study remains pending. Immediate
+reuse is deliberately not integrated into Tensor storage because stream safety is
+an M8 correctness dependency. See `docs/MEMORY_ALLOCATOR.md`.
 
 ### M8 — Stream-aware allocation — Planned; hardware pending
 

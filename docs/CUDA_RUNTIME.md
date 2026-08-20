@@ -81,8 +81,9 @@ copies use D2D copies, and different-GPU transfers use `cudaMemcpyPeer`.
 Synchronous Tensor operations use synchronous CUDA copies/memset. The lower-level
 asynchronous memory functions enqueue work on a caller-owned `Stream`; the caller
 must keep source/destination memory alive until the stream/event dependency proves
-completion. No caching allocator reuse is present yet, so every CUDA Tensor storage
-allocation is directly freed and `cudaFree` may synchronize.
+completion. The M7 caching allocator exists as a separate subsystem but is not used
+by Tensor storage until M8 makes reuse stream-safe, so every CUDA Tensor storage
+allocation is still directly freed and `cudaFree` may synchronize.
 
 The current runtime objects are safe to move between host threads only when no
 other thread concurrently accesses the same object and the CUDA context rules are
@@ -109,7 +110,8 @@ compute-sanitizer --tool memcheck ./build-cuda/tests/helix_cuda_runtime_tests
 
 - No GPU runtime test has run in the current environment.
 - No pinned host allocator exists yet.
-- No allocator cache or stream-aware deferred free exists yet.
+- The allocator cache is not integrated here because stream-aware deferred free is
+  not implemented yet.
 - Tensor transfers are synchronous at the high-level API.
 - Peer copies require runtime/driver support and have not been hardware-validated.
 - Destructor failures can only be logged; callers needing explicit cleanup status
