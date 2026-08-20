@@ -76,6 +76,22 @@ if(HELIX_ENABLE_CUDA)
 endif()
 
 helix_configure_target(helix_core)
+
+add_library(helix_tensor
+  src/tensor/shape.cpp
+  src/tensor/storage.cpp
+  src/tensor/tensor.cpp)
+add_library(helix::tensor ALIAS helix_tensor)
+target_compile_features(helix_tensor PUBLIC cxx_std_20)
+target_link_libraries(helix_tensor PUBLIC helix::core)
+target_include_directories(
+  helix_tensor
+  PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+    $<BUILD_INTERFACE:${HELIX_GENERATED_INCLUDE_DIR}>
+    $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
+helix_configure_target(helix_tensor)
+
 helix_add_format_targets()
 
 if(HELIX_BUILD_TESTS)
@@ -96,7 +112,7 @@ if(HELIX_BUILD_EXAMPLES)
 endif()
 
 install(
-  TARGETS helix_core
+  TARGETS helix_core helix_tensor
   EXPORT HelixTargets
   ARCHIVE DESTINATION "${CMAKE_INSTALL_LIBDIR}"
   LIBRARY DESTINATION "${CMAKE_INSTALL_LIBDIR}"

@@ -1,5 +1,5 @@
-add_executable(helix_benchmarks core_benchmarks.cpp)
-target_link_libraries(helix_benchmarks PRIVATE helix::core benchmark::benchmark_main)
+add_executable(helix_benchmarks core_benchmarks.cpp tensor_benchmarks.cpp)
+target_link_libraries(helix_benchmarks PRIVATE helix::tensor benchmark::benchmark_main)
 helix_configure_target(helix_benchmarks)
 
 add_test(
