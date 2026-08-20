@@ -17,3 +17,12 @@ gtest_discover_tests(
   helix_tensor_tests
   TEST_PREFIX "tensor."
   DISCOVERY_MODE PRE_TEST)
+
+add_executable(helix_cpu_kernel_tests cpu_kernels_test.cpp)
+target_link_libraries(helix_cpu_kernel_tests PRIVATE helix::cpu_kernels GTest::gtest_main)
+helix_configure_target(helix_cpu_kernel_tests)
+
+gtest_discover_tests(
+  helix_cpu_kernel_tests
+  TEST_PREFIX "cpu_kernels."
+  DISCOVERY_MODE PRE_TEST)

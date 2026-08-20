@@ -92,6 +92,18 @@ target_include_directories(
     $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
 helix_configure_target(helix_tensor)
 
+add_library(helix_cpu_kernels src/kernels/cpu/reference.cpp)
+add_library(helix::cpu_kernels ALIAS helix_cpu_kernels)
+target_compile_features(helix_cpu_kernels PUBLIC cxx_std_20)
+target_link_libraries(helix_cpu_kernels PUBLIC helix::tensor)
+target_include_directories(
+  helix_cpu_kernels
+  PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+    $<BUILD_INTERFACE:${HELIX_GENERATED_INCLUDE_DIR}>
+    $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
+helix_configure_target(helix_cpu_kernels)
+
 helix_add_format_targets()
 
 if(HELIX_BUILD_TESTS)
@@ -112,7 +124,7 @@ if(HELIX_BUILD_EXAMPLES)
 endif()
 
 install(
-  TARGETS helix_core helix_tensor
+  TARGETS helix_core helix_tensor helix_cpu_kernels
   EXPORT HelixTargets
   ARCHIVE DESTINATION "${CMAKE_INSTALL_LIBDIR}"
   LIBRARY DESTINATION "${CMAKE_INSTALL_LIBDIR}"

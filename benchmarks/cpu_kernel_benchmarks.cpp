@@ -1,0 +1,88 @@
+#include "helix/kernels/cpu/reference.hpp"
+
+#include <benchmark/benchmark.h>
+#include <cstdint>
+
+namespace helix::cpu {
+namespace {
+
+void finish_elementwise_iteration(benchmark::State& state, std::int64_t elements,
+                                  std::int64_t tensors_touched) {
+  state.SetItemsProcessed(state.iterations() * elements);
+  state.SetBytesProcessed(state.iterations() * elements * tensors_touched *
+                          static_cast<std::int64_t>(sizeof(float)));
+}
+
+void BM_CpuAdd(benchmark::State& state) {
+  const auto elements = static_cast<Dimension>(state.range(0));
+  const Tensor lhs = Tensor::random_uniform({elements}, 101);
+  const Tensor rhs = Tensor::random_uniform({elements}, 202);
+  Tensor output = Tensor::empty({elements});
+  for ([[maybe_unused]] auto iteration : state) {
+    add_out(lhs, rhs, output);
+    benchmark::ClobberMemory();
+  }
+  finish_elementwise_iteration(state, state.range(0), 3);
+}
+
+void BM_CpuSilu(benchmark::State& state) {
+  const auto elements = static_cast<Dimension>(state.range(0));
+  const Tensor input = Tensor::random_uniform({elements}, 303, -8.0F, 8.0F);
+  Tensor output = Tensor::empty({elements});
+  for ([[maybe_unused]] auto iteration : state) {
+    silu_out(input, output);
+    benchmark::ClobberMemory();
+  }
+  finish_elementwise_iteration(state, state.range(0), 2);
+}
+
+void BM_CpuSoftmax(benchmark::State& state) {
+  const auto rows = static_cast<Dimension>(state.range(0));
+  const auto width = static_cast<Dimension>(state.range(1));
+  const Tensor input = Tensor::random_uniform({rows, width}, 404, -5.0F, 5.0F);
+  Tensor output = Tensor::empty({rows, width});
+  for ([[maybe_unused]] auto iteration : state) {
+    softmax_out(input, output);
+    benchmark::ClobberMemory();
+  }
+  finish_elementwise_iteration(state, state.range(0) * state.range(1), 2);
+}
+
+void BM_CpuMatmul(benchmark::State& state) {
+  const auto rows = static_cast<Dimension>(state.range(0));
+  const auto inner = static_cast<Dimension>(state.range(1));
+  const auto columns = static_cast<Dimension>(state.range(2));
+  const Tensor lhs = Tensor::random_uniform({rows, inner}, 505);
+  const Tensor rhs = Tensor::random_uniform({inner, columns}, 606);
+  Tensor output = Tensor::empty({rows, columns});
+  for ([[maybe_unused]] auto iteration : state) {
+    matmul_out(lhs, rhs, output);
+    benchmark::ClobberMemory();
+  }
+  const auto operations = 2 * state.range(0) * state.range(1) * state.range(2);
+  state.SetItemsProcessed(state.iterations() * operations);
+  state.counters["FLOP/s"] = benchmark::Counter(static_cast<double>(operations),
+                                                benchmark::Counter::kIsIterationInvariantRate);
+}
+
+void BM_CpuRmsNorm(benchmark::State& state) {
+  const auto rows = static_cast<Dimension>(state.range(0));
+  const auto width = static_cast<Dimension>(state.range(1));
+  const Tensor input = Tensor::random_uniform({rows, width}, 707);
+  const Tensor weight = Tensor::random_uniform({width}, 808, 0.5F, 1.5F);
+  Tensor output = Tensor::empty({rows, width});
+  for ([[maybe_unused]] auto iteration : state) {
+    rms_norm_out(input, weight, 1.0e-5F, output);
+    benchmark::ClobberMemory();
+  }
+  finish_elementwise_iteration(state, state.range(0) * state.range(1), 3);
+}
+
+BENCHMARK(BM_CpuAdd)->Arg(1024)->Arg(1 << 20);
+BENCHMARK(BM_CpuSilu)->Arg(1024)->Arg(1 << 20);
+BENCHMARK(BM_CpuSoftmax)->Args({1, 128})->Args({32, 128})->Args({16, 1023});
+BENCHMARK(BM_CpuMatmul)->Args({31, 29, 37})->Args({64, 64, 64})->Args({128, 128, 128});
+BENCHMARK(BM_CpuRmsNorm)->Args({1, 4096})->Args({32, 4096});
+
+} // namespace
+} // namespace helix::cpu
