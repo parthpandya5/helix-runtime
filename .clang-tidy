@@ -1,0 +1,27 @@
+Checks: >
+  -*,
+  bugprone-*,
+  clang-analyzer-*,
+  concurrency-*,
+  cppcoreguidelines-avoid-goto,
+  cppcoreguidelines-init-variables,
+  cppcoreguidelines-narrowing-conversions,
+  misc-*,
+  modernize-*,
+  performance-*,
+  portability-*,
+  readability-container-size-empty,
+  readability-duplicate-include,
+  readability-inconsistent-declaration-parameter-name,
+  readability-make-member-function-const,
+  readability-qualified-auto,
+  readability-redundant-*,
+  readability-static-accessed-through-instance
+WarningsAsErrors: ''
+HeaderFilterRegex: '^(include|src)/helix/|/include/helix/'
+FormatStyle: file
+CheckOptions:
+  - key: modernize-use-trailing-return-type.IgnoreMacros
+    value: 'true'
+  - key: readability-identifier-naming.NamespaceCase
+    value: lower_case

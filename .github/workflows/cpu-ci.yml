@@ -1,0 +1,82 @@
+name: CPU CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    name: CPU ${{ matrix.build_type }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        build_type: [Debug, Release]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes ninja-build libgtest-dev libbenchmark-dev
+      - name: Configure
+        run: >-
+          cmake -S . -B build -G Ninja
+          -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
+          -DHELIX_ENABLE_CUDA=OFF
+          -DHELIX_FETCH_DEPENDENCIES=OFF
+          -DHELIX_WARNINGS_AS_ERRORS=ON
+      - name: Build
+        run: cmake --build build
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+  sanitizers:
+    name: CPU ASan + UBSan
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes ninja-build clang libgtest-dev libbenchmark-dev
+      - name: Configure
+        run: >-
+          cmake -S . -B build-sanitize -G Ninja
+          -DCMAKE_BUILD_TYPE=Debug
+          -DCMAKE_CXX_COMPILER=clang++
+          -DHELIX_ENABLE_CUDA=OFF
+          -DHELIX_ENABLE_SANITIZERS=ON
+          -DHELIX_FETCH_DEPENDENCIES=OFF
+      - name: Build
+        run: cmake --build build-sanitize
+      - name: Test
+        run: ctest --test-dir build-sanitize --output-on-failure
+
+  quality:
+    name: Formatting and static analysis
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes ninja-build clang clang-format clang-tidy libgtest-dev libbenchmark-dev
+      - name: Configure
+        run: >-
+          cmake -S . -B build-quality -G Ninja
+          -DCMAKE_BUILD_TYPE=Debug
+          -DCMAKE_CXX_COMPILER=clang++
+          -DHELIX_ENABLE_CUDA=OFF
+          -DHELIX_ENABLE_CLANG_TIDY=ON
+          -DHELIX_FETCH_DEPENDENCIES=OFF
+      - name: Check formatting
+        run: cmake --build build-quality --target format-check
+      - name: Build with clang-tidy
+        run: cmake --build build-quality
+
+# This workflow is intentionally CPU-only. CUDA compilation and GPU runtime tests
+# require separately provisioned NVIDIA infrastructure and are not represented here.

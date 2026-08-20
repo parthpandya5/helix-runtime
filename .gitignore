@@ -1,0 +1,38 @@
+# CMake build trees
+/build*/
+/cmake-build-*/
+/out/
+/install/
+
+# Generated CMake files
+CMakeCache.txt
+CMakeFiles/
+CMakeUserPresets.json
+compile_commands.json
+
+# IDE and editor state
+.cache/
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS metadata
+.DS_Store
+
+# Build products and diagnostics
+*.dSYM/
+*.profraw
+*.profdata
+*.gcda
+*.gcno
+*.nsys-rep
+*.ncu-rep
+core
+core.*
+
+# Models and generated benchmark output
+/models/
+/benchmark-results/
+/profiles/
