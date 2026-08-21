@@ -105,6 +105,7 @@ public:
   [[nodiscard]] std::string_view terminal_context() const noexcept;
 
   [[nodiscard]] RequestTimePoint created_at() const noexcept;
+  [[nodiscard]] RequestTimePoint latest_event_at() const noexcept;
   [[nodiscard]] std::optional<RequestTimePoint> first_scheduled_at() const noexcept;
   [[nodiscard]] std::optional<RequestTimePoint> prefill_completed_at() const noexcept;
   [[nodiscard]] std::optional<RequestTimePoint> first_token_at() const noexcept;

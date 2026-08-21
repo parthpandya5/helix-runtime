@@ -196,6 +196,7 @@ helix_configure_target(helix_attention)
 
 add_library(helix_scheduler
   src/scheduler/fifo_scheduler.cpp
+  src/scheduler/metrics.cpp
   src/scheduler/request.cpp)
 add_library(helix::scheduler ALIAS helix_scheduler)
 target_compile_features(helix_scheduler PUBLIC cxx_std_20)

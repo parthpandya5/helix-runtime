@@ -494,6 +494,17 @@ SchedulerStats FifoScheduler::stats() const {
   return result;
 }
 
+SchedulerMetrics FifoScheduler::metrics(RequestTimePoint observed_at) const {
+  require_time_not_before_scheduler(observed_at, "metrics");
+  std::vector<const Request*> requests;
+  requests.reserve(requests_.size());
+  for (const auto& [id, owned] : requests_) {
+    static_cast<void>(id);
+    requests.push_back(owned.get());
+  }
+  return summarize_request_metrics(requests, observed_at);
+}
+
 const SchedulerConfig& FifoScheduler::config() const noexcept {
   return config_;
 }

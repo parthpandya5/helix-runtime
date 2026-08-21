@@ -37,3 +37,13 @@ add_test(
           --benchmark_min_time=0.001
           --benchmark_repetitions=1)
 set_tests_properties(benchmark.smoke PROPERTIES LABELS "benchmark;smoke" TIMEOUT 30)
+
+add_test(
+  NAME benchmark.scheduler_smoke
+  COMMAND helix_benchmarks
+          "--benchmark_filter=BM_(ContinuousBatchingPolicy|StaticCohortPolicy)"
+          --benchmark_min_time=0.001
+          --benchmark_repetitions=1)
+set_tests_properties(
+  benchmark.scheduler_smoke
+  PROPERTIES LABELS "benchmark;scheduler;smoke" TIMEOUT 30)

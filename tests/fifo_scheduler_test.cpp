@@ -291,6 +291,63 @@ TEST(FifoSchedulerTest, StatisticsSeparateLiveQueuesAndTerminalHistory) {
   EXPECT_EQ(stats.completed_iteration_count, 1U);
   EXPECT_EQ(stats.scheduled_prefill_tokens, 2U);
   EXPECT_EQ(stats.scheduled_decode_tokens, 0U);
+
+  const SchedulerMetrics metrics = scheduler.metrics(kStart + 2ms);
+  EXPECT_EQ(metrics.finished_count, 1U);
+  EXPECT_EQ(metrics.failed_count, 1U);
+  EXPECT_EQ(metrics.request_latency.sample_count, 1U);
+}
+
+TEST(FifoSchedulerTest, FinishedRequestIsReplacedBeforeOriginalCohortDrains) {
+  FifoScheduler scheduler(SchedulerConfig{16, 4, 4});
+  scheduler.submit(make_request(80, 1, 1));
+  scheduler.submit(make_request(81, 1, 3));
+  scheduler.submit(make_request(82, 1, 3));
+  scheduler.submit(make_request(83, 1, 3));
+  scheduler.submit(make_request(84, 1, 1));
+
+  std::size_t available_blocks = 20;
+  const ScheduleResult prefill = scheduler.schedule_iteration(available_blocks, kStart);
+  ASSERT_TRUE(prefill.batch.has_value());
+  ASSERT_EQ(prefill.batch->work.size(), 4U);
+  EXPECT_EQ(prefill.batch->work[0].request_id, RequestId{80});
+  EXPECT_EQ(prefill.batch->work[3].request_id, RequestId{83});
+  available_blocks -= prefill.batch->new_kv_blocks;
+  const std::vector prefill_completions{
+      prefill_success(RequestId{80}), prefill_success(RequestId{81}),
+      prefill_success(RequestId{82}), prefill_success(RequestId{83})};
+  static_cast<void>(
+      scheduler.complete_iteration(prefill.batch->id, prefill_completions, kStart + 1ms));
+
+  const ScheduleResult first_decode = scheduler.schedule_iteration(available_blocks, kStart + 2ms);
+  ASSERT_TRUE(first_decode.batch.has_value());
+  ASSERT_EQ(first_decode.batch->work.size(), 4U);
+  EXPECT_THROW(static_cast<void>(scheduler.metrics(kStart + 1ms)), Error);
+  const std::vector decode_completions{
+      decode_success(RequestId{80}, 180), decode_success(RequestId{81}, 181),
+      decode_success(RequestId{82}, 182), decode_success(RequestId{83}, 183)};
+  const CompletionReport completed =
+      scheduler.complete_iteration(first_decode.batch->id, decode_completions, kStart + 3ms);
+  ASSERT_EQ(completed.retired_requests.size(), 1U);
+  EXPECT_EQ(completed.retired_requests[0].request_id, RequestId{80});
+  available_blocks += completed.released_kv_blocks;
+
+  const ScheduleResult replacement = scheduler.schedule_iteration(available_blocks, kStart + 4ms);
+  ASSERT_TRUE(replacement.batch.has_value());
+  ASSERT_EQ(replacement.batch->work.size(), 4U);
+  EXPECT_EQ(replacement.batch->work[0].request_id, RequestId{81});
+  EXPECT_EQ(replacement.batch->work[1].request_id, RequestId{82});
+  EXPECT_EQ(replacement.batch->work[2].request_id, RequestId{83});
+  EXPECT_EQ(replacement.batch->work[3].request_id, RequestId{84});
+  EXPECT_EQ(replacement.batch->work[3].kind, WorkKind::kPrefill);
+  EXPECT_TRUE(scheduler.waiting_requests().empty());
+  ASSERT_EQ(scheduler.running_requests().size(), 4U);
+  EXPECT_EQ(scheduler.running_requests()[0], RequestId{81});
+  EXPECT_EQ(scheduler.running_requests()[1], RequestId{82});
+  EXPECT_EQ(scheduler.running_requests()[2], RequestId{83});
+  EXPECT_EQ(scheduler.running_requests()[3], RequestId{84});
+  EXPECT_EQ(scheduler.request(RequestId{81}).state(), RequestState::kDecoding);
+  EXPECT_EQ(scheduler.request(RequestId{84}).state(), RequestState::kPrefill);
 }
 
 } // namespace

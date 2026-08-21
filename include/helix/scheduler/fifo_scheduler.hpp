@@ -1,5 +1,6 @@
 #pragma once
 
+#include "helix/scheduler/metrics.hpp"
 #include "helix/scheduler/request.hpp"
 
 #include <cstddef>
@@ -143,6 +144,7 @@ public:
   [[nodiscard]] std::vector<RequestId> waiting_requests() const;
   [[nodiscard]] bool iteration_in_flight() const noexcept;
   [[nodiscard]] SchedulerStats stats() const;
+  [[nodiscard]] SchedulerMetrics metrics(RequestTimePoint observed_at) const;
   [[nodiscard]] const SchedulerConfig& config() const noexcept;
 
 private:

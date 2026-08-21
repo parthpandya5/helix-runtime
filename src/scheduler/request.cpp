@@ -159,6 +159,10 @@ RequestTimePoint Request::created_at() const noexcept {
   return created_at_;
 }
 
+RequestTimePoint Request::latest_event_at() const noexcept {
+  return latest_event_at_;
+}
+
 std::optional<RequestTimePoint> Request::first_scheduled_at() const noexcept {
   return first_scheduled_at_;
 }
