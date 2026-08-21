@@ -466,12 +466,35 @@ transactional failure, enum validation, metrics, and move ownership. Normal and
 ASan/UBSan suites pass 103/103. The CUDA-enabled build passes the same 103
 hardware-independent tests; 57 GPU tests remain gated. See `docs/SCHEDULER.md`.
 
-### M15 — FIFO/token-budget scheduler — Planned
+### M15 — FIFO/token-budget scheduler — Implemented, CPU-validated, sanitized, and benchmarked
 
 - waiting/running ownership and deterministic FIFO admission
 - iteration token budget and KV-block capacity interface
 - separate prefill/decode work descriptions
 - completion, cancellation, and resource-exhaustion behavior
+
+Implementation/validation record (2026-08-21, commit `7b50dbc`): a single-thread-
+owned scheduler retains each move-only request, maintains deterministic waiting and
+running order, and emits typed prefill ranges or one-token decode work. Scheduling
+is bounded independently by tokens, resident requests, and a caller-provided KV
+free-block snapshot. Each work record exposes blocks before/new; completion,
+failure, and cancellation report exact logical release counts without pretending
+the scheduler owns physical KV memory. Partial-block slack remains usable with no
+free blocks, while an unschedulable FIFO head yields a partial/empty result rather
+than being skipped or failed.
+
+Only one iteration may be in flight. Completion validates the full ordered result
+vector before mutation, then stages failure strings and token-vector capacity so
+logical request progress cannot be split by an allocation failure. Ten scheduler
+tests cover budgets, chunking, resource exhaustion, state/result mismatches,
+whole-vector transactionality, cancellation/failure, monotonic time, ownership,
+and statistics. Normal, ASan/UBSan, and CUDA-enabled host suites pass 113/113; all
+CUDA sources compile with NVCC 12.6.85, while 57 GPU tests remain hardware-gated.
+
+A four-case Release trace records complete host policy cost (49.720 us to 1.363 ms
+median CPU time) but deliberately excludes model math and physical KV operations;
+it is not an inference-throughput claim. See `docs/SCHEDULER.md` and
+`docs/PERFORMANCE.md`.
 
 ### M16 — Continuous batching — Planned
 

@@ -30,6 +30,7 @@ Every recorded experiment must include:
 | M11 contiguous CPU KV cache | No earlier KV storage | Reserve per-sequence K/V tensors, append complete tokens, and copy a compact layer history into preallocated outputs | Lifecycle median CPU time: 26.898 us (2x2x64, capacity/append 128), 63.700 us (4x8x64, capacity 512/append 32), 7.853 us (odd 3x3x37, 29); layer-copy median: 1.595 us (128 KiB), 29.609 us (2 MiB), 613 ns (25,752 B) | Lifecycle includes sequence allocation, appends, and release. Layer copy excludes output allocation. This is a contiguous baseline under high host load, not evidence that paging or another layout is faster. |
 | M12 paged CPU KV cache | Same-run M11 contiguous fixtures | Use a long-lived fixed-token pool, allocate logical blocks on append boundaries, and compact through block tables | Paged/contiguous lifecycle medians: 25.784/28.485 us, 18.016/64.400 us, 6.869/8.074 us. Paged/contiguous layer-copy medians: 3.684/1.568 us (128 KiB), 57.690/33.032 us (2 MiB), 540/554 ns (25,752 B). | Pool construction is outside paged lifecycle timing while per-sequence contiguous storage is inside; the 72% lifecycle reduction also uses 16x less assigned capacity. Paged copying is 2.35x and 1.75x slower for the large histories because it traverses 8 and 32 blocks. |
 | M13 CPU attention value traversal | Dimension-major probability-times-V for contiguous and direct paged storage | Accumulate fixed 32-coordinate tiles while each V row/page is hot; retain both baselines | Contiguous speedup 1.31x–2.47x and paged speedup 2.36x–2.99x across four paired cases. With equal tiling, paged CPU time was 2.1%–6.7% higher. | The original apparent paged win was confounded by a general loop-locality improvement. Applying the same traversal to both paths isolates a modest end-to-end paging cost on this CPU; it is not GPU evidence. |
+| M15 FIFO scheduler host trace | No earlier scheduler implementation | Schedule and complete deterministic mixed prefill/decode traces under token, running-request, and logical KV-block limits | Median CPU time per complete trace: 49.720 us (16 requests/256 tokens) through 1.363 ms (128 requests/6,144 tokens) | This measures host policy bookkeeping and its allocations. Logical token transitions per second are not model or inference throughput. |
 
 ## M1 CPU tensor baseline — 2026-08-20
 
@@ -427,6 +428,57 @@ Command:
 These are CPU layout/locality measurements. They say nothing about device block-
 table fetches, warp grouping, coalescing, register pressure, occupancy, or GPU
 latency. Those require a CUDA paged cache/kernel and physical NVIDIA execution.
+
+## M15 FIFO scheduler host-policy baseline — 2026-08-21
+
+Environment:
+
+- source: commit `7b50dbc`
+- host: Apple M3 Pro, 12 CPU cores, 18 GB RAM
+- OS/compiler/build: macOS 26.0.1 arm64, Apple Clang 17.0.0, Release,
+  `HELIX_ENABLE_CUDA=OFF`, warnings as errors
+- CMake 4.2.3 and Google Benchmark 1.9.1
+- request construction and submission: outside the timed region
+- timed work: every `schedule_iteration`, completion-vector construction, and
+  `complete_iteration` call until the trace finishes
+- excluded work: model execution, token selection, physical KV allocation/data,
+  device transfer, and CUDA execution
+- synthetic KV capacity: enough blocks for every request's full prompt and output;
+  reported batch reservations are deducted and terminal releases returned
+- logical time: advanced deterministically by one microsecond around each
+  completion; it is metadata input and not used as benchmark duration
+- warmup: time-based 0.05 seconds per case
+- measurement: time-based minimum 0.1 seconds per repetition, five repetitions;
+  median CPU time reported
+- concurrency: one benchmark thread and one scheduler owner
+- one-minute host load average at start: 15.36; affinity and CPU-frequency metadata
+  were unavailable
+
+| Requests | Prompt/output tokens each | Max running | Token budget | Block tokens | Scheduler iterations | Median CPU time/trace | CPU-time CV | Logical transitions/s |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 16 | 8 / 8 | 8 | 64 | 16 | 18 | 49.720 us | 3.05% | 5.149 million |
+| 64 | 32 / 16 | 16 | 128 | 16 | 72 | 413.875 us | 3.55% | 7.423 million |
+| 64 | 128 / 32 | 32 | 512 | 16 | 74 | 791.028 us | 1.85% | 12.945 million |
+| 128 | 17 / 31 | 32 | 256 | 7 | 130 | 1.363 ms | 2.40% | 4.507 million |
+
+“Logical transitions/s” divides prompt-plus-generated token state transitions by
+the measured host CPU time. It is useful only for comparing scheduler policy
+implementations on the same trace. It is not tokens generated per second: the
+fixture performs no tensor operation, attention, cache write, sampling, or GPU
+work. The non-monotonic rate reflects differing active-set sizes, prompt chunking,
+decode iteration counts, and container/allocation work; no optimization conclusion
+is drawn from this first baseline.
+
+Command:
+
+```bash
+./build-release/benchmarks/helix_benchmarks \
+  --benchmark_filter=BM_FifoSchedulerTrace \
+  --benchmark_min_warmup_time=0.05 \
+  --benchmark_min_time=0.1s \
+  --benchmark_repetitions=5 \
+  --benchmark_report_aggregates_only=true
+```
 
 ## Timing rules
 

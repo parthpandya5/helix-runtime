@@ -417,16 +417,36 @@ TTFT, completion, and inter-token metric derivation. The request is not thread-s
 one scheduler thread owns mutation. Details and the exhaustive transition matrix
 are in `docs/SCHEDULER.md`.
 
-The planned FIFO scheduler initially admits work subject to a per-iteration token
-budget and available KV blocks. Prefill consumes prompt tokens; decode normally
-consumes one token per running request. Continuous batching removes completed
-requests and admits waiting work at the next iteration without waiting for an
-original static batch to drain.
+The implemented FIFO scheduler owns requests in a stable map, orders waiting IDs in
+a deque, and bounds running IDs in admission order. Each iteration is limited by a
+token budget, running-request capacity, and a caller-supplied count of free KV
+blocks. Prefill describes a positive prompt range and may be chunked; decode emits
+one-token work. Existing running requests are considered before waiting admission,
+which is deterministic but intentionally permits head-of-line delay.
 
-Scheduler state will remain host-only and deterministic in tests. The initial
-scheduler is not thread-safe; the runtime engine owns it from one orchestration
-thread. A future multi-producer submission queue may provide the synchronization
-boundary.
+```mermaid
+sequenceDiagram
+    participant KV as KV authority
+    participant S as FIFO scheduler
+    participant E as Executor
+    KV->>S: free-block snapshot
+    S-->>E: batch(id, token ranges, new blocks)
+    E->>KV: reserve reported blocks
+    E-->>S: ordered work completions
+    S-->>KV: terminal block releases
+```
+
+The scheduler does not own physical cache blocks. It predicts block deltas from
+logical token counts; the runtime must apply reservations before execution and
+apply release counts afterward. Only one batch can be in flight. Completion first
+validates every ordered result, then stages all potentially allocating state before
+request mutation. This prevents a malformed late result or allocation failure from
+partially committing an iteration.
+
+Scheduler state remains host-only and deterministic in tests. It is not thread-
+safe; the runtime engine will own it from one orchestration thread. A future multi-
+producer submission queue may provide the synchronization boundary. Continuous
+replacement and aggregate metrics are the next policy gate.
 
 ## Model executor
 
