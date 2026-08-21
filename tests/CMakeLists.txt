@@ -78,6 +78,15 @@ gtest_discover_tests(
   TEST_PREFIX "request."
   DISCOVERY_MODE PRE_TEST)
 
+add_executable(helix_fifo_scheduler_tests fifo_scheduler_test.cpp)
+target_link_libraries(helix_fifo_scheduler_tests PRIVATE helix::scheduler GTest::gtest_main)
+helix_configure_target(helix_fifo_scheduler_tests)
+
+gtest_discover_tests(
+  helix_fifo_scheduler_tests
+  TEST_PREFIX "fifo_scheduler."
+  DISCOVERY_MODE PRE_TEST)
+
 add_executable(helix_memory_tests memory_allocator_test.cpp)
 target_link_libraries(helix_memory_tests PRIVATE helix::memory GTest::gtest_main)
 helix_configure_target(helix_memory_tests)

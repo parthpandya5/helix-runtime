@@ -5,6 +5,7 @@ add_executable(helix_benchmarks
   cpu_kernel_benchmarks.cpp
   kv_cache_benchmarks.cpp
   paged_attention_benchmarks.cpp
+  scheduler_benchmarks.cpp
   tensor_benchmarks.cpp)
 target_link_libraries(
   helix_benchmarks
@@ -13,6 +14,7 @@ target_link_libraries(
     helix::cpu_kernels
     helix::kv_cache
     helix::memory
+    helix::scheduler
     benchmark::benchmark_main)
 if(HELIX_ENABLE_CUDA)
   target_sources(

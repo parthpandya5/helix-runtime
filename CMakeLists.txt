@@ -194,7 +194,9 @@ target_include_directories(
     $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
 helix_configure_target(helix_attention)
 
-add_library(helix_scheduler src/scheduler/request.cpp)
+add_library(helix_scheduler
+  src/scheduler/fifo_scheduler.cpp
+  src/scheduler/request.cpp)
 add_library(helix::scheduler ALIAS helix_scheduler)
 target_compile_features(helix_scheduler PUBLIC cxx_std_20)
 target_link_libraries(helix_scheduler PUBLIC helix::core)

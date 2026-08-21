@@ -12,6 +12,8 @@
 
 namespace helix::scheduler {
 
+class FifoScheduler;
+
 class RequestId final {
 public:
   RequestId() = default;
@@ -119,6 +121,9 @@ public:
   void fail(RequestTimePoint now, std::string context);
 
 private:
+  friend class FifoScheduler;
+
+  void reserve_generated_capacity(std::size_t capacity);
   void require_time_not_before_latest(RequestTimePoint now, std::string_view operation) const;
   void transition_to(RequestState next, RequestTimePoint now, std::string_view operation);
   void terminate(RequestState terminal_state, FinishReason reason, RequestTimePoint now,

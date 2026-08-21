@@ -193,6 +193,12 @@ std::optional<RequestDuration> Request::time_to_first_token() const noexcept {
   return *first_token_at_ - created_at_;
 }
 
+void Request::reserve_generated_capacity(std::size_t capacity) {
+  HELIX_ASSERT(capacity <= max_new_tokens_,
+               "scheduler requested generated-token capacity beyond the request limit");
+  generated_tokens_.reserve(capacity);
+}
+
 void Request::require_time_not_before_latest(RequestTimePoint now,
                                              std::string_view operation) const {
   HELIX_CHECK(now >= latest_event_at_, ErrorCode::kInvalidArgument,
