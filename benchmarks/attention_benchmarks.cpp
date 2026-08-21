@@ -6,7 +6,7 @@
 namespace helix::attention::cpu {
 namespace {
 
-void BM_CpuContiguousAttention(benchmark::State& state) {
+void BM_CpuContiguousAttention(benchmark::State& state, bool dimension_major) {
   const auto heads = static_cast<Dimension>(state.range(0));
   const auto queries = static_cast<Dimension>(state.range(1));
   const auto keys = static_cast<Dimension>(state.range(2));
@@ -20,7 +20,12 @@ void BM_CpuContiguousAttention(benchmark::State& state) {
   const auto query_position_offset = static_cast<std::size_t>(keys - queries);
 
   for ([[maybe_unused]] auto iteration : state) {
-    scaled_dot_product_attention_out(query, key, value, query_position_offset, output, workspace);
+    if (dimension_major) {
+      scaled_dot_product_attention_dimension_major_out(query, key, value, query_position_offset,
+                                                       output, workspace);
+    } else {
+      scaled_dot_product_attention_out(query, key, value, query_position_offset, output, workspace);
+    }
     benchmark::ClobberMemory();
   }
 
@@ -32,7 +37,14 @@ void BM_CpuContiguousAttention(benchmark::State& state) {
   state.SetItemsProcessed(state.iterations() * state.range(0) * state.range(1));
 }
 
-BENCHMARK(BM_CpuContiguousAttention)
+BENCHMARK_CAPTURE(BM_CpuContiguousAttention, DimensionMajor, true)
+    ->Args({8, 1, 128, 64, 64})
+    ->Args({8, 1, 1024, 64, 64})
+    ->Args({3, 17, 29, 37, 37})
+    ->Args({3, 17, 29, 37, 41})
+    ->Args({8, 128, 128, 64, 64});
+
+BENCHMARK_CAPTURE(BM_CpuContiguousAttention, DimensionTiled, false)
     ->Args({8, 1, 128, 64, 64})
     ->Args({8, 1, 1024, 64, 64})
     ->Args({3, 17, 29, 37, 37})

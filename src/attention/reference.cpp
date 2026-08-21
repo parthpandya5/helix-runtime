@@ -3,6 +3,8 @@
 #include "helix/core/error.hpp"
 #include "helix/kernels/cpu/reference.hpp"
 
+#include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstddef>
 #include <limits>
@@ -112,9 +114,17 @@ std::size_t score_workspace_bytes(const Tensor& query, const Tensor& key) {
   return checked_nbytes(score_workspace_shape(query, key), DType::kFloat32);
 }
 
-void scaled_dot_product_attention_out(const Tensor& query, const Tensor& key, const Tensor& value,
-                                      std::size_t query_position_offset, Tensor& output,
-                                      Tensor& score_workspace) {
+namespace {
+
+enum class ValueTraversal {
+  kDimensionMajor,
+  kDimensionTiled,
+};
+
+void scaled_dot_product_attention_out_impl(const Tensor& query, const Tensor& key,
+                                           const Tensor& value, std::size_t query_position_offset,
+                                           Tensor& output, Tensor& score_workspace,
+                                           ValueTraversal value_traversal) {
   constexpr std::string_view kOperation = "attention::cpu::scaled_dot_product_attention_out";
   const AttentionDimensions dimensions = validate_inputs(query, key, value, kOperation);
   validate_offset(dimensions, query_position_offset, kOperation);
@@ -168,23 +178,67 @@ void scaled_dot_product_attention_out(const Tensor& query, const Tensor& key, co
 
   helix::cpu::softmax_out(score_workspace, score_workspace);
 
+  constexpr std::size_t kValueDimensionTile = 32;
   for (std::size_t head = 0; head < dimensions.heads; ++head) {
     for (std::size_t query_index = 0; query_index < dimensions.queries; ++query_index) {
       const std::size_t score_offset = (head * dimensions.queries + query_index) * dimensions.keys;
       const std::size_t output_offset =
           (head * dimensions.queries + query_index) * dimensions.value_dimension;
-      for (std::size_t dimension = 0; dimension < dimensions.value_dimension; ++dimension) {
-        double accumulator = 0.0;
+      if (value_traversal == ValueTraversal::kDimensionMajor) {
+        for (std::size_t dimension = 0; dimension < dimensions.value_dimension; ++dimension) {
+          double accumulator = 0.0;
+          for (std::size_t key_index = 0; key_index < dimensions.keys; ++key_index) {
+            const std::size_t value_offset =
+                (head * dimensions.keys + key_index) * dimensions.value_dimension;
+            accumulator += static_cast<double>(scores[score_offset + key_index]) *
+                           static_cast<double>(value_values[value_offset + dimension]);
+          }
+          output_values[output_offset + dimension] = static_cast<float>(accumulator);
+        }
+        continue;
+      }
+
+      // Accumulate a fixed-size coordinate tile while each row of V is hot.
+      // This preserves each coordinate's KV accumulation order and avoids a
+      // head-dimension-sized dynamic allocation.
+      for (std::size_t dimension_start = 0; dimension_start < dimensions.value_dimension;
+           dimension_start += kValueDimensionTile) {
+        const std::size_t tile_dimensions =
+            std::min(kValueDimensionTile, dimensions.value_dimension - dimension_start);
+        std::array<double, kValueDimensionTile> accumulators{};
         for (std::size_t key_index = 0; key_index < dimensions.keys; ++key_index) {
           const std::size_t value_offset =
-              (head * dimensions.keys + key_index) * dimensions.value_dimension;
-          accumulator += static_cast<double>(scores[score_offset + key_index]) *
-                         static_cast<double>(value_values[value_offset + dimension]);
+              (head * dimensions.keys + key_index) * dimensions.value_dimension + dimension_start;
+          const double probability = static_cast<double>(scores[score_offset + key_index]);
+          for (std::size_t tile_dimension = 0; tile_dimension < tile_dimensions; ++tile_dimension) {
+            accumulators[tile_dimension] +=
+                probability * static_cast<double>(value_values[value_offset + tile_dimension]);
+          }
         }
-        output_values[output_offset + dimension] = static_cast<float>(accumulator);
+        for (std::size_t tile_dimension = 0; tile_dimension < tile_dimensions; ++tile_dimension) {
+          output_values[output_offset + dimension_start + tile_dimension] =
+              static_cast<float>(accumulators[tile_dimension]);
+        }
       }
     }
   }
+}
+
+} // namespace
+
+void scaled_dot_product_attention_out(const Tensor& query, const Tensor& key, const Tensor& value,
+                                      std::size_t query_position_offset, Tensor& output,
+                                      Tensor& score_workspace) {
+  scaled_dot_product_attention_out_impl(query, key, value, query_position_offset, output,
+                                        score_workspace, ValueTraversal::kDimensionTiled);
+}
+
+void scaled_dot_product_attention_dimension_major_out(const Tensor& query, const Tensor& key,
+                                                      const Tensor& value,
+                                                      std::size_t query_position_offset,
+                                                      Tensor& output, Tensor& score_workspace) {
+  scaled_dot_product_attention_out_impl(query, key, value, query_position_offset, output,
+                                        score_workspace, ValueTraversal::kDimensionMajor);
 }
 
 Tensor scaled_dot_product_attention(const Tensor& query, const Tensor& key, const Tensor& value,

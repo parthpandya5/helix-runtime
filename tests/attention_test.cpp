@@ -34,6 +34,15 @@ TEST(AttentionTest, ComputesKnownCausalAttentionAndMaterializesProbabilities) {
       output, std::array{10.0F, 0.0F, 10.0F * first_probability, 20.0F * second_probability});
   EXPECT_EQ(score_workspace_shape(query, key), (Shape{1, 2, 2}));
   EXPECT_EQ(score_workspace_bytes(query, key), 4U * sizeof(float));
+
+  Tensor baseline_output = Tensor::empty({1, 2, 2});
+  Tensor baseline_workspace = Tensor::empty({1, 2, 2});
+  scaled_dot_product_attention_dimension_major_out(query, key, value, 0, baseline_output,
+                                                   baseline_workspace);
+  expect_values_near(baseline_output, std::array{10.0F, 0.0F, 10.0F * first_probability,
+                                                 20.0F * second_probability});
+  expect_values_near(baseline_workspace,
+                     std::array{1.0F, 0.0F, first_probability, second_probability});
 }
 
 TEST(AttentionTest, QueryOffsetModelsSingleTokenDecodeAgainstFullKvHistory) {
