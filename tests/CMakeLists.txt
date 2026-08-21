@@ -69,6 +69,15 @@ gtest_discover_tests(
   TEST_PREFIX "paged_attention."
   DISCOVERY_MODE PRE_TEST)
 
+add_executable(helix_request_tests request_test.cpp)
+target_link_libraries(helix_request_tests PRIVATE helix::scheduler GTest::gtest_main)
+helix_configure_target(helix_request_tests)
+
+gtest_discover_tests(
+  helix_request_tests
+  TEST_PREFIX "request."
+  DISCOVERY_MODE PRE_TEST)
+
 add_executable(helix_memory_tests memory_allocator_test.cpp)
 target_link_libraries(helix_memory_tests PRIVATE helix::memory GTest::gtest_main)
 helix_configure_target(helix_memory_tests)
