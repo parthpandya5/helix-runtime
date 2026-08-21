@@ -35,6 +35,7 @@ void BM_CpuContiguousAttention(benchmark::State& state) {
 BENCHMARK(BM_CpuContiguousAttention)
     ->Args({8, 1, 128, 64, 64})
     ->Args({8, 1, 1024, 64, 64})
+    ->Args({3, 17, 29, 37, 37})
     ->Args({3, 17, 29, 37, 41})
     ->Args({8, 128, 128, 64, 64});
 

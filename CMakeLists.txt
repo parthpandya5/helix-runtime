@@ -164,22 +164,6 @@ target_include_directories(
     $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
 helix_configure_target(helix_cpu_kernels)
 
-add_library(helix_attention src/attention/reference.cpp)
-add_library(helix::attention ALIAS helix_attention)
-target_compile_features(helix_attention PUBLIC cxx_std_20)
-target_link_libraries(helix_attention PUBLIC helix::cpu_kernels)
-if(HELIX_ENABLE_CUDA)
-  target_sources(helix_attention PRIVATE src/attention/cuda.cu)
-  target_link_libraries(helix_attention PUBLIC helix::cuda_kernels helix::cuda_runtime)
-endif()
-target_include_directories(
-  helix_attention
-  PUBLIC
-    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
-    $<BUILD_INTERFACE:${HELIX_GENERATED_INCLUDE_DIR}>
-    $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
-helix_configure_target(helix_attention)
-
 add_library(helix_kv_cache src/kv_cache/contiguous.cpp src/kv_cache/paged.cpp)
 add_library(helix::kv_cache ALIAS helix_kv_cache)
 target_compile_features(helix_kv_cache PUBLIC cxx_std_20)
@@ -191,6 +175,24 @@ target_include_directories(
     $<BUILD_INTERFACE:${HELIX_GENERATED_INCLUDE_DIR}>
     $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
 helix_configure_target(helix_kv_cache)
+
+add_library(helix_attention
+  src/attention/paged_reference.cpp
+  src/attention/reference.cpp)
+add_library(helix::attention ALIAS helix_attention)
+target_compile_features(helix_attention PUBLIC cxx_std_20)
+target_link_libraries(helix_attention PUBLIC helix::cpu_kernels helix::kv_cache)
+if(HELIX_ENABLE_CUDA)
+  target_sources(helix_attention PRIVATE src/attention/cuda.cu)
+  target_link_libraries(helix_attention PUBLIC helix::cuda_kernels helix::cuda_runtime)
+endif()
+target_include_directories(
+  helix_attention
+  PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+    $<BUILD_INTERFACE:${HELIX_GENERATED_INCLUDE_DIR}>
+    $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
+helix_configure_target(helix_attention)
 
 helix_add_format_targets()
 

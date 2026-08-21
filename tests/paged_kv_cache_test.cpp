@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <gtest/gtest.h>
 #include <limits>
+#include <memory>
 #include <span>
 #include <thread>
 #include <vector>
@@ -271,6 +272,40 @@ TEST(PagedKvCacheTest, SerializesConcurrentAppendsAndReclaimsAllTables) {
   EXPECT_EQ(cache.stats().free_blocks, 16U);
   EXPECT_EQ(cache.stats().active_sequence_count, 0U);
   EXPECT_EQ(cache.stats().active_tokens, 0U);
+}
+
+TEST(PagedKvCacheTest, LayerReadViewPinsStorageAndExposesOnlyWrittenPrefixes) {
+  auto cache = std::make_unique<PagedKvCache>(PagedKvCacheConfig{2, 2, 2, 2, 2});
+  const PagedSequenceHandle sequence = cache->create_sequence();
+  for (std::size_t token = 0; token < 3; ++token) {
+    cache->append(sequence, make_token(2, 2, 2, static_cast<float>(token * 100)),
+                  make_token(2, 2, 2, static_cast<float>(1'000 + token * 100)));
+  }
+
+  auto view = cache->read_layer(sequence, 1);
+  EXPECT_EQ(view.length(), 3U);
+  EXPECT_EQ(view.kv_heads(), 2U);
+  EXPECT_EQ(view.head_dimension(), 2U);
+  EXPECT_EQ(view.block_tokens(), 2U);
+  EXPECT_EQ(view.logical_block_count(), 2U);
+  EXPECT_EQ(view.block_token_count(0), 2U);
+  EXPECT_EQ(view.block_token_count(1), 1U);
+  EXPECT_EQ(view.physical_block(0).value(), 0U);
+  EXPECT_EQ(view.physical_block(1).value(), 1U);
+  EXPECT_EQ(view.key_block(0, 0).size(), 4U);
+  expect_values(Tensor::from_values({4}, view.key_block(0, 0)),
+                std::array{4.0F, 5.0F, 104.0F, 105.0F});
+  EXPECT_EQ(view.key_block(1, 0).size(), 2U);
+  expect_values(Tensor::from_values({2}, view.key_block(1, 0)), std::array{204.0F, 205.0F});
+  expect_values(Tensor::from_values({2}, view.value_block(1, 1)), std::array{1'206.0F, 1'207.0F});
+  EXPECT_THROW(static_cast<void>(view.key_block(2, 0)), Error);
+  EXPECT_THROW(static_cast<void>(view.value_block(0, 2)), Error);
+
+  cache.reset();
+  auto moved_view = std::move(view);
+  EXPECT_THROW(static_cast<void>(view.length()), Error);
+  EXPECT_EQ(moved_view.length(), 3U);
+  expect_values(Tensor::from_values({2}, moved_view.key_block(1, 0)), std::array{204.0F, 205.0F});
 }
 
 } // namespace

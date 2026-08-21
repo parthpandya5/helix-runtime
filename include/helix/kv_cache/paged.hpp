@@ -6,6 +6,9 @@
 #include <cstdint>
 #include <limits>
 #include <memory>
+#include <mutex>
+#include <span>
+#include <string_view>
 #include <vector>
 
 namespace helix::kv_cache {
@@ -92,7 +95,46 @@ struct PagedKvCacheStats {
 };
 
 class PagedKvCache final {
+  struct SequenceState;
+  struct Impl;
+
 public:
+  class LayerReadView final {
+  public:
+    ~LayerReadView();
+
+    LayerReadView(const LayerReadView&) = delete;
+    LayerReadView& operator=(const LayerReadView&) = delete;
+    LayerReadView(LayerReadView&&) noexcept;
+    LayerReadView& operator=(LayerReadView&&) noexcept;
+
+    [[nodiscard]] std::size_t length() const;
+    [[nodiscard]] std::size_t kv_heads() const;
+    [[nodiscard]] std::size_t head_dimension() const;
+    [[nodiscard]] std::size_t block_tokens() const;
+    [[nodiscard]] std::size_t logical_block_count() const;
+    [[nodiscard]] std::size_t block_token_count(std::size_t logical_block) const;
+    [[nodiscard]] PhysicalBlockId physical_block(std::size_t logical_block) const;
+    [[nodiscard]] std::span<const float> key_block(std::size_t logical_block,
+                                                   std::size_t head) const;
+    [[nodiscard]] std::span<const float> value_block(std::size_t logical_block,
+                                                     std::size_t head) const;
+
+  private:
+    friend class PagedKvCache;
+
+    LayerReadView(std::shared_ptr<Impl> cache, std::unique_lock<std::mutex> lock,
+                  const SequenceState* sequence, std::size_t layer) noexcept;
+    void require_valid(std::string_view operation) const;
+    [[nodiscard]] std::span<const float> block_span(std::size_t logical_block, std::size_t head,
+                                                    bool keys) const;
+
+    std::shared_ptr<Impl> cache_;
+    std::unique_lock<std::mutex> lock_;
+    const SequenceState* sequence_ = nullptr;
+    std::size_t layer_ = 0;
+  };
+
   explicit PagedKvCache(PagedKvCacheConfig config);
   ~PagedKvCache();
 
@@ -113,6 +155,8 @@ public:
   [[nodiscard]] bool contains(const PagedSequenceHandle& sequence) const;
   [[nodiscard]] std::size_t length(const PagedSequenceHandle& sequence) const;
   [[nodiscard]] std::vector<PhysicalBlockId> block_table(const PagedSequenceHandle& sequence) const;
+  [[nodiscard]] LayerReadView read_layer(const PagedSequenceHandle& sequence,
+                                         std::size_t layer) const;
   [[nodiscard]] std::size_t bytes_per_token() const noexcept;
   [[nodiscard]] std::size_t block_bytes() const noexcept;
   [[nodiscard]] std::size_t token_capacity() const noexcept;
@@ -120,8 +164,7 @@ public:
   [[nodiscard]] const PagedKvCacheConfig& config() const noexcept;
 
 private:
-  struct Impl;
-  std::unique_ptr<Impl> impl_;
+  std::shared_ptr<Impl> impl_;
 };
 
 } // namespace helix::kv_cache

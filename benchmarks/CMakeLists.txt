@@ -4,6 +4,7 @@ add_executable(helix_benchmarks
   core_benchmarks.cpp
   cpu_kernel_benchmarks.cpp
   kv_cache_benchmarks.cpp
+  paged_attention_benchmarks.cpp
   tensor_benchmarks.cpp)
 target_link_libraries(
   helix_benchmarks

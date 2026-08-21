@@ -191,12 +191,12 @@ private:
 
 } // namespace
 
-struct PagedKvCache::Impl {
-  struct SequenceState {
-    std::size_t length = 0;
-    std::vector<PhysicalBlockId> blocks;
-  };
+struct PagedKvCache::SequenceState {
+  std::size_t length = 0;
+  std::vector<PhysicalBlockId> blocks;
+};
 
+struct PagedKvCache::Impl {
   explicit Impl(PagedLayout layout)
       : config(layout.config), cache_id(next_paged_cache_id()),
         per_token_bytes(layout.bytes_per_token), per_block_bytes(layout.block_bytes),
@@ -365,8 +365,93 @@ struct PagedKvCache::Impl {
   PagedKvCacheStats stats;
 };
 
+PagedKvCache::LayerReadView::LayerReadView(std::shared_ptr<Impl> cache,
+                                           std::unique_lock<std::mutex> lock,
+                                           const SequenceState* sequence,
+                                           std::size_t layer) noexcept
+    : cache_(std::move(cache)), lock_(std::move(lock)), sequence_(sequence), layer_(layer) {}
+
+PagedKvCache::LayerReadView::~LayerReadView() = default;
+
+PagedKvCache::LayerReadView::LayerReadView(LayerReadView&&) noexcept = default;
+
+PagedKvCache::LayerReadView&
+PagedKvCache::LayerReadView::operator=(LayerReadView&&) noexcept = default;
+
+void PagedKvCache::LayerReadView::require_valid(std::string_view operation) const {
+  HELIX_CHECK(cache_ != nullptr && lock_.owns_lock() && sequence_ != nullptr,
+              ErrorCode::kInvalidArgument,
+              std::string(operation) + ": paged KV layer view is empty or moved from");
+  HELIX_ASSERT(layer_ < cache_->config.layers, "paged KV layer view contains an invalid layer");
+}
+
+std::size_t PagedKvCache::LayerReadView::length() const {
+  require_valid("PagedKvCache::LayerReadView::length");
+  return sequence_->length;
+}
+
+std::size_t PagedKvCache::LayerReadView::kv_heads() const {
+  require_valid("PagedKvCache::LayerReadView::kv_heads");
+  return cache_->config.kv_heads;
+}
+
+std::size_t PagedKvCache::LayerReadView::head_dimension() const {
+  require_valid("PagedKvCache::LayerReadView::head_dimension");
+  return cache_->config.head_dimension;
+}
+
+std::size_t PagedKvCache::LayerReadView::block_tokens() const {
+  require_valid("PagedKvCache::LayerReadView::block_tokens");
+  return cache_->config.block_tokens;
+}
+
+std::size_t PagedKvCache::LayerReadView::logical_block_count() const {
+  require_valid("PagedKvCache::LayerReadView::logical_block_count");
+  return sequence_->blocks.size();
+}
+
+std::size_t PagedKvCache::LayerReadView::block_token_count(std::size_t logical_block) const {
+  require_valid("PagedKvCache::LayerReadView::block_token_count");
+  HELIX_CHECK(logical_block < sequence_->blocks.size(), ErrorCode::kOutOfRange,
+              "PagedKvCache::LayerReadView::block_token_count logical block is out of range");
+  const std::size_t logical_start = logical_block * cache_->config.block_tokens;
+  return std::min(cache_->config.block_tokens, sequence_->length - logical_start);
+}
+
+PhysicalBlockId PagedKvCache::LayerReadView::physical_block(std::size_t logical_block) const {
+  require_valid("PagedKvCache::LayerReadView::physical_block");
+  HELIX_CHECK(logical_block < sequence_->blocks.size(), ErrorCode::kOutOfRange,
+              "PagedKvCache::LayerReadView::physical_block logical block is out of range");
+  return sequence_->blocks[logical_block];
+}
+
+std::span<const float> PagedKvCache::LayerReadView::block_span(std::size_t logical_block,
+                                                               std::size_t head,
+                                                               bool key_span) const {
+  require_valid("PagedKvCache::LayerReadView::block_span");
+  HELIX_CHECK(logical_block < sequence_->blocks.size(), ErrorCode::kOutOfRange,
+              "PagedKvCache::LayerReadView::block_span logical block is out of range");
+  HELIX_CHECK(head < cache_->config.kv_heads, ErrorCode::kOutOfRange,
+              "PagedKvCache::LayerReadView::block_span head is out of range");
+  const std::size_t valid_tokens = block_token_count(logical_block);
+  const std::size_t elements = valid_tokens * cache_->config.head_dimension;
+  const std::size_t offset = cache_->pool_offset(sequence_->blocks[logical_block], layer_, head, 0);
+  const Tensor& pool = key_span ? cache_->keys : cache_->values;
+  return std::span<const float>(pool.data_as<float>() + offset, elements);
+}
+
+std::span<const float> PagedKvCache::LayerReadView::key_block(std::size_t logical_block,
+                                                              std::size_t head) const {
+  return block_span(logical_block, head, true);
+}
+
+std::span<const float> PagedKvCache::LayerReadView::value_block(std::size_t logical_block,
+                                                                std::size_t head) const {
+  return block_span(logical_block, head, false);
+}
+
 PagedKvCache::PagedKvCache(PagedKvCacheConfig config) try
-    : impl_(std::make_unique<Impl>(make_layout(config))) {
+    : impl_(std::make_shared<Impl>(make_layout(config))) {
 } catch (const std::bad_alloc&) {
   throw_error(ErrorCode::kResourceExhausted,
               "PagedKvCache construction could not allocate pool metadata");
@@ -398,7 +483,7 @@ void PagedKvCache::append(const PagedSequenceHandle& sequence, const Tensor& tok
                           const Tensor& token_values) {
   constexpr std::string_view kOperation = "PagedKvCache::append";
   std::scoped_lock lock(impl_->mutex);
-  Impl::SequenceState& state = impl_->require_sequence(sequence, kOperation);
+  SequenceState& state = impl_->require_sequence(sequence, kOperation);
   require_cpu_float_tensor(token_keys, "token keys", kOperation);
   require_cpu_float_tensor(token_values, "token values", kOperation);
   const Shape token_shape{checked_dimension(impl_->config.layers, "KV layer count"),
@@ -467,7 +552,7 @@ void PagedKvCache::append(const PagedSequenceHandle& sequence, const Tensor& tok
 KvLayer PagedKvCache::retrieve_layer(const PagedSequenceHandle& sequence, std::size_t layer) const {
   constexpr std::string_view kOperation = "PagedKvCache::retrieve_layer";
   std::scoped_lock lock(impl_->mutex);
-  const Impl::SequenceState& state = impl_->require_sequence(sequence, kOperation);
+  const SequenceState& state = impl_->require_sequence(sequence, kOperation);
   HELIX_CHECK(layer < impl_->config.layers, ErrorCode::kOutOfRange,
               "PagedKvCache::retrieve_layer layer index is out of range");
   const Shape output_shape{checked_dimension(impl_->config.kv_heads, "KV head count"),
@@ -482,14 +567,14 @@ void PagedKvCache::copy_layer_out(const PagedSequenceHandle& sequence, std::size
                                   Tensor& keys, Tensor& values) const {
   constexpr std::string_view kOperation = "PagedKvCache::copy_layer_out";
   std::scoped_lock lock(impl_->mutex);
-  const Impl::SequenceState& state = impl_->require_sequence(sequence, kOperation);
+  const SequenceState& state = impl_->require_sequence(sequence, kOperation);
   impl_->copy_layer(state, layer, keys, values, kOperation);
 }
 
 void PagedKvCache::release_sequence(const PagedSequenceHandle& sequence) {
   constexpr std::string_view kOperation = "PagedKvCache::release_sequence";
   std::scoped_lock lock(impl_->mutex);
-  const Impl::SequenceState& state = impl_->require_sequence(sequence, kOperation);
+  const SequenceState& state = impl_->require_sequence(sequence, kOperation);
   HELIX_ASSERT(state.blocks.size() <= impl_->config.physical_blocks - impl_->free_blocks.size(),
                "paged KV release would overflow the free-block queue");
   for (const PhysicalBlockId block : state.blocks) {
@@ -538,6 +623,16 @@ std::vector<PhysicalBlockId> PagedKvCache::block_table(const PagedSequenceHandle
     throw_error(ErrorCode::kResourceExhausted,
                 "PagedKvCache::block_table could not allocate the table snapshot");
   }
+}
+
+PagedKvCache::LayerReadView PagedKvCache::read_layer(const PagedSequenceHandle& sequence,
+                                                     std::size_t layer) const {
+  constexpr std::string_view kOperation = "PagedKvCache::read_layer";
+  std::unique_lock lock(impl_->mutex);
+  const SequenceState& state = impl_->require_sequence(sequence, kOperation);
+  HELIX_CHECK(layer < impl_->config.layers, ErrorCode::kOutOfRange,
+              "PagedKvCache::read_layer layer index is out of range");
+  return LayerReadView(impl_, std::move(lock), &state, layer);
 }
 
 std::size_t PagedKvCache::bytes_per_token() const noexcept {
