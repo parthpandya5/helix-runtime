@@ -28,6 +28,7 @@ Every recorded experiment must include:
 | M9 CPU transformer primitives | No earlier RoPE fixture; M2 provided scalar SiLU only | Add preallocated SwiGLU and adjacent-pair RoPE reference paths | Median CPU time: SwiGLU 4,096 values 44.602 us and 131,072 values 1.512 ms; RoPE 1x32x128 1.904 us and 128x32x128 187.894 us | These are single-threaded correctness baselines, not optimized CPU or GPU comparisons. High host load makes wall-time variation substantial. |
 | M10 contiguous CPU attention | No earlier attention path | Materialize scaled/masked scores, stable softmax in place, then probabilities x V with reusable output/workspace | Median CPU time: 8x1x128x64x64 76.371 us; 8x1x1,024x64x64 825.128 us; 3x17x29x37x41 46.284 us; 8x128x128x64x64 8.164 ms | Workspace is exactly `4*H*Q*K` bytes. These single-threaded results include softmax but the reported dot FLOP/s numerator does not; they are correctness baselines. |
 | M11 contiguous CPU KV cache | No earlier KV storage | Reserve per-sequence K/V tensors, append complete tokens, and copy a compact layer history into preallocated outputs | Lifecycle median CPU time: 26.898 us (2x2x64, capacity/append 128), 63.700 us (4x8x64, capacity 512/append 32), 7.853 us (odd 3x3x37, 29); layer-copy median: 1.595 us (128 KiB), 29.609 us (2 MiB), 613 ns (25,752 B) | Lifecycle includes sequence allocation, appends, and release. Layer copy excludes output allocation. This is a contiguous baseline under high host load, not evidence that paging or another layout is faster. |
+| M12 paged CPU KV cache | Same-run M11 contiguous fixtures | Use a long-lived fixed-token pool, allocate logical blocks on append boundaries, and compact through block tables | Paged/contiguous lifecycle medians: 25.784/28.485 us, 18.016/64.400 us, 6.869/8.074 us. Paged/contiguous layer-copy medians: 3.684/1.568 us (128 KiB), 57.690/33.032 us (2 MiB), 540/554 ns (25,752 B). | Pool construction is outside paged lifecycle timing while per-sequence contiguous storage is inside; the 72% lifecycle reduction also uses 16x less assigned capacity. Paged copying is 2.35x and 1.75x slower for the large histories because it traverses 8 and 32 blocks. |
 
 ## M1 CPU tensor baseline — 2026-08-20
 
@@ -294,9 +295,71 @@ Command:
 
 These measurements establish only the contiguous CPU cost. The host was heavily
 loaded, so they should be repeated on an idle machine before interpreting small
-differences. M12 must compare page allocation and capacity utilization against
-this design using the same request traces; it cannot claim improvement merely from
-smaller theoretical tail waste.
+differences. The paired M12 run below repeats these contiguous cases in the same
+process as their paged counterparts.
+
+## M12 paged-versus-contiguous CPU KV baseline — 2026-08-21
+
+Environment:
+
+- source: commit `68e8d31`
+- host: Apple M3 Pro, 12 CPU cores, 18 GB RAM
+- OS/compiler/build: macOS 26.0.1 arm64, Apple Clang 17.0.0, Release,
+  `HELIX_ENABLE_CUDA=OFF`, Float32
+- CMake 4.2.3 and Google Benchmark 1.9.1
+- warmup: time-based 0.05 seconds per case
+- measurement: time-based minimum 0.1 seconds per repetition, five repetitions;
+  median CPU time reported
+- concurrency: one benchmark thread; both caches use one mutex
+- host one-minute load average at start: 15.05; affinity and CPU-frequency
+  metadata were unavailable
+
+Both lifecycle fixtures time sequence creation, all whole-token appends, and
+release with input tensors prepared outside the timed region. The contiguous cache
+allocates and releases each sequence's declared-capacity tensors inside the loop.
+The paged cache's global pool is constructed outside the loop, as it would be for a
+long-lived runtime; the loop assigns and returns physical blocks. These are useful
+steady-state runtime traces, but they do not isolate block-table overhead from the
+different allocation boundary.
+
+| Layers x heads x dimension; appended tokens | Contiguous declaration / assigned bytes | Paged block geometry / assigned pool bytes | Contiguous median | Paged median | Observed result |
+|---|---:|---:|---:|---:|---|
+| 2 x 2 x 64; 128 | capacity 128 / 262,144 B | 8 x 16 / 262,144 B | 28.485 us | 25.784 us | Paged was 9.5% lower CPU time with equal payload capacity. |
+| 4 x 8 x 64; 32 | capacity 512 / 8,388,608 B | 2 x 16 / 524,288 B | 64.400 us | 18.016 us | Paged was 72.0% lower with 16x less assigned capacity in this over-reserved trace. |
+| 3 x 3 x 37; 29 | capacity 29 / 77,256 B | 5 x 7 / 93,240 B | 8.074 us | 6.869 us | Paged was 14.9% lower despite six tail slots; pool allocation remains outside timing. |
+
+No universal append-speed conclusion follows from these three shapes. They show
+the intended lifetime model and that avoiding per-sequence maximum reservation can
+matter. At equal exact capacities, block-table bookkeeping and the global-pool
+construction boundary must be considered separately.
+
+The layer-copy fixtures prefill outside timing and copy equal payloads into
+preallocated compact outputs. Contiguous storage issues two copies per head. Paged
+storage issues two copies per head per logical block.
+
+| Layer history | Logical blocks | Contiguous median | Paged median | Observed result |
+|---|---:|---:|---:|---|
+| 2 heads x 128 tokens x 64; 131,072 B | 8 | 1.568 us | 3.684 us | Paged was 2.35x slower. |
+| 8 heads x 512 tokens x 64; 2,097,152 B | 32 | 33.032 us | 57.690 us | Paged was 1.75x slower. |
+| 3 heads x 29 tokens x 37; 25,752 B | 5 | 554 ns | 540 ns | The 2.5% difference is within observed variation; no winner is claimed. |
+
+The unfavorable large-copy results are retained: materializing a contiguous
+history erases paging's indirection benefit while adding copy calls. M13 paged
+attention must read through the block table directly and be compared separately;
+this benchmark does not predict its latency.
+
+Command:
+
+```bash
+./build-release/benchmarks/helix_benchmarks \
+  '--benchmark_filter=BM_(Contiguous|Paged)Kv' \
+  --benchmark_min_warmup_time=0.05 \
+  --benchmark_min_time=0.1s \
+  --benchmark_repetitions=5 \
+  --benchmark_report_aggregates_only=true
+```
+
+No GPU storage or timing is represented by these CPU measurements.
 
 ## Timing rules
 

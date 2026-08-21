@@ -337,10 +337,20 @@ flowchart LR
     Offset --> KV[(K/V block storage)]
 ```
 
-The planned M12 manager owns a free-block pool, allocation state, and sequence
-tables. Its first memory-pressure policy rejects admission/append with a typed
-resource error while preserving current sequences. Preemption, prefix sharing,
-and reference counting are added only for implemented policies that need them.
+The implemented M12 CPU manager owns two physical-major tensors shaped
+`[physical_blocks, layers, kv_heads, block_tokens, head_dimension]`, a preallocated
+circular FIFO free-block pool, owner/free/reuse metadata, and one block table per
+sequence. It allocates a physical block only when an append begins a new logical
+block. The sequence table is grown before the free queue changes, so metadata OOM
+or pool exhaustion preserves the prior mapping and logical length. Release
+prevalidates ownership and returns blocks without allocating.
+
+The first memory-pressure policy rejects append with a typed resource error while
+preserving current sequences; an append within an already-owned partial block can
+still proceed. Debug builds re-derive ownership and accounting invariants after
+every mutation. Both contiguous and paged CPU caches use one mutex per instance.
+Paged attention, GPU-resident pool integration, preemption, prefix sharing, and
+reference counting remain separate milestones rather than implied features.
 
 ## Request and scheduler
 

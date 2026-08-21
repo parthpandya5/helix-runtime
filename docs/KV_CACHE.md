@@ -2,10 +2,11 @@
 
 ## Status
 
-The M11 contiguous Float32 CPU cache is implemented, CPU-validated, sanitized,
-and benchmarked. It defines the ownership, layout, append, retrieval, accounting,
-and exhaustion contracts that paging will preserve. M12 paged storage and M13
-paged attention remain planned; there is not yet a GPU-resident KV-cache path.
+The M11 contiguous and M12 paged Float32 CPU caches are implemented,
+CPU-validated, sanitized, and benchmarked. They share append/retrieve/release
+semantics while exposing the memory-capacity and traversal tradeoffs between a
+per-sequence allocation and a global fixed-block pool. M13 paged attention remains
+planned; there is not yet a GPU-resident KV-cache path.
 
 ## Why cache keys and values?
 
@@ -99,18 +100,18 @@ and its unused reserved payload is:
 
 This is capacity slack, not the `HelixAllocator` block-fragmentation metric. A
 request must choose one fixed maximum up front, and its unused tail cannot serve a
-different sequence. That is the allocation problem M12 paging targets.
+different sequence. That is the allocation problem M12 paging addresses.
 
 ## Thread safety
 
-All public operations that access sequence state are serialized by one cache
-mutex. The immutable configuration and bytes-per-token value can be read without
-locking. The coarse lock intentionally covers allocation and copies in this
-correctness baseline; it gives a clear shared-state boundary and is tested with
+Each cache instance serializes public operations that access sequence state with
+one mutex. Immutable configuration and byte formulas can be read without locking.
+The coarse lock intentionally covers metadata updates and copies in these
+correctness baselines; it gives a clear shared-state boundary and is tested with
 concurrent appends to independent sequences. Fine-grained locking is deferred
 until a measured scheduler workload demonstrates contention.
 
-## Correctness coverage
+## Contiguous correctness coverage
 
 Deterministic tests cover:
 
@@ -127,11 +128,19 @@ Deterministic tests cover:
 Actual CPU workload baselines and their limitations are recorded in
 `docs/PERFORMANCE.md`.
 
-## Paged design (M12 target)
+## Paged block cache
 
-Paged storage will allocate fixed-token physical blocks only as a sequence crosses
-a block boundary. A sequence's block table maps logical blocks to pool-owned
-physical blocks:
+`PagedKvCache` allocates two long-lived, physical-major CPU tensors when the cache
+is constructed:
+
+```text
+keys   [physical_blocks, layers, kv_heads, block_tokens, head_dimension]
+values [physical_blocks, layers, kv_heads, block_tokens, head_dimension]
+```
+
+It assigns a fixed-token `PhysicalBlockId` only when an append crosses a logical
+block boundary. A sequence's `std::vector<PhysicalBlockId>` block table maps a
+logical position to pool storage:
 
 ```mermaid
 flowchart LR
@@ -142,20 +151,87 @@ flowchart LR
     Split --> Pool
 ```
 
-The manager will own the free-block pool and all block tables. Allocation of the
-next block must be transactional: exhaustion leaves sequence length, mappings,
-data, and counters unchanged. Release returns every owned block exactly once.
-Reference counting is intentionally absent until prefix sharing creates shared
-ownership. The initial policy remains safe rejection when no block is free.
+For position `p`, `logical_block = p / block_tokens` and
+`token_offset = p % block_tokens`. The physical-major layout keeps every physical
+block's complete layer/head K/V payload together. Within one layer and head, a
+block's token vectors are contiguous. Retrieving a compact layer therefore issues
+two copies per head per logical block instead of two copies per head in the
+contiguous cache.
+
+### Free pool and ownership
+
+The free pool is a fixed-capacity circular FIFO initialized with block IDs in
+ascending order. It allocates no metadata during release, returns blocks in a
+deterministic order, and prefers never-used blocks before recycled blocks. Parallel
+arrays record the owning sequence, free membership, and whether each block has ever
+been assigned. `PagedSequenceHandle` carries a cache identity and monotonic
+sequence identity independently from the contiguous handle type.
+
+When an append needs a new block, Helix validates the input and checks availability
+before changing the free queue. It first grows the sequence table; only after that
+potentially throwing allocation succeeds does it dequeue and assign the physical
+block. All remaining writes are bounds-derived nonthrowing copies, so exhaustion or
+host metadata OOM cannot leave a partial mapping. An append inside an already-owned
+partial block remains legal even when the free pool is empty.
+
+Release validates every block owner before mutation, then returns all blocks
+without allocating. Reused storage is not cleared, but retrieval exposes only the
+new sequence's written logical length; every visible token position is overwritten
+before it can be read. There is one owner per block. Reference counting is
+intentionally absent until prefix sharing creates shared ownership.
+
+### Accounting and invariants
+
+The pool reserves:
+
+```text
+pool_bytes = physical_blocks * block_tokens * bytes_per_token
+```
+
+Assigned capacity is `used_blocks * block_tokens`; per-sequence tail slack is less
+than `block_tokens`. Statistics report reserved/used/free/peak bytes, total/used/
+free blocks, active sequences/tokens, allocated and unused token slots, successful
+lifecycle counts, block assignments, and reuse. Debug builds re-derive ownership,
+block-table lengths, free membership, byte totals, token slots, and all major
+counters after every mutation.
+
+The deterministic comparison test uses two requests declared with contiguous
+capacities of ten tokens but active lengths of one and five. The contiguous cache
+assigns 20 token slots (160 bytes) and leaves 14 unused; a four-token paged pool
+assigns 12 slots (96 bytes) and leaves six unused. This result is specific to an
+over-reserved trace. If every contiguous request knew its exact final length,
+paging could use more memory because each sequence retains up to one partial-block
+tail.
+
+### Paged correctness coverage
+
+Seven deterministic tests cover:
+
+- multi-layer/head values spanning odd and complete block boundaries,
+- visible block-table order and compact retrieval,
+- cached decode passed through the M10 attention oracle,
+- transactional exhaustion and continued writes to a partial final block,
+- FIFO reclamation, reuse, stale-data invisibility, and double-release rejection,
+- invalid/overflowing configuration, handles, shapes, dtypes, layers, and outputs,
+- exact statistics and contiguous-versus-paged tail accounting,
+- concurrent append followed by complete reclamation,
+- normal and ASan/UBSan execution.
+
+Release-mode lifecycle and layer-copy comparisons are recorded in
+`docs/PERFORMANCE.md`. The large-history layer-copy results are deliberately
+unfavorable to paging because materialization must traverse many discontiguous
+blocks; M13 will read block tables directly instead of treating compaction as the
+final attention design.
 
 ## Current limitations
 
 - Float32 CPU tensors only; no GPU-resident cache or asynchronous copy contract.
 - Keys and values use the same head dimension.
-- Retrieval compacts/copies a layer rather than returning a non-owning strided
-  view.
-- Sequence capacity cannot grow.
-- No paging, prefix sharing, eviction, preemption, or reference counting yet.
+- Retrieval compacts/copies a layer; attention does not yet consume block tables
+  directly.
+- Contiguous sequence capacity cannot grow; the paged pool cannot grow after
+  construction.
+- No prefix sharing, eviction, preemption, or reference counting yet.
 - One mutex serializes all sequences.
 
 The implementation is original. Fixed-size blocks, block tables, and KV reuse are

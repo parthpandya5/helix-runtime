@@ -359,7 +359,7 @@ tests; 57 GPU tests remain hardware-gated, and M11 does not claim a GPU cache pa
 CPU lifecycle and allocation-free layer-copy baselines are recorded in
 `docs/PERFORMANCE.md`; design and limitations are in `docs/KV_CACHE.md`.
 
-### M12 — Paged KV cache — Planned
+### M12 — Implemented, CPU-validated, sanitized, and benchmarked
 
 - fixed-token physical blocks and strongly typed block/sequence IDs
 - logical-to-physical block tables and free-block pool
@@ -368,6 +368,37 @@ CPU lifecycle and allocation-free layer-copy baselines are recorded in
 - fragmentation/capacity comparison with contiguous sequence allocation
 
 Reference counting is deferred until prefix sharing creates a real need.
+
+Implementation/validation record (2026-08-21, commit `68e8d31`):
+`PagedKvCache` owns a fixed Float32 pool laid out as
+`[physical_blocks, layers, kv_heads, block_tokens, head_dimension]` for both keys
+and values. Strong `PhysicalBlockId` and cache-tagged `PagedSequenceHandle` types
+separate physical ownership from logical sequence identity. Per-sequence block
+tables translate logical token positions; a preallocated circular FIFO provides
+deterministic allocation and allocation-free reclamation.
+
+An append that crosses a block boundary grows the sequence table before dequeuing
+a block. Input failure, metadata OOM, or an empty free pool therefore leaves the
+mapping, length, payload, and success counters unchanged. A partially filled final
+block remains writable with zero blocks free. Release prevalidates ownership and
+returns every block exactly once. Debug builds re-derive table lengths, owners,
+free membership, token slots, bytes, and counters after mutations.
+
+Seven new tests bring normal and ASan/UBSan suites to 88/88. They cover values
+across block boundaries, attention interoperability, transactional exhaustion,
+FIFO reuse, stale-data invisibility, invalid and overflowing contracts, exact
+reclamation/accounting, a contiguous tail-slack comparison, and concurrent
+callers. The CUDA-on build passes all 88 hardware-independent tests; the existing
+57 GPU tests remain hardware-gated. M12 is a CPU metadata/storage implementation,
+not a GPU-runtime claim.
+
+Release measurements retain both sides of the tradeoff. With a long-lived pool,
+paged lifecycle traces were 9.5%, 72.0%, and 14.9% lower CPU time than the
+corresponding contiguous traces, but their allocation boundaries and reserved
+capacities differ as documented. Compact layer copying was 2.35x and 1.75x slower
+for the 128 KiB and 2 MiB histories because it traverses 8 and 32 blocks; the odd
+25,752-byte case was within run-to-run variation. See `docs/KV_CACHE.md` and
+`docs/PERFORMANCE.md` for exact methodology and limitations.
 
 ### M13 — Paged attention — Planned; GPU optimization hardware pending
 

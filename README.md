@@ -14,15 +14,15 @@ reproducible benchmark evidence.
 ## Current status
 
 Milestones 0–2, the host-testable portions of Milestones 7–8, the CPU paths of
-Milestones 9–10, and the M11 contiguous KV cache are implemented and CPU-validated.
-The repository contains the
-CPU-first build foundation, a checked contiguous tensor core, Float32 reference
+Milestones 9–10, and the M11–M12 contiguous and paged KV caches are implemented
+and CPU-validated. The repository contains the CPU-first build foundation, a
+checked contiguous tensor core, Float32 reference
 kernels for elementwise math, reductions, stable softmax, matrix multiplication,
 RMSNorm, SwiGLU, adjacent-pair RoPE, linear projection, and causal scaled
 dot-product attention, plus a caching allocator, completion-aware deferred
-reclamation, and a layer-aware KV history with checked capacity accounting. On
-2026-08-21, Apple Clang 17 built the project on macOS arm64 with warnings as errors;
-81/81 CPU tests passed in normal and ASan/UBSan configurations.
+reclamation, and layer-aware contiguous/paged KV histories with checked capacity
+accounting. On 2026-08-21, Apple Clang 17 built the project on macOS arm64 with
+warnings as errors; 88/88 CPU tests passed in normal and ASan/UBSan configurations.
 
 CUDA is optional at configure time. The current Apple Silicon development host has
 no NVIDIA GPU or native CUDA toolkit, so no CUDA execution or performance claim is
@@ -32,7 +32,7 @@ compile-validated in an ARM64 CUDA 12.6 development container without a
 driver/device. The M8 stream-ordered allocator and M9 block-reduced RMSNorm,
 grid-stride SwiGLU, adjacent-pair RoPE, and projection adapter are also
 compile-validated, as is the M10 three-stage contiguous attention baseline. None is
-runtime-validated on a GPU. The CUDA-on build passes the same 81 hardware-
+runtime-validated on a GPU. The CUDA-on build passes the same 88 hardware-
 independent tests and registers 57 GPU tests that cannot run without a driver and
 device.
 
@@ -120,7 +120,9 @@ cmake --build build-release -j
 The first release-mode `Tensor::zeros` baseline is recorded without an optimization
 claim. Allocation-free CPU reference-kernel baselines are also recorded, including
 odd-width softmax, odd-dimension/standard-square matmul, SwiGLU, and decode/prefill-
-shaped RoPE. Methodology and actual measurements live in
+shaped RoPE. Contiguous attention and contiguous-versus-paged KV lifecycle/layer-
+copy fixtures record their actual CPU costs and unfavorable results. Methodology
+and measurements live in
 [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md).
 
 ## Tensor runtime
@@ -181,7 +183,7 @@ keeps score, stable softmax, and probability-times-V stages visible. The CPU pat
 is tested, sanitized, and benchmarked; the matching CUDA path and event fixtures
 are compile-validated only. See [`docs/ATTENTION.md`](docs/ATTENTION.md).
 
-## Contiguous KV cache
+## KV cache
 
 The M11 CPU baseline owns per-sequence Float32 key/value tensors with explicit
 layer, KV-head, capacity, and head-dimension axes. It appends one complete token,
@@ -190,7 +192,15 @@ capacity exhaustion transactionally, and reports exact active/peak bytes and tok
 counts. Cache-tagged sequence handles prevent foreign or released handles from
 freeing storage. Five focused tests include cached-decode equivalence and
 concurrent callers; lifecycle and preallocated layer-copy baselines are measured.
-See [`docs/KV_CACHE.md`](docs/KV_CACHE.md).
+
+The M12 paged path replaces per-sequence maximum-capacity allocations with a
+fixed-token physical pool and logical block tables. A deterministic allocation-
+free FIFO manages free blocks; append-on-boundary and release are transactional,
+cache-tagged handles reject foreign/stale ownership, and statistics expose block,
+byte, token-slot, reuse, and tail-slack behavior. Tests cover exhaustion, reuse,
+concurrency, and a concrete contiguous capacity comparison. Benchmarks keep the
+faster steady-state lifecycle and slower large-history compaction results. See
+[`docs/KV_CACHE.md`](docs/KV_CACHE.md).
 
 ## Supported hardware
 
@@ -204,12 +214,12 @@ See [`docs/KV_CACHE.md`](docs/KV_CACHE.md).
 
 The CUDA runtime, M4–M6/M9–M10 kernels, and M7–M8 CUDA allocator adapters are
 compile-validated only; physical GPU correctness, timing, and resource validation
-remain pending. The KV cache is CPU-only and contiguous; paged KV storage, paged
-attention, scheduler, model execution, and generation remain roadmap work. Tensor
-allocator integration is also pending. Float16 has no arithmetic path yet. Tensor
-execution is contiguous-only; broadcasting, slicing, and general strided kernels
-are intentionally deferred. CPU kernels are reference implementations, not
-optimized BLAS replacements.
+remain pending. Both KV-cache layouts are CPU-only; paged attention, scheduler,
+model execution, and generation remain roadmap work. Tensor allocator integration
+is also pending. Float16 has no arithmetic path yet. Tensor execution is
+contiguous-only; broadcasting, slicing, and general strided kernels are
+intentionally deferred. CPU kernels are reference implementations, not optimized
+BLAS replacements.
 
 ## Engineering notes
 
