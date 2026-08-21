@@ -30,7 +30,8 @@ Every recorded experiment must include:
 | M11 contiguous CPU KV cache | No earlier KV storage | Reserve per-sequence K/V tensors, append complete tokens, and copy a compact layer history into preallocated outputs | Lifecycle median CPU time: 26.898 us (2x2x64, capacity/append 128), 63.700 us (4x8x64, capacity 512/append 32), 7.853 us (odd 3x3x37, 29); layer-copy median: 1.595 us (128 KiB), 29.609 us (2 MiB), 613 ns (25,752 B) | Lifecycle includes sequence allocation, appends, and release. Layer copy excludes output allocation. This is a contiguous baseline under high host load, not evidence that paging or another layout is faster. |
 | M12 paged CPU KV cache | Same-run M11 contiguous fixtures | Use a long-lived fixed-token pool, allocate logical blocks on append boundaries, and compact through block tables | Paged/contiguous lifecycle medians: 25.784/28.485 us, 18.016/64.400 us, 6.869/8.074 us. Paged/contiguous layer-copy medians: 3.684/1.568 us (128 KiB), 57.690/33.032 us (2 MiB), 540/554 ns (25,752 B). | Pool construction is outside paged lifecycle timing while per-sequence contiguous storage is inside; the 72% lifecycle reduction also uses 16x less assigned capacity. Paged copying is 2.35x and 1.75x slower for the large histories because it traverses 8 and 32 blocks. |
 | M13 CPU attention value traversal | Dimension-major probability-times-V for contiguous and direct paged storage | Accumulate fixed 32-coordinate tiles while each V row/page is hot; retain both baselines | Contiguous speedup 1.31x–2.47x and paged speedup 2.36x–2.99x across four paired cases. With equal tiling, paged CPU time was 2.1%–6.7% higher. | The original apparent paged win was confounded by a general loop-locality improvement. Applying the same traversal to both paths isolates a modest end-to-end paging cost on this CPU; it is not GPU evidence. |
-| M15 FIFO scheduler host trace | No earlier scheduler implementation | Schedule and complete deterministic mixed prefill/decode traces under token, running-request, and logical KV-block limits | Median CPU time per complete trace: 49.720 us (16 requests/256 tokens) through 1.363 ms (128 requests/6,144 tokens) | This measures host policy bookkeeping and its allocations. Logical token transitions per second are not model or inference throughput. |
+| M15 FIFO scheduler host trace | No earlier scheduler implementation | Schedule and complete deterministic mixed prefill/decode traces under token, running-request, and logical KV-block limits | Corrected median CPU time per complete trace: 48.777 us (16 requests/256 tokens) through 1.342 ms (128 requests/6,144 tokens) | A first fixture revision accidentally polled the O(N) statistics snapshot inside timing; those values were discarded. The corrected trace measures host policy and completion-vector work, not inference. |
+| M16 continuous batching policy | Static cohorts on the same mixed-length request sequence | Refill finished slots between iterations and aggregate lifecycle metrics | Under an explicit constant-1-ms iteration model, continuous/static makespans were 48/132 ms and 92/260 ms (2.75x and 2.83x modeled rates). Median host control CPU times differed by 1.3% and 4.1%. | Modeled results demonstrate policy utilization only; they are not measured model throughput. Host differences are small relative to local variation and do not establish a CPU optimization. |
 
 ## M1 CPU tensor baseline — 2026-08-20
 
@@ -433,7 +434,7 @@ latency. Those require a CUDA paged cache/kernel and physical NVIDIA execution.
 
 Environment:
 
-- source: commit `7b50dbc`
+- source: scheduler commit `7b50dbc`; corrected fixture commit `f17ce74`
 - host: Apple M3 Pro, 12 CPU cores, 18 GB RAM
 - OS/compiler/build: macOS 26.0.1 arm64, Apple Clang 17.0.0, Release,
   `HELIX_ENABLE_CUDA=OFF`, warnings as errors
@@ -441,6 +442,8 @@ Environment:
 - request construction and submission: outside the timed region
 - timed work: every `schedule_iteration`, completion-vector construction, and
   `complete_iteration` call until the trace finishes
+- completion detection: derived from each returned retirement report; no statistics
+  snapshot or O(N) request-history scan occurs inside the timed loop
 - excluded work: model execution, token selection, physical KV allocation/data,
   device transfer, and CUDA execution
 - synthetic KV capacity: enough blocks for every request's full prompt and output;
@@ -451,15 +454,15 @@ Environment:
 - measurement: time-based minimum 0.1 seconds per repetition, five repetitions;
   median CPU time reported
 - concurrency: one benchmark thread and one scheduler owner
-- one-minute host load average at start: 15.36; affinity and CPU-frequency metadata
+- one-minute host load average at start: 7.90; affinity and CPU-frequency metadata
   were unavailable
 
 | Requests | Prompt/output tokens each | Max running | Token budget | Block tokens | Scheduler iterations | Median CPU time/trace | CPU-time CV | Logical transitions/s |
 |---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| 16 | 8 / 8 | 8 | 64 | 16 | 18 | 49.720 us | 3.05% | 5.149 million |
-| 64 | 32 / 16 | 16 | 128 | 16 | 72 | 413.875 us | 3.55% | 7.423 million |
-| 64 | 128 / 32 | 32 | 512 | 16 | 74 | 791.028 us | 1.85% | 12.945 million |
-| 128 | 17 / 31 | 32 | 256 | 7 | 130 | 1.363 ms | 2.40% | 4.507 million |
+| 16 | 8 / 8 | 8 | 64 | 16 | 18 | 48.777 us | 2.38% | 5.248 million |
+| 64 | 32 / 16 | 16 | 128 | 16 | 72 | 367.201 us | 3.36% | 8.366 million |
+| 64 | 128 / 32 | 32 | 512 | 16 | 74 | 698.269 us | 1.37% | 14.665 million |
+| 128 | 17 / 31 | 32 | 256 | 7 | 130 | 1.342 ms | 3.08% | 4.579 million |
 
 “Logical transitions/s” divides prompt-plus-generated token state transitions by
 the measured host CPU time. It is useful only for comparing scheduler policy
@@ -469,11 +472,104 @@ work. The non-monotonic rate reflects differing active-set sizes, prompt chunkin
 decode iteration counts, and container/allocation work; no optimization conclusion
 is drawn from this first baseline.
 
+The fixture initially used `scheduler.stats().finished_count` as its loop
+condition. `stats()` walks retained request history to classify every state, so
+that observer added unrelated O(N) work to every measured iteration. The values
+recorded before `f17ce74` are discarded rather than presented as a scheduler
+regression or optimization. The corrected fixture counts finished requests from
+the already-required `CompletionReport`; the table above is the replacement
+measurement.
+
 Command:
 
 ```bash
 ./build-release/benchmarks/helix_benchmarks \
   --benchmark_filter=BM_FifoSchedulerTrace \
+  --benchmark_min_warmup_time=0.05 \
+  --benchmark_min_time=0.1s \
+  --benchmark_repetitions=5 \
+  --benchmark_report_aggregates_only=true
+```
+
+## M16 static-versus-continuous scheduler experiment — 2026-08-21
+
+Environment and measured host scope:
+
+- source: commit `f17ce74`
+- host/OS/compiler/build: Apple M3 Pro (12 CPU cores, 18 GB RAM), macOS
+  26.0.1 arm64, Apple Clang 17.0.0, Release, `HELIX_ENABLE_CUDA=OFF`, warnings as
+  errors
+- CMake 4.2.3 and Google Benchmark 1.9.1
+- measured host work: scheduler/request construction, prompt construction and
+  submission, all scheduling/completion decisions and completion vectors, and the
+  final metrics snapshot; only the immutable workload specification is outside
+  timing
+- warmup: time-based 0.05 seconds per case
+- measurement: time-based minimum 0.1 seconds per repetition, five repetitions;
+  median CPU time reported
+- concurrency: one benchmark thread and one scheduler owner
+- one-minute host load average at start: 7.90; affinity and CPU-frequency metadata
+  were unavailable
+
+The same fixture also advances request timestamps by exactly 1 ms per completed
+scheduler iteration. This is a declared policy model, not elapsed benchmark time.
+It assumes every batch has equal cost regardless of resident count, prefill/decode
+mix, prompt chunk, tensor shape, or KV length. No model, attention, cache write,
+device transfer, or GPU kernel executes. Enough logical KV blocks are provisioned
+to remove memory pressure as a confound, and all requests arrive at modeled time
+zero.
+
+Workloads are deliberately mixed-length. In workload S, 32 requests have prompt
+length 8, concurrency 8, token budget 64, and 16-token KV blocks; the first request
+of each eight-request group emits 32 tokens and the other seven emit 4. In workload
+L, 128 requests have prompt length 17, concurrency 32, token budget 544, and
+7-token blocks; each group leader emits 64 tokens and the other 31 emit 8. Static
+policy admits the next fixed cohort only after every request in the prior cohort
+finishes. Continuous policy queues all requests and refills each terminal slot on
+the next iteration.
+
+Modeled utilization/rate results:
+
+| Workload | Policy | Iterations / modeled ms | Modeled requests/s | Modeled generated tokens/s |
+|---|---|---:|---:|---:|
+| S: 32 requests, max 8 | Continuous | 48 | 666.667 | 5,000.000 |
+| S: 32 requests, max 8 | Static cohorts | 132 | 242.424 | 1,818.182 |
+| L: 128 requests, max 32 | Continuous | 92 | 1,391.304 | 13,565.217 |
+| L: 128 requests, max 32 | Static cohorts | 260 | 492.308 | 4,800.000 |
+
+Modeled latency distributions (milliseconds):
+
+| Workload/policy | Wait mean / p50 / p95 | TTFT p50 / p95 | Request latency p50 / p95 | Mean inter-token |
+|---|---:|---:|---:|---:|
+| S continuous | 9.375 / 10 / 22.25 | 12 / 24.25 | 15 / 40.25 | 1 |
+| S static | 49.5 / 49.5 / 99 | 51.5 / 101 | 68.5 / 104 | 1 |
+| L continuous | 14.203 / 18 / 27 | 20 / 29 | 27 / 45 | 1 |
+| L static | 97.5 / 97.5 / 195 | 99.5 / 197 | 134.5 / 204 | 1 |
+
+Continuous batching therefore produces 2.75x and 2.83x the modeled request/token
+rate for these two intentionally imbalanced arrival sequences. That conclusion is
+conditional on the constant-cost iteration model. It demonstrates that refilling
+slots removes static-cohort bubbles; it does not predict the speedup of a real
+transformer, where prefill and decode have different costs and batch efficiency is
+shape/hardware dependent.
+
+Measured host control-path results:
+
+| Workload | Continuous median CPU time | Static median CPU time | CPU-time CVs |
+|---|---:|---:|---:|
+| S | 105.937 us | 107.290 us | 1.28% / 2.33% |
+| L | 491.558 us | 512.741 us | 2.94% / 1.93% |
+
+Continuous host time was 1.3% and 4.1% lower in this run, but the implementations
+perform different iteration/container traces and the gaps are small relative to
+local variation. No CPU optimization claim is made. The modeled policy outcome is
+deterministic; the host timing remains a local control-path baseline.
+
+Command:
+
+```bash
+./build-release/benchmarks/helix_benchmarks \
+  --benchmark_filter='BM_(ContinuousBatchingPolicy|StaticCohortPolicy)' \
   --benchmark_min_warmup_time=0.05 \
   --benchmark_min_time=0.1s \
   --benchmark_repetitions=5 \

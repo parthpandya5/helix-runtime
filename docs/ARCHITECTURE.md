@@ -445,8 +445,24 @@ partially committing an iteration.
 
 Scheduler state remains host-only and deterministic in tests. It is not thread-
 safe; the runtime engine will own it from one orchestration thread. A future multi-
-producer submission queue may provide the synchronization boundary. Continuous
-replacement and aggregate metrics are the next policy gate.
+producer submission queue may provide the synchronization boundary.
+
+Continuous replacement is a consequence of the completion/admission boundary:
+terminal IDs leave the running vector after an iteration, and the next call admits
+waiting IDs into those slots before the surviving cohort finishes. Mixed batches
+may therefore carry decode work for resident requests and prefill ranges for newly
+admitted requests. This is implemented and deterministically tested at the host
+policy layer; the model executor integration is still pending.
+
+Metrics are derived from immutable request snapshots at a caller-provided
+`steady_clock` observation time. The reporting path validates distinct live IDs and
+monotonic time, aggregates state/token counters, then sorts duration samples for
+linearly interpolated p50/p95 values. Waiting time includes scheduled requests,
+TTFT includes requests with at least one token, request latency includes successful
+finishes only, and inter-token latency contributes one sample per adjacent token
+pair. Rate denominators begin at the earliest request creation time and require a
+positive observation window. Snapshot allocation/sorting is intentionally outside
+the per-iteration scheduling hot path.
 
 ## Model executor
 

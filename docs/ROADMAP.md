@@ -488,23 +488,45 @@ vector before mutation, then stages failure strings and token-vector capacity so
 logical request progress cannot be split by an allocation failure. Ten scheduler
 tests cover budgets, chunking, resource exhaustion, state/result mismatches,
 whole-vector transactionality, cancellation/failure, monotonic time, ownership,
-and statistics. Normal, ASan/UBSan, and CUDA-enabled host suites pass 113/113; all
-CUDA sources compile with NVCC 12.6.85, while 57 GPU tests remain hardware-gated.
+and statistics. At the M15 gate, normal, ASan/UBSan, and CUDA-enabled host suites
+passed 113/113; all CUDA sources compiled with NVCC 12.6.85, while 57 GPU tests
+remained hardware-gated.
 
-A four-case Release trace records complete host policy cost (49.720 us to 1.363 ms
+A four-case Release trace records complete host policy cost (48.777 us to 1.342 ms
 median CPU time) but deliberately excludes model math and physical KV operations;
 it is not an inference-throughput claim. See `docs/SCHEDULER.md` and
 `docs/PERFORMANCE.md`.
 
-### M16 — Continuous batching — Planned
+### M16 — Continuous batching — Implemented, CPU-validated, sanitized, and benchmarked
 
 - removal/admission between inference iterations
 - deterministic mixed-length workload tests
 - synthetic static-versus-continuous benchmark
 - requests/sec, tokens/sec, wait, TTFT, inter-token, p50, and p95 definitions
 
-Metrics are published only for measured workloads and include the workload
-distribution and concurrency.
+Implementation/validation record (2026-08-21, commit `f17ce74`): completion removes
+terminal requests from the resident order, and the next iteration fills each freed
+slot from the waiting FIFO while the surviving cohort continues. An exact test
+executes A/B/C/D, finishes A, then observes B/C/D plus newly admitted E in the next
+mixed decode/prefill batch.
+
+`SchedulerMetrics` uses an explicit observation boundary and reports lifecycle
+state/token counters, successful requests/second, generated and processed
+tokens/second, and sample count/min/mean/p50/p95/max for waiting, TTFT, successful
+request latency, and adjacent-token intervals. Percentiles use documented linear
+interpolation; zero windows do not fabricate rates; invalid IDs, duplicate samples,
+and time regression are rejected. Three focused metrics tests cover exact values,
+active/terminal states, empty samples, and invalid snapshots.
+
+The static-versus-continuous benchmark uses two disclosed mixed-length workloads,
+sufficient synthetic KV capacity, and a deliberately constant 1 ms modeled cost
+per iteration. The model produced 48/132 and 92/260 continuous/static iterations,
+or 2.75x and 2.83x modeled request/token rates. These are policy-model results, not
+measured inference throughput. Measured host control-path CPU times were close and
+do not support an optimization claim. Normal, ASan/UBSan, and CUDA-enabled host
+suites pass 118/118; 57 GPU runtime tests remain gated. See
+`docs/PERFORMANCE.md` for workloads, exact distributions, host timings, and the
+benchmark-observer correction.
 
 ## Phase F: narrow end-to-end inference
 

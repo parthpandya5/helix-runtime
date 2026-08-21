@@ -2,12 +2,12 @@
 
 ## Status
 
-Milestones 14–15 are implemented: the host-only request state machine feeds a
-single-thread-owned FIFO scheduler with explicit token and KV-block budgets. The
-normal, ASan/UBSan, and CUDA-enabled host suites pass 113/113 tests. The CUDA build
-also registers 57 GPU tests, but this scheduler is host policy and requires no GPU.
-Milestone 16's continuous-batching comparison and aggregate latency metrics remain
-planned in this revision.
+Milestones 14–16 are implemented: the host-only request state machine feeds a
+single-thread-owned FIFO/token/KV-budget scheduler, finished slots are refilled
+between iterations, and deterministic metric aggregation exposes lifecycle
+distributions and rates. Normal, ASan/UBSan, and CUDA-enabled host suites pass
+118/118 tests. The CUDA build also registers 57 GPU tests, but this scheduler is
+host policy and requires no GPU.
 
 ## Ownership and thread safety
 
@@ -90,6 +90,23 @@ Per-token timestamps are sufficient to derive inter-token latency later without
 introducing a scheduler-global clock. A cancelled or failed request has a completion
 time but no fabricated first-token metric when it emitted nothing.
 
+`SchedulerMetrics` snapshots an explicit `observed_at` boundary and reports state
+counts, processed prompt/generated tokens, and four duration distributions:
+
+- waiting time for every request that has first been scheduled;
+- time to first token for every request that has emitted one;
+- end-to-end request latency for successfully finished requests only;
+- one sample for every adjacent generated-token interval within each request.
+
+Each distribution contains sample count, minimum, arithmetic mean, p50, p95, and
+maximum in seconds. P50/p95 use linear interpolation at `p*(N-1)` in sorted
+samples. Successful requests/second and generated/processed tokens/second use the
+window from the earliest request creation to `observed_at` and are undefined for a
+zero-length window. Cancellation and failure are counted separately rather than
+silently included in successful latency/throughput. Snapshot construction validates
+IDs, duplicates, and time boundaries, then allocates and sorts; it is a reporting
+path, not per-token hot-path instrumentation.
+
 ## Failure behavior and invariants
 
 - zero request IDs and empty prompts are rejected at construction;
@@ -153,26 +170,58 @@ strings and generated-token vector capacity before mutation. Once mutation start
 the remaining state transitions and vector insertions are nonallocating. A malformed
 later completion therefore cannot leave an earlier request partially progressed.
 
-Ten scheduler tests cover configuration, mixed prefill/decode batches, token and
+Eleven scheduler tests cover configuration, mixed prefill/decode batches, token and
 running limits, KV exhaustion and partial-block slack, malformed whole-vector
 completion, failure/release accounting, cancellation, time validation, lookup,
-and statistics. Together with the ten request tests, these paths pass in normal and
-sanitized builds.
+statistics, and next-iteration replacement. Three additional metrics tests cover
+exact distributions/rates, active states, empty samples, invalid IDs/duplicates,
+and time regression. Together with the ten request tests, these paths pass in
+normal and sanitized builds.
+
+## Continuous replacement
+
+Terminal requests are removed from `running_` during completion. The next
+`schedule_iteration` considers surviving running requests and then immediately
+admits waiting requests into the freed capacity. It never waits for the rest of an
+original cohort:
+
+```text
+iteration 1 prefill: A B C D       (E waits)
+iteration 2 decode:  A B C D       (A finishes)
+iteration 3 mixed:     B C D E     (E begins prefill)
+```
+
+The batch may therefore contain one-token decode work and prompt ranges together.
+The eventual executor may partition those work kinds internally, but it must
+preserve the one-batch completion contract. A deterministic test checks the exact
+membership/order above and confirms that E enters while B/C/D are still decoding.
 
 ## M15 host-policy benchmark
 
 The Release benchmark reconstructs a scheduler outside timing, then times every
 schedule/completion decision for a complete deterministic request trace. It does
 not execute model math, allocate physical KV blocks, or measure inference. Median
-CPU cost ranged from 49.720 us for 16 requests/256 logical token transitions to
-1.363 ms for 128 requests/6,144 transitions across the four recorded workloads.
+CPU cost ranged from 48.777 us for 16 requests/256 logical token transitions to
+1.342 ms for 128 requests/6,144 transitions across the four recorded workloads.
 Exact configurations, repetitions, variation, and logical-work rates are in
 `docs/PERFORMANCE.md`.
 
-## Next scheduler gate
+## M16 static-versus-continuous experiment
 
-Milestone 16 will test replacement explicitly: a request that finishes in one
-iteration leaves the running set, and a waiting request can enter the next without
-waiting for the original cohort to drain. It will add deterministic request-level
-wait, TTFT, inter-token, completion, p50, and p95 aggregation plus a carefully
-labeled static-versus-continuous synthetic comparison.
+The policy harness compares continuous replacement with a static cohort barrier on
+the same two mixed-length workloads. It separately reports measured host control-
+path CPU time and a modeled schedule in which every batch—regardless of work kind
+or shape—costs exactly 1 ms. Under that declared model, continuous batching used
+48 versus 132 iterations for 32 requests and 92 versus 260 for 128 requests. The
+corresponding 2.75x and 2.83x modeled rate differences are not measured model
+throughput. Host control time showed only small differences, so no scheduler CPU
+optimization is claimed. Full distributions and caveats are in
+`docs/PERFORMANCE.md`.
+
+## Remaining policy limitations
+
+The baseline is strict FIFO with no priorities, aging, preemption, prefix sharing,
+or fairness tuning between long prefill and decode. Terminal request history is
+retained indefinitely. The scheduler predicts KV-block deltas but is not yet wired
+to the physical paged-cache authority or a model executor. Consequently M16 proves
+host admission/replacement semantics, not end-to-end continuous inference.

@@ -15,14 +15,15 @@ reproducible benchmark evidence.
 
 Milestones 0–2, the host-testable portions of Milestones 7–8, the CPU paths of
 Milestones 9–10, the M11–M12 KV caches, the M13 direct paged-attention CPU path,
-and the M14–M15 request/FIFO scheduler are implemented and CPU-validated. The
-repository contains the CPU-first build foundation, a checked contiguous tensor core,
+and the M14–M16 request and continuous-batching scheduler are implemented and CPU-
+validated. The repository contains the CPU-first build foundation, a checked
+contiguous tensor core,
 Float32 reference kernels for elementwise math, reductions, stable softmax,
 matrix multiplication, RMSNorm, SwiGLU, adjacent-pair RoPE, linear projection, and
 causal scaled dot-product attention, plus a caching allocator, completion-aware deferred
 reclamation, and layer-aware contiguous/paged KV histories with checked capacity
 accounting and copy-free block-table attention traversal. On 2026-08-21, Apple
-Clang 17 built the project on macOS arm64 with warnings as errors; 113/113 CPU tests
+Clang 17 built the project on macOS arm64 with warnings as errors; 118/118 CPU tests
 passed in normal and ASan/UBSan configurations.
 
 CUDA is optional at configure time. The current Apple Silicon development host has
@@ -33,7 +34,7 @@ compile-validated in an ARM64 CUDA 12.6 development container without a
 driver/device. The M8 stream-ordered allocator and M9 block-reduced RMSNorm,
 grid-stride SwiGLU, adjacent-pair RoPE, and projection adapter are also
 compile-validated, as is the M10 three-stage contiguous attention baseline. None is
-runtime-validated on a GPU. The CUDA-on build passes the same 113 hardware-
+runtime-validated on a GPU. The CUDA-on build passes the same 118 hardware-
 independent tests and registers 57 GPU tests that cannot run without a driver and
 device.
 
@@ -124,8 +125,9 @@ odd-width softmax, odd-dimension/standard-square matmul, SwiGLU, and decode/pref
 shaped RoPE. Attention fixtures retain dimension-major baselines, measure a common
 32-coordinate value tile, and compare direct block traversal against contiguous
 storage. Contiguous-versus-paged KV lifecycle/layer-copy fixtures keep their actual
-CPU costs and unfavorable results. A scheduler trace measures host policy only and
-is never labeled as inference throughput. Methodology and measurements live in
+CPU costs and unfavorable results. Scheduler traces separate measured host-policy
+cost from a declared synthetic static-versus-continuous model; neither is labeled
+as inference throughput. Methodology and measurements live in
 [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md).
 
 ## Tensor runtime
@@ -213,7 +215,7 @@ lifetime and excludes append/release while attention holds raw spans. This coars
 cache-wide lock is the current correctness boundary and a documented concurrency
 limitation, not an asynchronous GPU lifetime mechanism.
 
-## Request lifecycle and FIFO scheduler
+## Request lifecycle and continuous batching
 
 The M14 host-only `Request` uses strong request/token IDs and a move-only state
 owner. It supports positive chunked prefill progress, decode token recording,
@@ -225,7 +227,10 @@ running FIFO order, separates chunked prefill from one-token decode work, and
 enforces per-iteration token, running-request, and caller-supplied KV-block limits.
 One checked batch may be in flight; ordered completion validates all results before
 mutating any request and reports blocks to release on finish, failure, or
-cancellation. See
+cancellation. Finished slots admit waiting work in the next iteration without a
+static-cohort barrier. Metrics aggregate successful request rate, token rate, wait,
+TTFT, request latency, and inter-token distributions at an explicit observation
+boundary. See
 [`docs/SCHEDULER.md`](docs/SCHEDULER.md).
 
 ## Supported hardware
@@ -240,10 +245,10 @@ cancellation. See
 
 The CUDA runtime, M4–M6/M9–M10 kernels, and M7–M8 CUDA allocator adapters are
 compile-validated only; physical GPU correctness, timing, and resource validation
-remain pending. KV caches, paged attention, and FIFO scheduling are host-only;
-continuous batching comparison, model execution, and generation remain roadmap
-work. Tensor allocator integration is
-also pending. Float16 has no arithmetic path yet. Tensor execution is contiguous-
+remain pending. KV caches, paged attention, and continuous batching are host-only;
+the scheduler is not yet integrated with physical KV reservation or model
+execution. Transformer execution and generation remain roadmap work. Tensor
+allocator integration is also pending. Float16 has no arithmetic path yet. Tensor execution is contiguous-
 only; broadcasting, slicing, and general strided kernels are intentionally
 deferred. CPU kernels are reference implementations, not optimized BLAS
 replacements.
