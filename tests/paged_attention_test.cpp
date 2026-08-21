@@ -46,6 +46,13 @@ TEST(PagedAttentionTest, MatchesContiguousCausalPrefillAcrossBlockBoundaries) {
   scaled_dot_product_attention_out(query, compact.keys, compact.values, 0, expected_output,
                                    expected_workspace);
   expect_near(workspace, expected_workspace);
+
+  Tensor baseline_output = Tensor::empty({1, 3, 2});
+  Tensor baseline_workspace = Tensor::empty({1, 3, 3});
+  paged_scaled_dot_product_attention_dimension_major_out(query, view, 0, baseline_output,
+                                                         baseline_workspace);
+  expect_near(baseline_output, expected);
+  expect_near(baseline_workspace, expected_workspace);
 }
 
 TEST(PagedAttentionTest, MatchesOddMultiHeadChunkedDecodeWithoutCompaction) {

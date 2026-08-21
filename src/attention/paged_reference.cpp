@@ -3,6 +3,8 @@
 #include "helix/core/error.hpp"
 #include "helix/kernels/cpu/reference.hpp"
 
+#include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstddef>
 #include <limits>
@@ -100,10 +102,17 @@ std::size_t paged_score_workspace_bytes(const Tensor& query,
   return checked_nbytes(paged_score_workspace_shape(query, kv_layer), DType::kFloat32);
 }
 
-void paged_scaled_dot_product_attention_out(const Tensor& query,
-                                            const kv_cache::PagedKvCache::LayerReadView& kv_layer,
-                                            std::size_t query_position_offset, Tensor& output,
-                                            Tensor& score_workspace) {
+namespace {
+
+enum class ValueTraversal {
+  kDimensionMajor,
+  kDimensionTiled,
+};
+
+void paged_scaled_dot_product_attention_out_impl(
+    const Tensor& query, const kv_cache::PagedKvCache::LayerReadView& kv_layer,
+    std::size_t query_position_offset, Tensor& output, Tensor& score_workspace,
+    ValueTraversal value_traversal) {
   constexpr std::string_view kOperation = "attention::cpu::paged_scaled_dot_product_attention_out";
   const PagedAttentionDimensions dimensions = validate_inputs(query, kv_layer, kOperation);
   validate_offset(dimensions, query_position_offset, kOperation);
@@ -169,13 +178,47 @@ void paged_scaled_dot_product_attention_out(const Tensor& query,
 
   helix::cpu::softmax_out(score_workspace, score_workspace);
 
+  // Keep the accumulator allocation-free while traversing values in their
+  // contiguous [token, head_dimension] order.  A dimension-at-a-time loop
+  // would reacquire every physical block and read each token with a wide
+  // stride.  Fixed-size tiles amortize block-table traversal without making
+  // head_dimension part of the stack footprint.
+  constexpr std::size_t kValueDimensionTile = 32;
   for (std::size_t head = 0; head < dimensions.heads; ++head) {
     for (std::size_t query_index = 0; query_index < dimensions.queries; ++query_index) {
       const std::size_t score_offset = (head * dimensions.queries + query_index) * dimensions.keys;
       const std::size_t output_offset =
           (head * dimensions.queries + query_index) * dimensions.head_dimension;
-      for (std::size_t dimension = 0; dimension < dimensions.head_dimension; ++dimension) {
-        double accumulator = 0.0;
+      if (value_traversal == ValueTraversal::kDimensionMajor) {
+        for (std::size_t dimension = 0; dimension < dimensions.head_dimension; ++dimension) {
+          double accumulator = 0.0;
+          std::size_t value_start = 0;
+          for (std::size_t logical_block = 0; logical_block < dimensions.logical_blocks;
+               ++logical_block) {
+            const std::size_t tokens_in_block = kv_layer.block_token_count(logical_block);
+            const std::span<const float> values = kv_layer.value_block(logical_block, head);
+            HELIX_ASSERT(values.size() == tokens_in_block * dimensions.head_dimension,
+                         "paged attention value span has an inconsistent size");
+            for (std::size_t token = 0; token < tokens_in_block; ++token) {
+              const std::size_t key_index = value_start + token;
+              const std::size_t value_offset = token * dimensions.head_dimension + dimension;
+              accumulator += static_cast<double>(scores[score_offset + key_index]) *
+                             static_cast<double>(values[value_offset]);
+            }
+            value_start += tokens_in_block;
+          }
+          HELIX_ASSERT(value_start == dimensions.keys,
+                       "paged attention value traversal did not cover the KV sequence");
+          output_values[output_offset + dimension] = static_cast<float>(accumulator);
+        }
+        continue;
+      }
+
+      for (std::size_t dimension_start = 0; dimension_start < dimensions.head_dimension;
+           dimension_start += kValueDimensionTile) {
+        const std::size_t tile_dimensions =
+            std::min(kValueDimensionTile, dimensions.head_dimension - dimension_start);
+        std::array<double, kValueDimensionTile> accumulators{};
         std::size_t value_start = 0;
         for (std::size_t logical_block = 0; logical_block < dimensions.logical_blocks;
              ++logical_block) {
@@ -185,18 +228,42 @@ void paged_scaled_dot_product_attention_out(const Tensor& query,
                        "paged attention value span has an inconsistent size");
           for (std::size_t token = 0; token < tokens_in_block; ++token) {
             const std::size_t key_index = value_start + token;
-            const std::size_t value_offset = token * dimensions.head_dimension + dimension;
-            accumulator += static_cast<double>(scores[score_offset + key_index]) *
-                           static_cast<double>(values[value_offset]);
+            const std::size_t value_offset = token * dimensions.head_dimension + dimension_start;
+            const double probability = static_cast<double>(scores[score_offset + key_index]);
+            for (std::size_t tile_dimension = 0; tile_dimension < tile_dimensions;
+                 ++tile_dimension) {
+              accumulators[tile_dimension] +=
+                  probability * static_cast<double>(values[value_offset + tile_dimension]);
+            }
           }
           value_start += tokens_in_block;
         }
         HELIX_ASSERT(value_start == dimensions.keys,
                      "paged attention value traversal did not cover the KV sequence");
-        output_values[output_offset + dimension] = static_cast<float>(accumulator);
+        for (std::size_t tile_dimension = 0; tile_dimension < tile_dimensions; ++tile_dimension) {
+          output_values[output_offset + dimension_start + tile_dimension] =
+              static_cast<float>(accumulators[tile_dimension]);
+        }
       }
     }
   }
+}
+
+} // namespace
+
+void paged_scaled_dot_product_attention_out(const Tensor& query,
+                                            const kv_cache::PagedKvCache::LayerReadView& kv_layer,
+                                            std::size_t query_position_offset, Tensor& output,
+                                            Tensor& score_workspace) {
+  paged_scaled_dot_product_attention_out_impl(query, kv_layer, query_position_offset, output,
+                                              score_workspace, ValueTraversal::kDimensionTiled);
+}
+
+void paged_scaled_dot_product_attention_dimension_major_out(
+    const Tensor& query, const kv_cache::PagedKvCache::LayerReadView& kv_layer,
+    std::size_t query_position_offset, Tensor& output, Tensor& score_workspace) {
+  paged_scaled_dot_product_attention_out_impl(query, kv_layer, query_position_offset, output,
+                                              score_workspace, ValueTraversal::kDimensionMajor);
 }
 
 Tensor paged_scaled_dot_product_attention(const Tensor& query,

@@ -18,6 +18,14 @@ void paged_scaled_dot_product_attention_out(const Tensor& query,
                                             const kv_cache::PagedKvCache::LayerReadView& kv_layer,
                                             std::size_t query_position_offset, Tensor& output,
                                             Tensor& score_workspace);
+
+// Retained as a measurement baseline for the optimized value traversal.  It
+// computes the same result but walks every physical page once per output
+// dimension and is not intended for normal runtime use.
+void paged_scaled_dot_product_attention_dimension_major_out(
+    const Tensor& query, const kv_cache::PagedKvCache::LayerReadView& kv_layer,
+    std::size_t query_position_offset, Tensor& output, Tensor& score_workspace);
+
 [[nodiscard]] Tensor
 paged_scaled_dot_product_attention(const Tensor& query,
                                    const kv_cache::PagedKvCache::LayerReadView& kv_layer,
