@@ -29,6 +29,7 @@ Every recorded experiment must include:
 | M10 contiguous CPU attention | No earlier attention path | Materialize scaled/masked scores, stable softmax in place, then probabilities x V with reusable output/workspace | Median CPU time: 8x1x128x64x64 76.371 us; 8x1x1,024x64x64 825.128 us; 3x17x29x37x41 46.284 us; 8x128x128x64x64 8.164 ms | Workspace is exactly `4*H*Q*K` bytes. These single-threaded results include softmax but the reported dot FLOP/s numerator does not; they are correctness baselines. |
 | M11 contiguous CPU KV cache | No earlier KV storage | Reserve per-sequence K/V tensors, append complete tokens, and copy a compact layer history into preallocated outputs | Lifecycle median CPU time: 26.898 us (2x2x64, capacity/append 128), 63.700 us (4x8x64, capacity 512/append 32), 7.853 us (odd 3x3x37, 29); layer-copy median: 1.595 us (128 KiB), 29.609 us (2 MiB), 613 ns (25,752 B) | Lifecycle includes sequence allocation, appends, and release. Layer copy excludes output allocation. This is a contiguous baseline under high host load, not evidence that paging or another layout is faster. |
 | M12 paged CPU KV cache | Same-run M11 contiguous fixtures | Use a long-lived fixed-token pool, allocate logical blocks on append boundaries, and compact through block tables | Paged/contiguous lifecycle medians: 25.784/28.485 us, 18.016/64.400 us, 6.869/8.074 us. Paged/contiguous layer-copy medians: 3.684/1.568 us (128 KiB), 57.690/33.032 us (2 MiB), 540/554 ns (25,752 B). | Pool construction is outside paged lifecycle timing while per-sequence contiguous storage is inside; the 72% lifecycle reduction also uses 16x less assigned capacity. Paged copying is 2.35x and 1.75x slower for the large histories because it traverses 8 and 32 blocks. |
+| M13 CPU attention value traversal | Dimension-major probability-times-V for contiguous and direct paged storage | Accumulate fixed 32-coordinate tiles while each V row/page is hot; retain both baselines | Contiguous speedup 1.31x–2.47x and paged speedup 2.36x–2.99x across four paired cases. With equal tiling, paged CPU time was 2.1%–6.7% higher. | The original apparent paged win was confounded by a general loop-locality improvement. Applying the same traversal to both paths isolates a modest end-to-end paging cost on this CPU; it is not GPU evidence. |
 
 ## M1 CPU tensor baseline — 2026-08-20
 
@@ -360,6 +361,72 @@ Command:
 ```
 
 No GPU storage or timing is represented by these CPU measurements.
+
+## M13 direct paged-attention experiment — 2026-08-21
+
+Environment:
+
+- source: commit `aaf9d59` (paged baseline `26a9adf`, paged tiling `2977005`)
+- host: Apple M3 Pro, 12 CPU cores, 18 GB RAM
+- OS/compiler/build: macOS 26.0.1 arm64, Apple Clang 17.0.0, Release,
+  `HELIX_ENABLE_CUDA=OFF`, Float32
+- CMake 4.2.3 and Google Benchmark 1.9.1
+- output and `[H,Q,K]` score/probability workspace: preallocated and reused
+- paged pool construction, sequence append, and read-view acquisition: outside
+  the timed region; the view lock remains held while timing
+- warmup: time-based 0.05 seconds per case
+- measurement: time-based minimum 0.1 seconds per repetition, five repetitions;
+  median CPU time reported
+- concurrency: one benchmark thread; attention is single-threaded
+- one-minute host load average at start: 11.60; affinity and CPU-frequency metadata
+  were unavailable
+
+The original probability-times-V loop accumulated one output dimension at a time.
+For paged storage, that also reacquired every page once per dimension. The tested
+change uses a fixed `std::array<double, 32>` accumulator, loops over KV rows while a
+32-coordinate value slice is contiguous and hot, and handles the final odd tile
+without padding. It introduces no allocation and preserves the KV accumulation
+order independently for every output coordinate. Both old paths remain in the
+binary so baseline and changed implementations execute with identical setup.
+
+| H x Q x K x D; page tokens/blocks | Contiguous major | Contiguous tiled | Contiguous speedup | Paged major | Paged tiled | Paged speedup | Tiled page overhead |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| 8 x 1 x 128 x 64; 16/8 | 77.621 us | 42.299 us | 1.84x | 101.751 us | 43.188 us | 2.36x | 2.1% |
+| 8 x 1 x 1,024 x 64; 16/64 | 813.689 us | 328.774 us | 2.47x | 889.556 us | 349.214 us | 2.55x | 6.2% |
+| 3 x 17 x 29 x 37; 7/5 | 44.480 us | 34.060 us | 1.31x | 96.676 us | 35.490 us | 2.72x | 4.2% |
+| 8 x 128 x 128 x 64; 16/8 | 8.192 ms | 3.544 ms | 2.31x | 11.300 ms | 3.780 ms | 2.99x | 6.7% |
+
+CPU-time coefficients of variation for the tiled contiguous cases were 1.80%–
+5.12%; tiled paged cases were 0.56%–3.07%. The reported page overhead is
+`paged_tiled / contiguous_tiled - 1` using median CPU time. Q, K, and V have equal
+head/value dimensions in all paired rows, and both implementations perform the
+same double-accumulating math and stable softmax. The paged fixture fills the same
+number of physical Float32 elements but obtains them through a sequence block
+table; compact-copy time is absent from both sides.
+
+This experiment corrected an important confound. Comparing optimized paged
+attention only with the original contiguous dimension-major loop would have shown
+a large but misleading paged win. Once both paths use the same value tile, direct
+paging is modestly slower on this CPU. The comparison is still end-to-end rather
+than a single-lookup microbenchmark: paged score traversal groups query work by
+physical block, whereas contiguous score traversal groups all keys by query. The
+two decode rows (`Q=1`) avoid that loop-order distinction and show 2.1% and 6.2%
+overhead at eight and 64 pages respectively.
+
+Command:
+
+```bash
+./build-release/benchmarks/helix_benchmarks \
+  --benchmark_filter='BM_Cpu(ContiguousAttention/(DimensionMajor|DimensionTiled)|PagedAttention/(DimensionMajor|DimensionTiled))' \
+  --benchmark_min_warmup_time=0.05 \
+  --benchmark_min_time=0.1s \
+  --benchmark_repetitions=5 \
+  --benchmark_report_aggregates_only=true
+```
+
+These are CPU layout/locality measurements. They say nothing about device block-
+table fetches, warp grouping, coalescing, register pressure, occupancy, or GPU
+latency. Those require a CUDA paged cache/kernel and physical NVIDIA execution.
 
 ## Timing rules
 

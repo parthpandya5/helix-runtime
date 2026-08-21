@@ -1,13 +1,14 @@
-# Contiguous Scaled Dot-Product Attention
+# Scaled Dot-Product Attention
 
 ## Validation status
 
-The Milestone 10 CPU reference is **implemented, CPU-validated, sanitizer-
-validated, and benchmarked**. Four focused attention tests and the full 76-test
-CPU suite pass in normal and ASan/UBSan builds. The CUDA baseline, four GPU tests,
-and CUDA-event benchmark fixtures compile with NVCC 12.6.85 and warnings as errors,
-but have not run without an NVIDIA driver/device. No GPU correctness or performance
-claim is made.
+The Milestone 10 contiguous CPU reference and Milestone 13 direct paged CPU path
+are **implemented, CPU-validated, sanitizer-validated, and benchmarked**. Eight
+focused attention tests and the full 93-test CPU suite pass in normal and
+ASan/UBSan builds. The contiguous CUDA baseline, four GPU tests, and CUDA-event
+benchmark fixtures compile with NVCC 12.6.85 and warnings as errors, but have not
+run without an NVIDIA driver/device. Paged attention is CPU-only. No GPU
+correctness or performance claim is made.
 
 ## Tensor contract
 
@@ -72,14 +73,60 @@ contract explicit and remain safe if views expand later.
 The CPU path uses double accumulation for QK dot products and probability-times-V,
 then stores Float32 results. It scales by `1/sqrt(head_dimension)`, writes negative
 infinity into causal-mask positions, and delegates the in-place probability stage
-to Helix's stable CPU softmax. This is deliberately direct and single-threaded so
-it remains a readable correctness oracle.
+to Helix's stable CPU softmax. The default value stage accumulates 32 adjacent
+output coordinates at a time while each V row is hot. A named dimension-major path
+retains the original loop for correctness comparison and benchmarking. Both keep
+each coordinate's KV accumulation order unchanged and allocate no hidden memory.
 
 Known-value tests check causal probabilities and outputs by hand. A separate
 single-token case verifies decode offset semantics against a three-token KV
 history. Multi-head shapes with head dimension 5 and value dimension 7 exercise
 odd extents; empty queries, zero heads, invalid ranges, wrong shapes/dtypes, and
 every unsafe alias are covered.
+
+## Direct paged CPU path
+
+`PagedKvCache::LayerReadView` exposes one sequence layer as logical blocks without
+copying it into `[heads, kv_tokens, head_dimension]`. For each logical block and
+head it returns a contiguous `[written_tokens_in_block, head_dimension]` span for
+keys or values. The final span stops at logical length; unwritten or recycled
+storage is never visible.
+
+```mermaid
+flowchart LR
+    Position[Logical KV position] --> Block[logical block + offset]
+    Block --> Table[Sequence block table]
+    Table --> Physical[Physical BlockId]
+    Physical --> Span[Written K/V span]
+    Span --> Attention[Score and value traversal]
+```
+
+The read view is move-only. It shares ownership of the cache implementation and
+holds the cache's mutex for the full view lifetime, so cache-facade destruction
+cannot free storage and append/release cannot invalidate a span mid-traversal. This
+coarse lease is a correctness-first contract: it also blocks operations on
+unrelated sequences in that cache and would be unsuitable around asynchronous GPU
+work without a separate stream/event lifetime mechanism.
+
+Paged Q/K head dimensions must match because the cache currently stores K and V
+with one common dimension. The path retains the same `[H,Q,K]` caller-owned
+workspace and explicit causal query offset as contiguous attention. Score traversal
+visits key pages directly. Relative to `retrieve_layer`, it avoids two transient
+compact Float32 buffers totaling `2 * H * K * D * sizeof(float)` bytes and their
+copies; the long-lived paged pool and block-table capacity are accounted separately
+by `PagedKvCache` statistics. The original value baseline reacquired each value page
+for every output dimension and read values with a `head_dimension` stride. The
+default fixed 32-coordinate tile reduces page lookups from
+`head_dimension * logical_blocks` to
+`ceil(head_dimension / 32) * logical_blocks` per head/query and consumes adjacent
+values. Its 256-byte double-accumulator array has fixed stack size; odd dimensions
+use a checked tail tile.
+
+Four tests compare direct paging against compact contiguous attention for causal
+prefill, chunked decode, multiple heads, odd dimension 5, odd dimension 37, and
+non-divisible block boundaries. They also cover empty query work and contract
+errors. A KV-cache test independently proves storage pinning and written-prefix
+visibility.
 
 ## CUDA baseline
 
@@ -112,7 +159,7 @@ All launches are asynchronous on the caller's stream and checked immediately for
 launch errors. Q/K/V, output, and workspace must remain alive until stream
 completion. Tests synchronize before copying output to the CPU oracle.
 
-## CPU benchmark baseline
+## CPU benchmark results
 
 On the Apple M3 Pro development host (Apple Clang 17, Release, Float32), with
 preallocated output/workspace and five repetitions:
@@ -124,7 +171,8 @@ preallocated output/workspace and five repetitions:
 | 3 x 17 x 29 x 37 x 41 | 46.284 us | 5,916 B | 4.985 GFLOP/s |
 | 8 x 128 x 128 x 64 x 64 | 8.164 ms | 524,288 B | 4.110 GFLOP/s |
 
-The rate counts only the two dense dot-product stages (`2*H*Q*K*(D+DV)`); softmax
+These M10 rows are the retained original dimension-major baseline. The rate counts
+only the two dense dot-product stages (`2*H*Q*K*(D+DV)`); softmax
 operations are excluded from that FLOP numerator but included in elapsed time.
 The host load average was 15.64 at measurement start, so these are local reference
 baselines, not optimization claims. Full methodology is in `docs/PERFORMANCE.md`.
@@ -132,6 +180,24 @@ baselines, not optimization claims. Full methodology is in `docs/PERFORMANCE.md`
 CUDA fixtures use the same shapes, preallocate all tensors, issue ten warmups, and
 time the complete three-stage sequence with same-stream CUDA events and stop-event
 synchronization. They have not executed, so there are no GPU result rows.
+
+The M13 same-process run retained both dimension-major baselines and applied the
+same 32-coordinate value tile to contiguous and paged storage. Median CPU times:
+
+| H x Q x K x D; page tokens | Contiguous major | Contiguous tiled | Paged major | Paged tiled | Tiled page overhead |
+|---|---:|---:|---:|---:|---:|
+| 8 x 1 x 128 x 64; 16 | 77.621 us | 42.299 us | 101.751 us | 43.188 us | 2.1% |
+| 8 x 1 x 1,024 x 64; 16 | 813.689 us | 328.774 us | 889.556 us | 349.214 us | 6.2% |
+| 3 x 17 x 29 x 37; 7 | 44.480 us | 34.060 us | 96.676 us | 35.490 us | 4.2% |
+| 8 x 128 x 128 x 64; 16 | 8.192 ms | 3.544 ms | 11.300 ms | 3.780 ms | 6.7% |
+
+Paged tiling improved its own retained baseline by 2.36x–2.99x. Contiguous tiling
+also improved 1.31x–2.47x, proving much of the original gain was loop locality, not
+paging. With equal value traversal, the direct paged path was modestly slower in
+these local CPU cases. The prefill score loops are not identical—paged traversal
+groups work by physical block—so even the equal-value comparison is an end-to-end
+path comparison, not a pure instruction-level cost of one table lookup. Full
+methodology and coefficients of variation are in `docs/PERFORMANCE.md`.
 
 ## Limitations and next step
 
@@ -141,8 +207,10 @@ synchronization. They have not executed, so there are no GPU result rows.
 - no batch dimension or ragged packed-sequence metadata exists yet,
 - CPU and CUDA paths are Float32 only,
 - the CUDA dot products are educational serial-per-output baselines,
-- no fusion, tiling, or paged-KV access is claimed.
+- the paged path uses one exclusive cache-wide read lease,
+- no CUDA paged storage/kernel, attention fusion, GQA, or GPU page-table analysis
+  is claimed.
 
-M11 first introduces correct contiguous KV-cache ownership. M13 will read K/V
-through block tables and compare that path with this materialized contiguous
-baseline before any attention fusion is justified.
+The next correctness dependency is deterministic request/scheduler ownership.
+GPU paged attention remains a later hardware-dependent implementation and must be
+validated against this CPU oracle before optimization.

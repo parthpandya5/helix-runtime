@@ -2,11 +2,11 @@
 
 ## Status
 
-The M11 contiguous and M12 paged Float32 CPU caches are implemented,
-CPU-validated, sanitized, and benchmarked. They share append/retrieve/release
-semantics while exposing the memory-capacity and traversal tradeoffs between a
-per-sequence allocation and a global fixed-block pool. M13 paged attention remains
-planned; there is not yet a GPU-resident KV-cache path.
+The M11 contiguous cache, M12 paged cache, and M13 direct paged-attention read path
+are implemented, CPU-validated, sanitized, and benchmarked in Float32. They expose
+the memory-capacity, compaction, and direct-traversal tradeoffs between a
+per-sequence allocation and a global fixed-block pool. There is not yet a GPU-
+resident KV-cache or CUDA paged-attention path.
 
 ## Why cache keys and values?
 
@@ -68,8 +68,9 @@ sequence invalidates every copy, and subsequent use produces a contextual error.
 
 Retrieved `KvLayer` tensors own independent compact storage, so their lifetime is
 not tied to the sequence. This deliberate baseline copy is safe and makes the
-attention boundary explicit; M13 will replace it with block-table traversal rather
-than claiming that this path is zero-copy.
+attention boundary explicit. The paged cache additionally provides an M13 read
+lease for direct block-table traversal; it does not change the owning semantics of
+compact retrieval.
 
 ## Capacity, exhaustion, and accounting
 
@@ -109,7 +110,12 @@ one mutex. Immutable configuration and byte formulas can be read without locking
 The coarse lock intentionally covers metadata updates and copies in these
 correctness baselines; it gives a clear shared-state boundary and is tested with
 concurrent appends to independent sequences. Fine-grained locking is deferred
-until a measured scheduler workload demonstrates contention.
+until a measured scheduler workload demonstrates contention. A paged
+`LayerReadView` retains this lock for its complete lifetime because its spans point
+into mutable pool storage. Callers must not invoke another operation on the same
+cache from the lock-owning thread while the view exists; doing so would attempt to
+reacquire the non-recursive mutex. The lease also serializes unrelated sequences,
+which is safe but may become a measured scheduler bottleneck.
 
 ## Contiguous correctness coverage
 
@@ -205,7 +211,7 @@ tail.
 
 ### Paged correctness coverage
 
-Seven deterministic tests cover:
+Eight deterministic tests cover:
 
 - multi-layer/head values spanning odd and complete block boundaries,
 - visible block-table order and compact retrieval,
@@ -215,24 +221,54 @@ Seven deterministic tests cover:
 - invalid/overflowing configuration, handles, shapes, dtypes, layers, and outputs,
 - exact statistics and contiguous-versus-paged tail accounting,
 - concurrent append followed by complete reclamation,
+- read-lease storage pinning, physical-block identity, and final-prefix bounds,
 - normal and ASan/UBSan execution.
 
 Release-mode lifecycle and layer-copy comparisons are recorded in
 `docs/PERFORMANCE.md`. The large-history layer-copy results are deliberately
 unfavorable to paging because materialization must traverse many discontiguous
-blocks; M13 will read block tables directly instead of treating compaction as the
-final attention design.
+blocks; direct block-table attention therefore does not use compact retrieval.
+
+## Direct block-table attention lease
+
+`read_layer(sequence, layer)` returns a move-only `LayerReadView`. It shares
+ownership of the cache implementation, stores a pointer to the validated sequence
+state, and owns the already-acquired cache mutex lock. This combination provides
+three lifetime guarantees:
+
+1. Destroying the `PagedKvCache` facade cannot free the physical tensors while a
+   view exists.
+2. Append and release cannot resize or erase the sequence table while block spans
+   are in use.
+3. A recycled physical block cannot change owner during the traversal.
+
+The view exposes logical length, geometry, physical IDs, tokens written in each
+logical block, and per-head key/value spans. A complete block span contains
+`block_tokens * head_dimension` floats. The last block contains only
+`(length % block_tokens) * head_dimension` floats when partial. Span offsets are
+derived with checked pool geometry at construction and bounded indices at access;
+no pointer to an unwritten slot is returned.
+
+The M13 CPU attention implementation holds this lease while it computes scaled
+scores, stable softmax, and probability-times-V directly from pages. That removes
+the two compact-history copies measured in M12. It does not make attention
+workspace-free: probabilities still use the explicit `[heads, queries, length]`
+Float32 workspace. It also does not establish asynchronous GPU safety. A future
+device view needs a device-resident table and stream-ordered ownership whose
+lifetime extends through kernel completion, not a host mutex held across an
+asynchronous launch.
 
 ## Current limitations
 
 - Float32 CPU tensors only; no GPU-resident cache or asynchronous copy contract.
 - Keys and values use the same head dimension.
-- Retrieval compacts/copies a layer; attention does not yet consume block tables
-  directly.
+- Compact retrieval still copies; direct CPU attention consumes a read lease
+  instead.
 - Contiguous sequence capacity cannot grow; the paged pool cannot grow after
   construction.
 - No prefix sharing, eviction, preemption, or reference counting yet.
-- One mutex serializes all sequences.
+- One mutex serializes all sequences, and a direct read lease holds it for the
+  complete attention call.
 
 The implementation is original. Fixed-size blocks, block tables, and KV reuse are
 standard inference-runtime concepts; Helix keeps its own layout, ownership,

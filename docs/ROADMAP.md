@@ -400,12 +400,44 @@ for the 128 KiB and 2 MiB histories because it traverses 8 and 32 blocks; the od
 25,752-byte case was within run-to-run variation. See `docs/KV_CACHE.md` and
 `docs/PERFORMANCE.md` for exact methodology and limitations.
 
-### M13 — Paged attention — Planned; GPU optimization hardware pending
+### M13 — Paged attention — CPU-validated, sanitized, and benchmarked; GPU path pending
 
 - correctness path reading K/V through sequence block tables
 - comparison with contiguous attention
 - memory-access and coalescing analysis
 - measured latency, overhead, fragmentation, and capacity on target hardware
+
+Implementation/validation record (2026-08-21, commits `26a9adf`, `2977005`, and
+`aaf9d59`): `PagedKvCache::LayerReadView` pins cache storage and sequence metadata
+behind a move-only read lease, exposes only written per-block prefixes, and holds
+the cache mutex for its lifetime so append/release cannot invalidate a traversal.
+The direct Float32 CPU attention path consumes those block spans without creating
+a compact K/V history. It retains the M10 `[H,Q,K]` score/probability workspace,
+causal offset semantics, stable softmax, and double accumulation.
+
+Four paged-attention tests compare full prefill and chunked decode with contiguous
+attention across odd dimensions and block boundaries, cover zero queries, and
+exercise invalid shape/dtype/range/output/alias contracts. A separate cache test
+proves the lease pins storage after its cache facade is destroyed and exposes only
+the final block's written prefix. Normal and ASan/UBSan suites pass 93/93; the
+CUDA-enabled build passes the same 93 hardware-independent tests and still
+registers 57 hardware-gated GPU tests.
+
+The first value stage walked every page once per output coordinate. Measurement
+identified that repeated page lookup and strided value access as the bottleneck.
+A fixed 32-coordinate stack tile now walks each page once per tile while preserving
+each coordinate's KV accumulation order and requiring no dynamic allocation. The
+original dimension-major path remains callable for paired benchmarking. Applying
+the same tile to contiguous attention avoids crediting a general loop-order
+improvement to paging. In a same-process Release run, tiling reduced paged CPU
+median time by 2.36x–2.99x; with equal tiled traversal, direct paging cost 2.1%–
+6.7% more CPU time than contiguous storage across the four measured cases. Exact
+shapes, variation, methodology, and caveats are in `docs/PERFORMANCE.md`.
+
+This completes the CPU correctness and measurement gate, not the GPU portion of
+M13. There is no device-resident block pool/table or CUDA paged-attention kernel,
+so coalescing, occupancy, GPU latency, and capacity remain pending NVIDIA hardware
+and implementation.
 
 ## Phase E: requests and continuous execution
 

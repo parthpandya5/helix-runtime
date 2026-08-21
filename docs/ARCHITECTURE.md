@@ -300,12 +300,41 @@ causal masking for prefill and decode. The caller-owned score workspace is
 `[heads, query_tokens, kv_tokens]`, or exactly `4*H*Q*K` bytes for Float32; softmax
 reuses it in place.
 
-The CPU implementation is the double-accumulating oracle. The CUDA baseline uses
-one serial-dot-product thread per score, the existing stable block softmax, and one
-serial-KV-reduction thread per output coordinate. This deliberately visible path
-establishes correctness and memory-cost baselines. Fusion or paged attention
-follows only after hardware validation and profiling identify the relevant traffic
-and launch costs. Q/K/V heads must currently match; GQA is not implied.
+The CPU implementation is the double-accumulating oracle. Its original
+probability-times-V loop remains as a dimension-major benchmark baseline. The
+default path uses a fixed 32-coordinate stack tile so each contiguous V row is
+consumed while hot without changing any coordinate's accumulation order. The CUDA
+baseline uses one serial-dot-product thread per score, the existing stable block
+softmax, and one serial-KV-reduction thread per output coordinate. This deliberately
+visible path establishes correctness and memory-cost baselines. Q/K/V heads must
+currently match; GQA is not implied.
+
+The CPU paged path accepts a move-only layer read lease from `PagedKvCache` and
+resolves logical blocks directly to per-head K/V spans. It never materializes a
+compact K/V history:
+
+```mermaid
+flowchart LR
+    Query[Query rows] --> Scores[Scaled causal scores]
+    Lease[Layer read lease] --> Table[Logical block table]
+    Table --> KeyPages[Physical key spans]
+    Table --> ValuePages[Physical value spans]
+    KeyPages --> Scores
+    Scores --> Softmax[Stable in-place softmax]
+    Softmax --> Values[32-coordinate value tiles]
+    ValuePages --> Values
+    Values --> Output
+```
+
+The lease shares ownership of the cache implementation and holds its mutex from
+construction through destruction. That pins both the physical pool and the
+sequence table and excludes append/release while raw spans are in use. It is safe
+but intentionally coarse: one long read blocks unrelated sequences in the same
+cache. The final logical block exposes only its written prefix, so stale bytes in
+unused slots or recycled blocks are unreachable. CPU measurements compare retained
+dimension-major baselines, equal tiled traversals, and the page-table overhead.
+There is no CUDA paged-attention implementation yet; CPU locality results are not
+GPU coalescing evidence.
 
 ## KV cache
 
@@ -349,8 +378,10 @@ The first memory-pressure policy rejects append with a typed resource error whil
 preserving current sequences; an append within an already-owned partial block can
 still proceed. Debug builds re-derive ownership and accounting invariants after
 every mutation. Both contiguous and paged CPU caches use one mutex per instance.
-Paged attention, GPU-resident pool integration, preemption, prefix sharing, and
-reference counting remain separate milestones rather than implied features.
+The M13 read lease lets attention traverse written block spans without compaction;
+its exclusive lifetime lock is the current invalidation boundary. GPU-resident pool
+integration, preemption, prefix sharing, and reference counting remain separate
+milestones rather than implied features.
 
 ## Request and scheduler
 
