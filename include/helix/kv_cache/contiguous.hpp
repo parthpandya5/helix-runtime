@@ -1,6 +1,6 @@
 #pragma once
 
-#include "helix/tensor/tensor.hpp"
+#include "helix/kv_cache/layer.hpp"
 
 #include <cstddef>
 #include <cstdint>
@@ -51,11 +51,6 @@ struct ContiguousKvCacheStats {
   std::uint64_t sequence_create_count = 0;
   std::uint64_t append_count = 0;
   std::uint64_t release_count = 0;
-};
-
-struct KvLayer final {
-  Tensor keys;
-  Tensor values;
 };
 
 class ContiguousKvCache final {
