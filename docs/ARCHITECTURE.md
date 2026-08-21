@@ -310,8 +310,20 @@ and launch costs. Q/K/V heads must currently match; GQA is not implied.
 ## KV cache
 
 For each layer, cached keys and values avoid recomputing projections for prior
-tokens during decode. A contiguous baseline first defines append, read, capacity,
-and release behavior.
+tokens during decode. The implemented Float32 CPU baseline stores two owned tensors
+per sequence with layout `[layers, kv_heads, capacity_tokens, head_dimension]`.
+Appending one `[layers, kv_heads, head_dimension]` token fills the current logical
+position. Layer retrieval creates a compact owning
+`[kv_heads, active_tokens, head_dimension]` snapshot compatible with contiguous
+attention; a preallocated-output form excludes allocation when required.
+
+`ContiguousKvCache` is the sole storage owner. Non-owning sequence handles combine
+a process-unique cache ID with a monotonic local sequence ID, so foreign, stale,
+and released handles cannot mutate another allocation. Creation reserves the full
+capacity under a byte ceiling, and exhaustion is transactional. One mutex
+serializes mutable sequence state; returned snapshots are independent. Exact
+layout, byte formulas, tests, and limitations are documented in
+`docs/KV_CACHE.md`.
 
 Paged KV storage divides capacity into fixed-token blocks. A per-sequence block
 table maps logical token blocks to physical blocks:
@@ -325,10 +337,10 @@ flowchart LR
     Offset --> KV[(K/V block storage)]
 ```
 
-The manager owns a free-block pool, allocation state, and sequence tables. The
-first memory-pressure policy rejects admission/append with a typed resource error
-while preserving current sequences. Preemption, prefix sharing, and reference
-counting are added only for implemented policies that need them.
+The planned M12 manager owns a free-block pool, allocation state, and sequence
+tables. Its first memory-pressure policy rejects admission/append with a typed
+resource error while preserving current sequences. Preemption, prefix sharing,
+and reference counting are added only for implemented policies that need them.
 
 ## Request and scheduler
 

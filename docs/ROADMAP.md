@@ -331,12 +331,33 @@ correctness and timing remain unvalidated. Reproducible CPU baselines and the
 quadratic workspace cost are recorded in `docs/ATTENTION.md` and
 `docs/PERFORMANCE.md`. No fusion or speedup claim is made.
 
-### M11 — Contiguous KV cache — Planned
+### M11 — Implemented, CPU-validated, sanitized, and benchmarked
 
 - layer-aware K/V shape and capacity model
 - create, append, retrieve, and release sequence operations
 - tests showing decode reuses prior K/V
 - memory formulas checked against allocated bytes
+
+Implementation/validation record (2026-08-21, commit `ad7ebc2`):
+`ContiguousKvCache` owns per-sequence Float32 key and value tensors laid out as
+`[layers, kv_heads, capacity_tokens, head_dimension]`. Whole-token append accepts
+`[layers, kv_heads, head_dimension]`; layer retrieval compacts the active prefix
+to `[kv_heads, length, head_dimension]`, directly matching the M10 attention
+contract. The exact reservation is
+`layers * 2 * kv_heads * head_dimension * capacity * sizeof(float)`, with checked
+arithmetic before allocation.
+
+Cache-instance-tagged sequence handles reject cross-cache and stale/released use.
+Creation reserves full capacity transactionally under a configured byte ceiling;
+full-cache and full-sequence failures leave storage, lengths, and statistics
+unchanged. Release reclaims both tensors and all active capacity/token accounting.
+A single documented mutex serializes mutable state. Five tests cover multi-layer
+layout, cached-decode attention equivalence, exact accounting, invalid contracts,
+transactional exhaustion, double release, and concurrent appends. Normal and
+ASan/UBSan suites pass 81/81. The CUDA-on build also passes all 81 independent
+tests; 57 GPU tests remain hardware-gated, and M11 does not claim a GPU cache path.
+CPU lifecycle and allocation-free layer-copy baselines are recorded in
+`docs/PERFORMANCE.md`; design and limitations are in `docs/KV_CACHE.md`.
 
 ### M12 — Paged KV cache — Planned
 

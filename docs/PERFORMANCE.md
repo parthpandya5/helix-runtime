@@ -27,6 +27,7 @@ Every recorded experiment must include:
 | M7 host-resource allocator baseline | Direct aligned C++ allocation/free | Route identical fixed and 16-allocation mixed traces through the best-fit cache | Median CPU time per fixed pair: direct/Helix 22.6/87.1 ns (256 B), 22.0/88.6 ns (4 KiB), 548/88.2 ns (1 MiB); mixed trace 1.657/2.016 us | Host allocation already caches small blocks, so Helix metadata loses on small/mixed traces but avoids repeated upstream work for 1 MiB. This does not predict `cudaMalloc` behavior. |
 | M9 CPU transformer primitives | No earlier RoPE fixture; M2 provided scalar SiLU only | Add preallocated SwiGLU and adjacent-pair RoPE reference paths | Median CPU time: SwiGLU 4,096 values 44.602 us and 131,072 values 1.512 ms; RoPE 1x32x128 1.904 us and 128x32x128 187.894 us | These are single-threaded correctness baselines, not optimized CPU or GPU comparisons. High host load makes wall-time variation substantial. |
 | M10 contiguous CPU attention | No earlier attention path | Materialize scaled/masked scores, stable softmax in place, then probabilities x V with reusable output/workspace | Median CPU time: 8x1x128x64x64 76.371 us; 8x1x1,024x64x64 825.128 us; 3x17x29x37x41 46.284 us; 8x128x128x64x64 8.164 ms | Workspace is exactly `4*H*Q*K` bytes. These single-threaded results include softmax but the reported dot FLOP/s numerator does not; they are correctness baselines. |
+| M11 contiguous CPU KV cache | No earlier KV storage | Reserve per-sequence K/V tensors, append complete tokens, and copy a compact layer history into preallocated outputs | Lifecycle median CPU time: 26.898 us (2x2x64, capacity/append 128), 63.700 us (4x8x64, capacity 512/append 32), 7.853 us (odd 3x3x37, 29); layer-copy median: 1.595 us (128 KiB), 29.609 us (2 MiB), 613 ns (25,752 B) | Lifecycle includes sequence allocation, appends, and release. Layer copy excludes output allocation. This is a contiguous baseline under high host load, not evidence that paging or another layout is faster. |
 
 ## M1 CPU tensor baseline — 2026-08-20
 
@@ -241,6 +242,61 @@ that FLOP numerator. Decode latency scales with KV history in these two samples,
 and prefill exposes the quadratic score workspace; neither observation is a speedup
 claim. CUDA fixtures use identical shapes, ten warmups, and same-stream event
 timing, but have not executed on a GPU.
+
+## M11 contiguous CPU KV-cache baseline — 2026-08-21
+
+Environment:
+
+- source: commit `ad7ebc2`
+- host: Apple M3 Pro, 12 CPU cores, 18 GB RAM
+- OS/compiler/build: macOS 26.0.1 arm64, Apple Clang 17.0.0, Release,
+  `HELIX_ENABLE_CUDA=OFF`, Float32
+- CMake 4.2.3 and Google Benchmark 1.9.1
+- warmup: time-based 0.05 seconds per case
+- measurement: time-based minimum 0.1 seconds per repetition, five repetitions;
+  median CPU time reported
+- concurrency: one benchmark thread; the cache itself uses one mutex
+- host one-minute load average at start: 46.58; affinity and CPU-frequency
+  metadata were unavailable
+
+The lifecycle fixture times one sequence creation, a fixed number of whole-token
+appends using already-created input tensors, and release. Capacity allocation is
+included, but unused `Tensor::empty` capacity is neither initialized nor page-
+touched by the fixture.
+
+| Layers x heads x dimension | Capacity / appended tokens | Reserved bytes | Median CPU time per lifecycle | Appends/s within trace |
+|---|---:|---:|---:|---:|
+| 2 x 2 x 64 | 128 / 128 | 262,144 B | 26.898 us | 4.759 million/s |
+| 4 x 8 x 64 | 512 / 32 | 8,388,608 B | 63.700 us | 502,355/s |
+| 3 x 3 x 37 | 29 / 29 | 77,256 B | 7.853 us | 3.693 million/s |
+
+The layer-copy fixture prefills one sequence outside the timed region and repeatedly
+copies one layer's keys and values into preallocated compact outputs. The effective
+rate counts copied payload bytes once; it is not a claim about total memory-bus
+traffic.
+
+| Layers x heads x dimension x tokens | Copied payload | Median CPU time | Effective copy rate |
+|---|---:|---:|---:|
+| 2 x 2 x 64 x 128 | 131,072 B | 1.595 us | 76.55 GiB/s |
+| 4 x 8 x 64 x 512 | 2,097,152 B | 29.609 us | 65.96 GiB/s |
+| 3 x 3 x 37 x 29 | 25,752 B | 613 ns | 39.11 GiB/s |
+
+Command:
+
+```bash
+./build-release/benchmarks/helix_benchmarks \
+  --benchmark_filter=BM_ContiguousKv \
+  --benchmark_min_warmup_time=0.05 \
+  --benchmark_min_time=0.1s \
+  --benchmark_repetitions=5 \
+  --benchmark_report_aggregates_only=true
+```
+
+These measurements establish only the contiguous CPU cost. The host was heavily
+loaded, so they should be repeated on an idle machine before interpreting small
+differences. M12 must compare page allocation and capacity utilization against
+this design using the same request traces; it cannot claim improvement merely from
+smaller theoretical tail waste.
 
 ## Timing rules
 
