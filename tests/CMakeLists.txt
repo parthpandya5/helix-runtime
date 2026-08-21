@@ -36,6 +36,17 @@ gtest_discover_tests(
   TEST_PREFIX "attention."
   DISCOVERY_MODE PRE_TEST)
 
+add_executable(helix_contiguous_kv_cache_tests contiguous_kv_cache_test.cpp)
+target_link_libraries(
+  helix_contiguous_kv_cache_tests
+  PRIVATE helix::attention helix::kv_cache GTest::gtest_main)
+helix_configure_target(helix_contiguous_kv_cache_tests)
+
+gtest_discover_tests(
+  helix_contiguous_kv_cache_tests
+  TEST_PREFIX "contiguous_kv."
+  DISCOVERY_MODE PRE_TEST)
+
 add_executable(helix_memory_tests memory_allocator_test.cpp)
 target_link_libraries(helix_memory_tests PRIVATE helix::memory GTest::gtest_main)
 helix_configure_target(helix_memory_tests)
