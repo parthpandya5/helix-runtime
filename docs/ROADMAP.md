@@ -441,12 +441,30 @@ and implementation.
 
 ## Phase E: requests and continuous execution
 
-### M14 — Request model — Planned
+### M14 — Request model — Implemented, CPU-validated, and sanitized
 
 - stable request/token IDs
 - validated waiting, prefill, decoding, terminal state transitions
 - generation limits, cancellation, failure context, and timestamps
 - exhaustive state-transition tests
+
+Implementation/validation record (2026-08-21, commit `582357b`): strong nonzero
+64-bit `RequestId` and independent 32-bit `TokenId` types feed a move-only,
+single-owner `Request`. The explicit waiting/prefill/decoding/finished/cancelled/
+failed graph has no terminal exits. Positive chunked prefill progress transitions
+to decode only after the whole prompt, or finishes immediately when
+`max_new_tokens` is zero. Generated tokens retain emission times and finish
+atomically at the configured length; EOS, cancellation, and failure have separate
+reasons, with context retained for the latter two.
+
+All event times use `steady_clock` and must be monotonic. Created, first-scheduled,
+prefill-complete, first/last-token, and completion times support derived waiting
+and TTFT metrics without a nondeterministic internal clock call during mutation.
+Ten tests enumerate all 36 state pairs and cover chunking, limits, EOS, every
+active-state cancellation/failure path, invalid inputs, time regression,
+transactional failure, enum validation, metrics, and move ownership. Normal and
+ASan/UBSan suites pass 103/103. The CUDA-enabled build passes the same 103
+hardware-independent tests; 57 GPU tests remain gated. See `docs/SCHEDULER.md`.
 
 ### M15 — FIFO/token-budget scheduler — Planned
 

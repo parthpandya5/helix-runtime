@@ -385,8 +385,9 @@ milestones rather than implied features.
 
 ## Request and scheduler
 
-A request has a stable ID, prompt tokens, generation limit, timestamps/metrics,
-and a validated state machine:
+The implemented M14 request is a move-only owner of a strong nonzero request ID,
+immutable prompt tokens, generated-token/timestamp records, generation limit,
+terminal context, and validated state machine:
 
 ```mermaid
 stateDiagram-v2
@@ -407,15 +408,25 @@ stateDiagram-v2
     Failed --> [*]
 ```
 
-The FIFO scheduler initially admits work subject to a per-iteration token budget
-and available KV blocks. Prefill consumes prompt tokens; decode normally consumes
-one token per running request. Continuous batching removes completed requests and
-admits waiting work at the next iteration without waiting for an original static
-batch to drain.
+Positive prefill progress may be chunked across iterations. Completing the prompt
+enters decode, except a zero generation budget finishes immediately. Appending a
+generated token at the configured limit finishes with `length`; EOS, cancellation,
+and failure are explicit alternatives. Terminal states have no exits. Every event
+uses a caller-supplied monotonic `steady_clock` time, allowing deterministic wait,
+TTFT, completion, and inter-token metric derivation. The request is not thread-safe;
+one scheduler thread owns mutation. Details and the exhaustive transition matrix
+are in `docs/SCHEDULER.md`.
 
-Scheduler state is host-only and deterministic in tests. The initial scheduler is
-not thread-safe; the runtime engine owns it from one orchestration thread. A future
-multi-producer submission queue may provide the synchronization boundary.
+The planned FIFO scheduler initially admits work subject to a per-iteration token
+budget and available KV blocks. Prefill consumes prompt tokens; decode normally
+consumes one token per running request. Continuous batching removes completed
+requests and admits waiting work at the next iteration without waiting for an
+original static batch to drain.
+
+Scheduler state will remain host-only and deterministic in tests. The initial
+scheduler is not thread-safe; the runtime engine owns it from one orchestration
+thread. A future multi-producer submission queue may provide the synchronization
+boundary.
 
 ## Model executor
 
