@@ -58,6 +58,17 @@ gtest_discover_tests(
   TEST_PREFIX "paged_kv."
   DISCOVERY_MODE PRE_TEST)
 
+add_executable(helix_prefix_cache_tests prefix_cache_test.cpp)
+target_link_libraries(
+  helix_prefix_cache_tests
+  PRIVATE helix::kv_cache GTest::gtest_main)
+helix_configure_target(helix_prefix_cache_tests)
+
+gtest_discover_tests(
+  helix_prefix_cache_tests
+  TEST_PREFIX "prefix_cache."
+  DISCOVERY_MODE PRE_TEST)
+
 add_executable(helix_paged_attention_tests paged_attention_test.cpp)
 target_link_libraries(
   helix_paged_attention_tests

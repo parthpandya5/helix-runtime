@@ -164,7 +164,10 @@ target_include_directories(
     $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
 helix_configure_target(helix_cpu_kernels)
 
-add_library(helix_kv_cache src/kv_cache/contiguous.cpp src/kv_cache/paged.cpp)
+add_library(helix_kv_cache
+  src/kv_cache/contiguous.cpp
+  src/kv_cache/paged.cpp
+  src/kv_cache/prefix.cpp)
 add_library(helix::kv_cache ALIAS helix_kv_cache)
 target_compile_features(helix_kv_cache PUBLIC cxx_std_20)
 target_link_libraries(helix_kv_cache PUBLIC helix::tensor)
