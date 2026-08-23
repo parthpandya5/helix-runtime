@@ -2,13 +2,14 @@
 
 ## Status
 
-Milestones 17–18 implement one narrow, deterministic Llama-style model and
-single-sequence generation session in the CPU backend. They are Float32
-correctness baselines for full causal prefill and contiguous-KV decode, not a claim
+Milestones 17–19 implement one narrow, deterministic Llama-style model,
+single-sequence generation session, and multi-request CPU orchestration path. They
+are Float32 correctness baselines for full causal prefill and contiguous or paged
+KV decode, not a claim
 of compatibility with every model whose configuration contains the word “Llama.”
 The implementation, native weight container, unit tests, sanitizer suite, and CPU
-benchmarks are complete. CUDA model execution, tokenizer integration, batched
-runtime execution, and real checkpoint conversion remain later gates.
+benchmarks are complete. CUDA model execution, fused tensor batching, tokenizer
+integration, and real checkpoint conversion remain later gates.
 
 ## Exact architecture contract
 
@@ -79,6 +80,19 @@ then copied that snapshot into a second buffer with a current-token tail.
 `[A,P+1,D]` buffer, validates the caller's expected length under the cache mutex,
 and leaves the tail untouched for the current K/V. This preserves cache ownership
 while removing two Tensor temporaries and one history-copy pass per layer.
+
+The same `decode_one` algorithm is instantiated for `PagedKvCache`: both cache
+types expose checked length, geometry, and prefix-copy contracts, while the model
+never owns or mutates either cache. `CpuRuntimeEngine` uses this overload for one
+paged sequence per live request and appends returned all-layer K/V only after a
+successful model step. A deterministic test crosses a paged block boundary and
+compares every sequential decode position with full-prefix recomputation.
+
+When a new prompt is scheduled as one complete range, the M19 engine calls
+`prefill_with_kv` once, retains only the final `[1,V]` logits row, and passes the
+layer-major K/V artifacts to `PagedKvCache::append_layer_major`. Partial prompt
+ranges retain token-at-a-time decode so arbitrary scheduler chunking remains
+correct. These are selectable benchmark paths rather than an erased baseline.
 
 `select_greedy_token` examines the last logits row, requires finite Float32 CPU
 values, and selects the lowest token ID among equal maxima. `generate` emits until
@@ -201,12 +215,13 @@ markers, metadata and payload corruption, nonzero padding, structurally invalid
 but checksum-consistent ranks/offsets, invalid weights, non-finite weights, and
 nonzero stream origins.
 
-Validation on 2026-08-23 through M18 implementation commit `c515d6d`:
+Validation on 2026-08-23 through M19 implementation commit `8086257` and benchmark
+methodology commit `2a6b365`:
 
-- normal and Release CPU suites: 136/136 tests passed;
-- Apple Clang ASan/UBSan suite: 136/136 tests passed;
+- normal, Release, and Apple Clang ASan/UBSan CPU suites: 148/148 tests passed;
+- relevant Release tests and benchmark smoke workloads passed;
 - CUDA 12.6.85/GCC 13.2 warnings-as-errors build: all targets compiled and all
-  136 hardware-independent tests passed;
+  148 hardware-independent tests passed;
 - 57 GPU runtime tests remained explicitly skipped because the compile container
   has no NVIDIA driver or device.
 
@@ -231,14 +246,22 @@ two-stage snapshot algorithm beside the direct-prefix path and includes output
 allocation and current-tail copies for both. Exact medians, variation, model
 shapes, repetitions, and commands are in `PERFORMANCE.md`.
 
+The M19 paired engine trace holds scheduler/decode/pool behavior constant and
+compares sequential-token prompt execution with full-prompt execution plus bulk
+paged append. The default reduced median CPU trace time by 15.8%–51.3% across the
+three tiny disclosed workloads. It measures serial CPU orchestration, not fused
+batch or GPU throughput.
+
 ## Deliberate limitations
 
 - CPU Float32 only for complete model execution.
-- Prefill is one complete prompt operation; chunked model prefill is not connected.
+- Complete new prompts use one full prefill; chunked runtime prefill falls back to
+  sequential one-token execution rather than a multi-token continuation kernel.
 - Cached decode uses a fixed-capacity contiguous CPU cache and materializes one
   `[A,P+1,D]` K/V pair per layer for the current attention call.
-- Generation supports one sequence and greedy selection only; no sampling,
-  batching, paged model decode, or runtime scheduler integration yet.
+- The standalone generator supports one sequence and greedy selection only. The
+  runtime supports several paged sessions but executes work items serially and has
+  no sampling or fused tensor batch.
 - No tokenizer and no supported public checkpoint conversion tool yet.
 - No GQA/MQA, tied-embedding option, biases, partial rotary dimensions, sliding
   windows, mixture-of-experts blocks, quantization, or arbitrary model graphs.

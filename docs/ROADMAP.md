@@ -610,12 +610,48 @@ disclosed Apple M3 Pro CPU fixtures, cached next-position decode measured 3.69x,
 are in `docs/PERFORMANCE.md`; these are tiny single-threaded CPU reference results,
 not production or GPU inference claims.
 
-### M19 — Runtime execution engine — Planned
+### M19 — CPU runtime execution engine — Implemented, CPU-validated, sanitized, and benchmarked
 
-- single owner connecting scheduler, model executor, KV cache, allocator, and stream
+- single owner connecting scheduler, CPU model executor, and paged KV cache;
+  CUDA allocator/stream ownership remains future work
 - request submission/result API
 - lifecycle metrics and resource cleanup under success/cancel/failure
 - end-to-end deterministic and stress tests
+
+Implementation/validation record (2026-08-23, commits `8086257` and `2a6b365`):
+`CpuRuntimeEngine` is a
+single-thread-owned synchronous orchestrator over one `FifoScheduler`, one
+`CpuLlamaModel`, one global `PagedKvCache`, and a request/session map. Each call
+uses the cache's actual free-block snapshot, executes the scheduler's ordered mixed
+prefill/decode work, completes logical state, and reclaims every terminal physical
+sequence before returning. Submission validates vocabulary, context, unique IDs,
+and whether the maximum live K/V prefix can fit in the pool; partial insertion
+rolls back its empty sequence.
+
+`CpuLlamaModel::decode_one` now accepts either contiguous or paged history. A
+transactional paged bulk-append API consumes full-prefill layer-major artifacts
+across partial/whole pages. The default engine uses one full causal prefill when a
+complete new prompt is scheduled and retains token-at-a-time prefill for arbitrary
+chunks and paired measurement. Scheduler capacity accounting now recognizes that
+the final length-limited output is selected from existing logits and needs no new
+K/V, preventing an exact-block-boundary deadlock.
+
+Eight engine tests cover full and chunked prefill, greedy equivalence with full
+recomputation, genuine mixed-work continuous replacement, physical exhaustion and
+reuse, EOS/cancellation, invalid submission rollback, injected model failure, and
+complete reclamation. The eighth runs 32 mixed-length requests through a constrained
+pool, compares every output with full recomputation, and verifies reuse plus final
+zero ownership. Normal, Release, and ASan/UBSan suites pass 148/148. A CUDA 12.6.85
+warnings-as-errors build compiles every target and passes the same 148 host tests;
+57 GPU tests remain skipped without a driver/device.
+
+On three disclosed tiny Apple M3 Pro CPU traces, the full-prompt default reduced
+median process CPU time by 51.3%, 36.0%, and 15.8% versus retained sequential-token
+prefill. Exact model/request shapes, peak K/V bytes, iterations, timing boundaries,
+variation, and command are in `docs/PERFORMANCE.md`. This completes M19's CPU
+correctness-engine gate, not CUDA model execution: work items are serial, the pool
+is host Tensor storage, and streams/events plus `HelixAllocator` integration remain
+pending. See `docs/RUNTIME.md`.
 
 ## Phase G: measured advanced work
 
@@ -636,10 +672,15 @@ latency, launch count, and traffic before and after.
 
 Content key, KV block reference counts, ownership, eviction, and concurrency tests.
 
-### M23 — Memory pressure and preemption — Planned baseline, optional extension
+### M23 — Memory pressure and preemption — Safe-admission baseline implemented; optional extension
 
-The first policy is safe admission rejection. Preemption or prefix eviction is an
-optional measured extension with explicit fairness and restoration semantics.
+The implemented CPU engine rejects submission when one request's maximum live K/V
+prefix cannot fit in the physical pool. Transient pressure does not fail a request:
+the scheduler preserves FIFO order, waits for terminal reclamation, then admits more
+work from the cache's actual free-block snapshot. Exact-boundary and 32-request
+stress tests cover progress, reuse, and leak-free exhaustion. Preemption or prefix
+eviction remains an optional measured extension with explicit fairness and
+restoration semantics.
 
 ### M24 — Additional precision/quantization — Optional
 
@@ -660,6 +701,7 @@ mock or single-GPU tests as distributed validation.
 - `docs/PERFORMANCE.md` starts with the first benchmark and never contains
   illustrative numbers in result columns.
 - `docs/MODEL_SUPPORT.md` is created before M17 compatibility claims.
+- `docs/RUNTIME.md` records M19 orchestration ownership and failure boundaries.
 - `docs/INTERVIEW_GUIDE.md` evolves with implemented code and cites actual types.
 - `docs/RESUME.md` contains only validated implementation and measured claims.
 
@@ -668,5 +710,6 @@ mock or single-GPU tests as distributed validation.
 The first portfolio release requires excellent M0–M8 work, correct attention and
 paged KV state through M13, deterministic continuous batching through M16, and a
 credible implementation of M17–M19 without weakening earlier quality. If
-end-to-end generation/runtime integration is deferred, the release must say so
-plainly and present the deeply validated lower-level systems as the project scope.
+CUDA end-to-end execution remains deferred, the release must say so plainly and
+present the validated synchronous CPU engine plus compile-only CUDA layers as the
+current project scope.

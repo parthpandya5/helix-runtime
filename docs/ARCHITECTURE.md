@@ -40,9 +40,11 @@ flowchart TD
     Token --> Scheduler
 ```
 
-The eventual runtime executes one scheduling iteration at a time: admit requests,
-construct prefill/decode work within token and KV-memory budgets, execute the model,
-append K/V state, select tokens, and retire or requeue requests.
+The implemented synchronous CPU runtime executes one scheduling iteration at a
+time: admit requests, construct prefill/decode work within token and KV-memory
+budgets, execute the model serially, append paged K/V state, select tokens, and
+retire or requeue requests. CUDA model execution and asynchronous iterations remain
+later layers of this architecture.
 
 ## Layering and dependency direction
 
@@ -374,6 +376,13 @@ block. The sequence table is grown before the free queue changes, so metadata OO
 or pool exhaustion preserves the prior mapping and logical length. Release
 prevalidates ownership and returns blocks without allocating.
 
+The M19 bulk append accepts one `[kv_heads,tokens,head_dimension]` key/value pair
+per layer. It validates the entire layer-major input, checks capacity, and reserves
+the final block-table size before assigning any block. Copies then traverse maximal
+spans in a partial or whole page. This lets full model prefill populate the paged
+pool without allocating and repacking one `[layers,heads,dimension]` Tensor pair per
+token; scalar append remains the incremental decode path.
+
 The first memory-pressure policy rejects append with a typed resource error while
 preserving current sequences; an append within an already-owned partial block can
 still proceed. Debug builds re-derive ownership and accounting invariants after
@@ -431,14 +440,17 @@ sequenceDiagram
     participant E as Executor
     KV->>S: free-block snapshot
     S-->>E: batch(id, token ranges, new blocks)
-    E->>KV: reserve reported blocks
+    E->>KV: execute and append within reported capacity
     E-->>S: ordered work completions
-    S-->>KV: terminal block releases
+    S-->>E: terminal request IDs
+    E->>KV: release terminal sequences
 ```
 
 The scheduler does not own physical cache blocks. It predicts block deltas from
-logical token counts; the runtime must apply reservations before execution and
-apply release counts afterward. Only one batch can be in flight. Completion first
+logical token counts; the runtime must supply an authoritative free-block snapshot,
+keep physical and logical lengths aligned, and release terminal sequences. A final
+length-limited token has zero new-block demand because it is selected from existing
+logits and is not fed back through the model. Only one batch can be in flight. Completion first
 validates every ordered result, then stages all potentially allocating state before
 request mutation. This prevents a malformed late result or allocation failure from
 partially committing an iteration.
@@ -451,8 +463,8 @@ Continuous replacement is a consequence of the completion/admission boundary:
 terminal IDs leave the running vector after an iteration, and the next call admits
 waiting IDs into those slots before the surviving cohort finishes. Mixed batches
 may therefore carry decode work for resident requests and prefill ranges for newly
-admitted requests. This is implemented and deterministically tested at the host
-policy layer; the model executor integration is still pending.
+admitted requests. This is implemented and deterministically tested both at the
+host-policy layer and through the M19 CPU engine with genuine model/cache work.
 
 Metrics are derived from immutable request snapshots at a caller-provided
 `steady_clock` observation time. The reporting path validates distinct live IDs and
@@ -538,18 +550,21 @@ values, an FNV-1a metadata checksum, and one checksum per payload before returni
 a model. FNV provides accidental-corruption detection, not authenticity. Details
 and the exact byte layout are in `docs/MODEL_SUPPORT.md`.
 
-The current CPU path performs full causal prefill and single-token contiguous-KV
-decode and repacks token-major Q/K/V tensors around the existing head-major
-attention API. Greedy selection, EOS/length/context stops, and a token-ID CLI are
-implemented. Scheduler integration, batched/paged model decode, tokenizer
-integration, public-checkpoint conversion, and CUDA model dispatch remain M19 or
-later work. A model-specific conversion utility has intentionally not been guessed
-because no public checkpoint compatibility is claimed yet.
+The current CPU path performs full causal prefill and single-token decode against
+either contiguous or paged K/V storage, repacking token-major Q/K/V tensors around
+the existing head-major attention API. Greedy selection, EOS/length/context stops,
+a token-ID CLI, and scheduler-driven multi-request paged decode are implemented.
+The runtime schedules several requests per iteration but executes their model work
+serially; a fused tensor batch, tokenizer integration, public-checkpoint conversion,
+and CUDA model dispatch remain later work. A model-specific conversion utility has
+intentionally not been guessed because no public checkpoint compatibility is
+claimed yet.
 
 ## Runtime execution and asynchronous work
 
-The following sequence is the M19 multi-request target, not a claim that the M18
-single-sequence generator already drives the scheduler:
+`CpuRuntimeEngine` is the implemented M19 orchestration baseline. It owns the
+scheduler, one model, one global paged cache, and a request/session map. The entire
+sequence below completes synchronously on its owning thread:
 
 ```mermaid
 sequenceDiagram
@@ -558,18 +573,33 @@ sequenceDiagram
     participant Engine
     participant Model
     participant KV
-    Client->>Scheduler: submit(request)
+    Client->>Engine: submit(request, optional EOS)
+    Engine->>KV: create empty sequence
+    Engine->>Scheduler: move request
     loop inference iteration
-        Scheduler->>Engine: build batch within budgets
-        Engine->>Model: prefill/decode(batch)
-        Model->>KV: read prior K/V and append new K/V
+        KV-->>Engine: actual free-block snapshot
+        Engine->>Scheduler: build batch within budgets
+        Scheduler-->>Engine: ordered mixed work
+        Engine->>Model: prefill/decode each work item
+        Model->>KV: read prior K/V
+        Engine->>KV: append successful K/V
         Model-->>Engine: logits
         Engine->>Scheduler: generated tokens/completions
+        Scheduler-->>Engine: terminal requests
+        Engine->>KV: release terminal sequences
     end
-    Scheduler-->>Client: completed response + metrics
+    Engine-->>Client: completed requests + metrics
 ```
 
-CUDA execution starts with one explicit stream. Additional streams are introduced
+Every operation checks that paged-cache length equals the scheduler's token offset.
+Complete new prompts use one full causal prefill and a transactional layer-major
+bulk append; chunked prompts retain a selectable token-at-a-time baseline. The
+paired benchmark supports the full-prompt default, while the retained baseline
+makes the change reproducible. Model/cache failures become failed ordered
+completions and reclaim their sequence; cancellation reclaims waiting or running
+sessions immediately when no batch is in flight. See `docs/RUNTIME.md`.
+
+Future CUDA execution starts with one explicit stream. Additional streams are introduced
 only with event-defined dependencies. Pinned staging buffers support genuinely
 asynchronous host-device copies. Each overlap experiment records both latency and
 throughput because concurrency can increase contention.

@@ -35,6 +35,7 @@ Every recorded experiment must include:
 | M17 CPU Llama-style prefill and model load | No earlier complete model path | Compose the tested CPU kernels into full causal prefill and add checked `HELIXLM1` deserialization | Prefill medians: 97.942 us, 2.099 ms, and 34.104 ms for the three disclosed tiny configurations; checked in-memory load: 183.744 us, 640.046 us, and 3.967 ms | These establish single-threaded Float32 reference baselines, including forward temporaries or loader validation/allocation as specified. They do not demonstrate an optimization, GPU performance, disk-loading speed, or production model throughput. |
 | M18 cached CPU next-position execution | Full-prefix recomputation for the identical prompt plus one input token | Reuse prefill K/V and execute only the new position | Cached/full-recompute median CPU times: 32.100/118.420 us, 89.580 us/2.113 ms, and 646.960 us/36.741 ms (3.69x, 23.59x, and 56.79x) | The growing advantage demonstrates avoided prefix model work in three tiny single-sequence CPU fixtures. It is not a production model, batched-runtime, tokenizer, or GPU result. |
 | M18 contiguous-KV decode staging | Allocate a compact owning history snapshot, then copy it into the final history-plus-tail buffers | Copy the locked cache prefix directly into the final buffers | Two-stage/direct median CPU times: 858/466 ns, 1,161/634 ns, and 3,784/1,587 ns; reductions 45.7%, 45.4%, and 58.1% | Both paths include final-buffer allocation and current-tail writes. Direct copy removes two temporary tensors and one full history pass; the paired algorithm benchmark isolates this change from model math. |
+| M19 synchronous CPU runtime prefill | Execute every scheduled prompt token through the one-token paged decode path | Execute a complete newly admitted prompt once and bulk-append its layer-major K/V pages | Sequential/full-prompt median CPU trace times: 461.833/224.800 us, 2.616/1.675 ms, and 11.745/9.890 ms; reductions 51.3%, 36.0%, and 15.8% | Full prefill wins all paired tiny traces, but the benefit narrows as decode dominates. The timed region is real serial CPU model/scheduler/cache execution, not GPU or fused-batch throughput. |
 
 ## M1 CPU tensor baseline — 2026-08-20
 
@@ -740,6 +741,78 @@ Command:
   '--benchmark_filter=BM_ContiguousKvDecodeStaging' \
   --benchmark_min_time=100000x \
   --benchmark_repetitions=10 \
+  --benchmark_enable_random_interleaving=true \
+  --benchmark_report_aggregates_only=true
+```
+
+## M19 synchronous CPU runtime prefill optimization — 2026-08-23
+
+Environment:
+
+- source: commit `2a6b365` (including implementation commit `8086257`);
+- host: Apple M3 Pro, 12 CPU cores (6 performance, 6 efficiency), 18 GB RAM;
+- OS/compiler/build: macOS 26.0.1 arm64, Apple Clang 17.0.0, Release,
+  `HELIX_ENABLE_CUDA=OFF`, warnings as errors, Float32;
+- CMake 4.2.3 and Google Benchmark 1.9.1;
+- concurrency: one benchmark thread; requests share one paged pool, but scheduled
+  model work executes serially through the single-threaded CPU kernels;
+- timing: Google Benchmark process CPU time, 30 complete request traces per
+  repetition, nine randomly interleaved repetitions;
+- warmup: one complete trace per mode/workload before its first measured trace;
+- CPU affinity and frequency metadata were unavailable. The displayed synthetic
+  24 MHz metadata is a failed `sysctl` estimate and is not used.
+
+Each trace constructs deterministic weights, the engine, paged pool, and all
+requests while timing is paused. The timed region repeatedly calls
+`run_iteration` until the engine's O(1) live-queue query is false. It includes
+scheduler policy, Float32 model temporaries/math, paged prefix reads and appends,
+greedy selection, logical completion, and physical reclamation. Engine destruction,
+request submission, the final ownership/statistics validation snapshot, and model
+construction are excluded. Scheduler timestamps advance by a declared synthetic
+one microsecond per iteration solely to satisfy monotonic lifecycle accounting;
+they do not delay or scale the measured CPU time.
+
+All workloads use vocabulary 128, block size four, token budget
+`active_requests * prompt_tokens`, and sufficient pool capacity for the maximum
+resident prefixes. Every group of `active_requests` has one long request; other
+requests generate `ceil(long_output/4)` tokens. `Logical tokens` counts prompt plus
+generated scheduler work, not just generated output. Peak K/V bytes are actual
+paged-pool assigned bytes, not the larger reserved pool.
+
+| H / I / L / heads | Requests / active | Prompt / long / short output | Logical tokens / runtime iterations | Peak K/V bytes | Sequential median / CPU CV | Full-prompt median / CPU CV | Reduction / speedup |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| 16 / 32 / 1 / 4 | 8 / 4 | 4 / 4 / 1 | 46 / 7 | 3,072 B | 461.833 us / 3.86% | 224.800 us / 7.30% | 51.3% / 2.05x |
+| 32 / 64 / 2 / 4 | 8 / 4 | 8 / 8 / 2 | 92 / 12 | 26,624 B | 2.616 ms / 3.72% | 1.675 ms / 4.26% | 36.0% / 1.56x |
+| 64 / 128 / 2 / 4 | 16 / 8 | 8 / 8 / 2 | 172 / 12 | 102,400 B | 11.745 ms / 5.12% | 9.890 ms / 3.85% | 15.8% / 1.19x |
+
+The corresponding optimized logical-work rates were 204.626k, 54.920k, and
+17.392k tokens/s; successful request rates were 35.587k, 4.776k, and 1.618k
+requests/s. These are tiny synthetic, serial CPU reference-runtime rates. They are
+not GPU throughput, public-model throughput, or evidence that executing multiple
+work descriptions serially provides tensor batching speedup.
+
+The retained `SequentialTokenPrefill` mode invokes paged one-token decode for each
+prompt position. The `FullPromptPrefill` mode performs one full causal prefill for
+a complete new prompt, retains its last logits row, and transactionally bulk-
+appends layer-major K/V. Both modes use identical decode, scheduler, request, and
+pool logic. The smaller relative gain at the largest case is an honest consequence
+of decode occupying more of the trace; the optimization changes prompt work only.
+
+The first fixture revision polled `SchedulerStats` (an O(number of retained
+requests) reporting snapshot) through `has_live_requests` on every iteration and
+included one final stats snapshot in timing. Those provisional values were
+discarded. The recorded version exposes an O(1) waiting/running query and pauses
+timing before final validation. This is a benchmark-methodology correction in
+addition to a useful production API property; it is not included as a claimed
+speedup.
+
+Command:
+
+```bash
+./build-release/benchmarks/helix_benchmarks \
+  '--benchmark_filter=BM_CpuRuntimeContinuousTrace' \
+  --benchmark_min_time=30x \
+  --benchmark_repetitions=9 \
   --benchmark_enable_random_interleaving=true \
   --benchmark_report_aggregates_only=true
 ```

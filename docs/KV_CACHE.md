@@ -2,8 +2,9 @@
 
 ## Status
 
-The M11 contiguous cache, M12 paged cache, and M13 direct paged-attention read path
-are implemented, CPU-validated, sanitized, and benchmarked in Float32. They expose
+The M11 contiguous cache, M12 paged cache, M13 direct paged-attention read path,
+and M19 layer-major bulk append/runtime integration are implemented, CPU-validated,
+sanitized, and benchmarked in Float32. They expose
 the memory-capacity, compaction, and direct-traversal tradeoffs between a
 per-sequence allocation and a global fixed-block pool. There is not yet a GPU-
 resident KV-cache or CUDA paged-attention path.
@@ -188,6 +189,16 @@ block. All remaining writes are bounds-derived nonthrowing copies, so exhaustion
 host metadata OOM cannot leave a partial mapping. An append inside an already-owned
 partial block remains legal even when the free pool is empty.
 
+`append_layer_major` is the full-prompt companion to scalar append. It accepts one
+contiguous `[kv_heads,tokens,head_dimension]` key/value tensor per layer, validates
+the complete set, checks final capacity, counts reusable blocks, and reserves the
+sequence table's final size before ownership changes. It then copies maximal token
+spans into the current partial page and subsequent whole pages while holding the
+cache lock. Its statistics count appended tokens rather than API calls, preserving
+the meaning of `append_count` across scalar and bulk paths. A focused test compares
+five tokens spanning three blocks byte-for-byte with scalar append and proves
+shape, zero-length, and pool-exhaustion failures leave an empty sequence unchanged.
+
 Release validates every block owner before mutation, then returns all blocks
 without allocating. Reused storage is not cleared, but retrieval exposes only the
 new sequence's written logical length; every visible token position is overwritten
@@ -219,12 +230,13 @@ tail.
 
 ### Paged correctness coverage
 
-Eight deterministic tests cover:
+Nine deterministic tests cover:
 
 - multi-layer/head values spanning odd and complete block boundaries,
 - visible block-table order and compact retrieval,
 - cached decode passed through the M10 attention oracle,
 - transactional exhaustion and continued writes to a partial final block,
+- bulk layer-major append across partial/whole blocks and transactional rollback,
 - FIFO reclamation, reuse, stale-data invisibility, and double-release rejection,
 - invalid/overflowing configuration, handles, shapes, dtypes, layers, and outputs,
 - exact statistics and contiguous-versus-paged tail accounting,
@@ -272,6 +284,8 @@ asynchronous launch.
 - Keys and values use the same head dimension.
 - Compact retrieval still copies; direct CPU attention consumes a read lease
   instead.
+- M19 model decode reads paged prefixes through the copy-out API; it does not yet
+  invoke direct block-table attention inside the model executor.
 - Contiguous sequence capacity cannot grow; the paged pool cannot grow after
   construction.
 - No prefix sharing, eviction, preemption, or reference counting yet.

@@ -16,8 +16,9 @@ reproducible benchmark evidence.
 Milestones 0–2, the host-testable portions of Milestones 7–8, the CPU paths of
 Milestones 9–10, the M11–M12 KV caches, the M13 direct paged-attention CPU path,
 the M14–M16 request and continuous-batching scheduler, the M17 narrow Llama-style
-CPU prefill runtime, and the M18 single-sequence cached generation path are
-implemented and CPU-validated. The repository
+CPU prefill runtime, the M18 single-sequence cached generation path, and the M19
+synchronous multi-request CPU execution engine are implemented and CPU-validated.
+The repository
 contains the CPU-first build foundation, a checked contiguous tensor core,
 Float32 reference kernels for elementwise math, reductions, stable softmax,
 matrix multiplication, RMSNorm, SwiGLU, adjacent-pair RoPE, linear projection, and
@@ -26,9 +27,10 @@ reclamation, and layer-aware contiguous/paged KV histories with checked capacity
 accounting and copy-free block-table attention traversal. The model composes those
 primitives into embedding, pre-norm attention/MLP blocks, RoPE, SwiGLU, residuals,
 final normalization, and an untied LM head, loads a checksummed versioned native
-weight format, and performs greedy generation through a contiguous KV cache. On
+weight format, performs greedy generation through a contiguous KV cache, and
+executes scheduler batches against a shared paged KV pool. On
 2026-08-23, Apple Clang 17 built the project on macOS arm64 with warnings as
-errors; 136/136 CPU tests passed in normal, Release, and ASan/UBSan configurations.
+errors; 148/148 CPU tests passed in Debug, Release, and ASan/UBSan configurations.
 
 CUDA is optional at configure time. The current Apple Silicon development host has
 no NVIDIA GPU or native CUDA toolkit, so no CUDA execution or performance claim is
@@ -38,7 +40,7 @@ compile-validated in an ARM64 CUDA 12.6 development container without a
 driver/device. The M8 stream-ordered allocator and M9 block-reduced RMSNorm,
 grid-stride SwiGLU, adjacent-pair RoPE, and projection adapter are also
 compile-validated, as is the M10 three-stage contiguous attention baseline. None is
-runtime-validated on a GPU. The CUDA-on build passes the same 136 hardware-
+runtime-validated on a GPU. The CUDA-on build passes the same 148 hardware-
 independent tests and registers 57 GPU tests that cannot run without a driver and
 device.
 
@@ -55,6 +57,10 @@ flowchart TD
     Kernels --> Memory
     KV --> Memory
 ```
+
+The M19 CPU engine implements the scheduler/model/paged-cache path in this diagram.
+The allocator-to-GPU-memory and CUDA-executor branches remain separately validated
+lower layers, not yet an end-to-end GPU engine.
 
 The full dependency, ownership, request-lifecycle, and memory designs are in
 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
@@ -133,9 +139,12 @@ CPU costs and unfavorable results. A paired decode-staging fixture measures the
 removal of an intermediate K/V snapshot, while complete next-position fixtures
 compare cached decode with full-prefix recomputation. Scheduler traces separate
 measured host-policy cost from a declared synthetic static-versus-continuous model;
-neither is labeled as inference throughput. Complete CPU model prefill and checked in-memory weight
-loading have three disclosed synthetic-model baselines; they are reference-path
-measurements, not production inference claims. Methodology and measurements live in
+neither is labeled as inference throughput. Complete CPU model prefill and checked
+in-memory weight loading have three disclosed synthetic-model baselines; they are
+reference-path measurements, not production inference claims. Paired end-to-end
+CPU runtime traces retain sequential-token and full-prompt prefill modes; the
+measured default reduced median trace CPU time by 15.8%–51.3% across three
+disclosed tiny workloads. Methodology and measurements live in
 [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md).
 
 ## Tensor runtime
@@ -216,8 +225,11 @@ fixed-token physical pool and logical block tables. A deterministic allocation-
 free FIFO manages free blocks; append-on-boundary and release are transactional,
 cache-tagged handles reject foreign/stale ownership, and statistics expose block,
 byte, token-slot, reuse, and tail-slack behavior. Tests cover exhaustion, reuse,
-concurrency, and a concrete contiguous capacity comparison. Benchmarks keep the
-faster steady-state lifecycle and slower large-history compaction results. See
+concurrency, bulk layer-major prompt append, and a concrete contiguous capacity
+comparison. The bulk path reserves the entire block-table extension before
+ownership changes, then copies across partial and complete pages without
+per-token Tensor packing. Benchmarks keep the faster steady-state lifecycle and
+slower large-history compaction results. See
 [`docs/KV_CACHE.md`](docs/KV_CACHE.md).
 
 The paged cache also exposes a move-only layer read lease that pins pool/table
@@ -240,7 +252,9 @@ mutating any request and reports blocks to release on finish, failure, or
 cancellation. Finished slots admit waiting work in the next iteration without a
 static-cohort barrier. Metrics aggregate successful request rate, token rate, wait,
 TTFT, request latency, and inter-token distributions at an explicit observation
-boundary. See
+boundary. A predictable final length-limited token consumes execution budget but
+does not reserve a K/V block because it is selected from existing logits and never
+fed back through the model. See
 [`docs/SCHEDULER.md`](docs/SCHEDULER.md).
 
 ## Minimal transformer runtime
@@ -284,10 +298,28 @@ cmake --build build --target helix_generate
   1 42 17
 ```
 
-The path is single-sequence, CPU Float32, and separate from the M15 scheduler; it
-is not yet a serving engine. Correctness and measured CPU decode baselines are in
+This CLI path remains single-sequence CPU Float32. The separate M19 engine below
+uses the same model semantics for multiple scheduled requests. Correctness and
+measured CPU decode baselines are in
 [`docs/MODEL_SUPPORT.md`](docs/MODEL_SUPPORT.md) and
 [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md).
+
+## CPU runtime engine
+
+`helix::runtime::CpuRuntimeEngine` owns one model, one FIFO scheduler, one global
+paged KV pool, and one session per live request. Each synchronous iteration reads
+actual free-block capacity, schedules a mixed batch, executes genuine prefill or
+cached-decode model work, reports ordered completions, and reclaims terminal K/V
+blocks before returning. Deterministic tests cover continuous refill, token/KV
+budgets, exact-boundary exhaustion, reuse, EOS, cancellation, and injected model
+failure.
+
+The default full-prompt path executes an admitted prompt in one causal model call
+and transactionally bulk-appends layer-major K/V. A retained sequential-token mode
+handles chunked prompts and provides the paired benchmark baseline. Work items are
+still executed serially on the CPU; this is a correctness engine, not fused GPU
+batch execution. Ownership, protocol, measurements, and limitations are in
+[`docs/RUNTIME.md`](docs/RUNTIME.md).
 
 ## Supported hardware
 
@@ -302,10 +334,12 @@ is not yet a serving engine. Correctness and measured CPU decode baselines are i
 The CUDA runtime, M4–M6/M9–M10 kernels, and M7–M8 CUDA allocator adapters are
 compile-validated only; physical GPU correctness, timing, and resource validation
 remain pending. KV caches, paged attention, and continuous batching are host-only;
-the scheduler is not yet integrated with physical KV reservation or model
-execution. Transformer execution currently supports CPU Float32 prefill and
-single-sequence contiguous-KV greedy decode; tokenization, batched generation,
-public checkpoint conversion, and CUDA model dispatch remain roadmap work. Tensor
+the CPU engine integrates the scheduler with physical paged-KV capacity and model
+execution, but scheduled work items run serially and no tensor batch is formed.
+Transformer execution currently supports CPU Float32 prefill, contiguous-KV
+single-sequence generation, and paged-KV multi-request orchestration; tokenization,
+public checkpoint conversion, GPU-resident paged KV, and CUDA model dispatch
+remain roadmap work. Tensor
 allocator integration is also pending. Float16 has no arithmetic path yet. Tensor
 execution is contiguous-only; broadcasting, slicing, and general strided kernels are intentionally
 deferred. CPU kernels are reference implementations, not optimized BLAS
@@ -320,6 +354,7 @@ replacements.
 - [Contiguous and paged attention design](docs/ATTENTION.md)
 - [KV-cache design and accounting](docs/KV_CACHE.md)
 - [Request and scheduler design](docs/SCHEDULER.md)
+- [CPU runtime execution engine](docs/RUNTIME.md)
 - [Model architecture and native weight format](docs/MODEL_SUPPORT.md)
 - [Caching allocator design and fragmentation](docs/MEMORY_ALLOCATOR.md)
 - [Performance methodology](docs/PERFORMANCE.md)

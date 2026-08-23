@@ -13,8 +13,9 @@ reduction, softmax, GEMM, transformer, and attention kernels, a caching allocato
 with fragmentation metrics and deferred stream-ordered reuse, contiguous and paged
 KV caches, direct block-table attention, and a deterministic continuous-batching
 scheduler. The current end-to-end path loads a checksummed native model format,
-runs a narrowly defined Float32 Llama-style model on CPU, and performs
-single-sequence greedy generation with transactional contiguous-KV prefill/decode.
+runs a narrowly defined Float32 Llama-style model on CPU, performs single-sequence
+greedy generation, and drives multiple scheduled requests through a shared paged
+KV pool with transactional prefill/decode/reclamation.
 CPU paths pass normal and sanitizer suites and have reproducible benchmarks. CUDA
 paths compile under CUDA 12.6, but I do not claim GPU correctness or performance
 because this development environment has no NVIDIA device.
@@ -203,7 +204,9 @@ waiting requests into those slots before surviving requests finish. Scheduler
 tests demonstrate `A B C D`, then after A finishes, `B C D E`. Token and logical
 KV-block budgets still constrain each batch. A synthetic constant-cost policy
 model shows the utilization effect but is explicitly not measured inference
-throughput.
+throughput. Separately, the M19 CPU engine test executes the replacement pattern
+with real model and paged-cache work; its benchmark measures serial CPU trace
+throughput without claiming GPU-style batched execution.
 
 ## How is prefill different from decode?
 
@@ -213,8 +216,11 @@ and reads a growing cached K/V history, so matrix shapes are much narrower and
 often memory/launch-latency sensitive. Helix's CPU generator runs full prompt
 prefill once, stores each layer's rotated keys and values, then computes only the
 new token position on decode. Deterministic tests compare successive cached logits
-and greedy tokens with full-prefix recomputation. The single-sequence generator is
-not yet connected to the scheduler's batched work descriptions.
+and greedy tokens with full-prefix recomputation. The M19 CPU engine additionally
+executes mixed scheduler work against per-request paged histories. Complete new
+prompts use full prefill plus bulk page append; chunked prompts use the retained
+one-token path. Work descriptions still execute serially, so this is continuous
+orchestration rather than a fused tensor batch.
 
 ## What limits inference throughput?
 
@@ -241,16 +247,18 @@ The current policy is safe non-admission. `PagedKvCache::append` fails
 transactionally when a new block is required and the pool is empty; an existing
 partially filled block remains writable. The scheduler accepts a free-block
 snapshot, keeps a FIFO head waiting when it cannot reserve the required delta, and
-does not pretend it owns physical blocks. Preemption and prefix eviction are not
-implemented.
+does not pretend it owns physical blocks. A final length-limited output needs no
+new K/V because it is sampled from existing logits, so it can retire and release
+an exactly full block even with zero free pages. The CPU engine tests that boundary
+and real block reuse. Preemption and prefix eviction are not implemented.
 
 ## What would break first at 10x workload?
 
 On the current CPU model, single-threaded reference GEMM would dominate quickly;
 prefill also carries an `O(T^2)` score workspace, while one-token decode still
-materializes a contiguous history-plus-tail pair per layer. In serving metadata,
-the scheduler retains terminal
-request history and several operations are linear scans. For KV, fixed pool
+materializes a contiguous history-plus-tail pair per layer. The engine executes
+scheduled work serially rather than forming tensor batches, and the scheduler
+retains terminal request history. For KV, fixed pool
 capacity becomes the admission boundary. On GPU, the answer requires profiling;
 likely constraints include KV capacity/bandwidth, GEMM efficiency, allocator/Tensor
 integration, and missing batched executor plumbing.
@@ -276,7 +284,8 @@ enable NCCL or claim multi-GPU support.
 Helix implements Tensor/storage metadata, CPU kernels, CUDA elementwise/reduction/
 softmax/GEMM/transformer/attention kernels, allocator metadata and deferred reuse,
 KV layouts, paged attention, requests, scheduling/metrics, the CPU transformer,
-cached generation session, greedy selection, and native file parser. It delegates
+cached generation session, paged multi-request CPU engine, greedy selection, and
+native file parser. It delegates
 CUDA driver/runtime operations to the CUDA Runtime API and testing/benchmark
 harnesses to GoogleTest/Google Benchmark.
 No PyTorch runtime, BLAS, cuBLAS, NCCL, or external model graph executes Helix
@@ -298,3 +307,11 @@ fixture kept that baseline and showed direct prefix copy reducing staging median
 by 45.4%–58.1% on the multi-token cases while preserving locking and stale-length
 checks. I do not quote those percentages as an end-to-end model speedup because
 the model benchmark contains much more work.
+
+M19 used the same paired approach at the orchestration boundary. The retained
+baseline evaluated every prompt token through one-token paged decode; the default
+executes a complete new prompt once and bulk-appends its layer-major K/V. Across
+the three disclosed tiny CPU traces this reduced median end-to-end trace time by
+15.8%–51.3%. The gain narrowed as decode dominated, which is more informative than
+presenting one favorable small case. Construction, submission, and final reporting
+were excluded; scheduler, model, cache, completion, and reclamation were timed.

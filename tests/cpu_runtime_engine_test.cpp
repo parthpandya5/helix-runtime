@@ -260,6 +260,60 @@ TEST(CpuRuntimeEngineTest, AppliesEosAndCancellationWithCompleteKvReclamation) {
   EXPECT_EQ(stats.kv_cache.free_blocks, stats.kv_cache.total_blocks);
 }
 
+TEST(CpuRuntimeEngineTest, SustainsMixedRequestsUnderKvPressureWithoutLeaks) {
+  constexpr std::size_t kRequestCount = 32;
+  const model::LlamaConfig model_config = runtime_model_config();
+  model::CpuLlamaModel reference = make_model(model_config);
+  CpuRuntimeEngine engine(make_model(model_config),
+                          CpuRuntimeConfig{scheduler::SchedulerConfig{8, 4, 2}, 8});
+
+  std::vector<std::vector<std::uint32_t>> expected;
+  expected.reserve(kRequestCount);
+  for (std::size_t index = 0; index < kRequestCount; ++index) {
+    const std::size_t prompt_length = 1 + index % 3;
+    const std::size_t output_length = 1 + index % 4;
+    std::vector<std::uint32_t> prompt;
+    prompt.reserve(prompt_length);
+    for (std::size_t position = 0; position < prompt_length; ++position) {
+      prompt.push_back(
+          static_cast<std::uint32_t>((index * 3 + position * 5) % model_config.vocabulary_size));
+    }
+    expected.push_back(full_recompute_greedy(reference, prompt, output_length));
+    engine.submit(make_request(100 + index, std::move(prompt), output_length));
+  }
+
+  bool observed_kv_pressure = false;
+  std::size_t iterations = 0;
+  for (; iterations < 256 && engine.has_live_requests(); ++iterations) {
+    const CpuRuntimeIterationResult result =
+        engine.run_iteration(kStart + std::chrono::milliseconds(iterations));
+    ASSERT_TRUE(result.iteration_id.has_value()) << "runtime made no progress at " << iterations;
+    observed_kv_pressure = observed_kv_pressure || result.kv_capacity_limited;
+  }
+
+  EXPECT_FALSE(engine.has_live_requests());
+  EXPECT_LT(iterations, 256U);
+  EXPECT_TRUE(observed_kv_pressure);
+  for (std::size_t index = 0; index < kRequestCount; ++index) {
+    const scheduler::Request& completed = engine.request(scheduler::RequestId{100 + index});
+    EXPECT_EQ(completed.state(), scheduler::RequestState::kFinished) << "request " << index;
+    EXPECT_EQ(completed.finish_reason(), scheduler::FinishReason::kLength) << "request " << index;
+    EXPECT_EQ(generated_values(completed), expected[index]) << "request " << index;
+  }
+
+  const CpuRuntimeStats stats = engine.stats();
+  EXPECT_EQ(stats.scheduler.submitted_count, kRequestCount);
+  EXPECT_EQ(stats.scheduler.finished_count, kRequestCount);
+  EXPECT_EQ(stats.scheduler.cancelled_count, 0U);
+  EXPECT_EQ(stats.scheduler.failed_count, 0U);
+  EXPECT_EQ(stats.active_session_count, 0U);
+  EXPECT_EQ(stats.kv_cache.active_sequence_count, 0U);
+  EXPECT_EQ(stats.kv_cache.active_tokens, 0U);
+  EXPECT_EQ(stats.kv_cache.used_blocks, 0U);
+  EXPECT_EQ(stats.kv_cache.free_blocks, stats.kv_cache.total_blocks);
+  EXPECT_GT(stats.kv_cache.block_reuse_count, 0U);
+}
+
 TEST(CpuRuntimeEngineTest, RejectsInvalidSubmissionsWithoutLeakingSessions) {
   const model::LlamaConfig model_config = runtime_model_config(6);
   EXPECT_THROW(

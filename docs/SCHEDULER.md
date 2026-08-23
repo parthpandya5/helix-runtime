@@ -2,12 +2,12 @@
 
 ## Status
 
-Milestones 14–16 are implemented: the host-only request state machine feeds a
-single-thread-owned FIFO/token/KV-budget scheduler, finished slots are refilled
-between iterations, and deterministic metric aggregation exposes lifecycle
-distributions and rates. Normal, ASan/UBSan, and CUDA-enabled host suites pass
-118/118 tests. The CUDA build also registers 57 GPU tests, but this scheduler is
-host policy and requires no GPU.
+Milestones 14–16 are implemented and integrated by the M19 CPU engine: the
+host-only request state machine feeds a single-thread-owned FIFO/token/KV-budget
+scheduler, finished slots are refilled between iterations, and deterministic
+metric aggregation exposes lifecycle distributions and rates. Normal, Release,
+and ASan/UBSan suites pass 148/148 tests. The CUDA build passes the same host tests
+and registers 57 GPU tests, but this scheduler is host policy and requires no GPU.
 
 ## Ownership and thread safety
 
@@ -22,7 +22,8 @@ addresses permit read-only request inspection while queue containers change. A
 FIFO deque contains waiting IDs and a bounded vector contains running IDs. Terminal
 requests leave both containers but remain queryable in the ownership map, so IDs
 cannot be reused accidentally. Retaining all terminal history is simple and useful
-for metrics, but an engine will eventually need an explicit reap/archive policy.
+for metrics; the current engine releases terminal model sessions immediately but
+does not yet reap/archive the retained logical request records.
 
 `RequestId` is a strong 64-bit type with zero reserved as invalid. `TokenId` is a
 separate strong 32-bit type; token zero is valid. This prevents a token, count, or
@@ -154,12 +155,23 @@ sum. The runtime must reserve that exact amount before launching work. Completio
 failure, cancellation, and zero-generation retirement return exact release counts
 for the runtime to reclaim.
 
-Block demand is computed as `ceil((prompt_processed + generated) / block_tokens)`.
+For prefill and nonfinal decode, block demand is computed as
+`ceil((prompt_processed + generated) / block_tokens)`.
 Consequently, a request may append into slack in its last block even when the free
 pool is empty. If the FIFO head cannot append one token, scheduling returns a
 partial batch or no batch with `kv_capacity_limited=true`; it does not fail or
-silently skip the request. The future engine integration must treat schedule,
-physical reservation, execution, completion, and release as one checked protocol.
+silently skip the request. One exception is predictable: when exactly one
+length-limited generation token remains, its K/V will never be consumed by a later
+step, so decode consumes one token of execution budget but reports zero new block
+demand. This prevents deadlock when the current prefix ends exactly at a full block
+and the pool has no free page. EOS is not predictable before execution and remains
+conservatively capacity-reserved.
+
+`CpuRuntimeEngine` supplies the physical paged cache's actual free-block snapshot,
+checks each sequence length against the scheduled token offset, applies successful
+appends, completes the ordered batch, and then releases every terminal sequence.
+The scheduler's reported release count remains an audit value; the cache manager is
+the physical ownership authority.
 
 ## Transactional completion
 
@@ -170,10 +182,11 @@ strings and generated-token vector capacity before mutation. Once mutation start
 the remaining state transitions and vector insertions are nonallocating. A malformed
 later completion therefore cannot leave an earlier request partially progressed.
 
-Eleven scheduler tests cover configuration, mixed prefill/decode batches, token and
+Twelve scheduler tests cover configuration, mixed prefill/decode batches, token and
 running limits, KV exhaustion and partial-block slack, malformed whole-vector
-completion, failure/release accounting, cancellation, time validation, lookup,
-statistics, and next-iteration replacement. Three additional metrics tests cover
+completion, exact-boundary final decode, failure/release accounting, cancellation,
+time validation, lookup, statistics, and next-iteration replacement. Three
+additional metrics tests cover
 exact distributions/rates, active states, empty samples, invalid IDs/duplicates,
 and time regression. Together with the ten request tests, these paths pass in
 normal and sanitized builds.
@@ -192,9 +205,10 @@ iteration 3 mixed:     B C D E     (E begins prefill)
 ```
 
 The batch may therefore contain one-token decode work and prompt ranges together.
-The eventual executor may partition those work kinds internally, but it must
-preserve the one-batch completion contract. A deterministic test checks the exact
-membership/order above and confirms that E enters while B/C/D are still decoding.
+The M19 CPU executor processes those work descriptions serially while preserving
+the one-batch completion contract. A deterministic policy test checks the exact
+membership/order above, and a separate real-model engine test confirms that a new
+request enters while an earlier request continues paged decode.
 
 ## M15 host-policy benchmark
 
@@ -222,6 +236,7 @@ optimization is claimed. Full distributions and caveats are in
 
 The baseline is strict FIFO with no priorities, aging, preemption, prefix sharing,
 or fairness tuning between long prefill and decode. Terminal request history is
-retained indefinitely. The scheduler predicts KV-block deltas but is not yet wired
-to the physical paged-cache authority or a model executor. Consequently M16 proves
-host admission/replacement semantics, not end-to-end continuous inference.
+retained indefinitely. The scheduler is wired to the physical CPU paged-cache
+authority and real model executor, but work descriptions execute serially rather
+than as a tensor batch. M16's synthetic policy rates remain policy evidence; M19's
+separate benchmark is the measured CPU execution trace.
