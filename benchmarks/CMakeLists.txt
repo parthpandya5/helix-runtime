@@ -4,6 +4,7 @@ add_executable(helix_benchmarks
   core_benchmarks.cpp
   cpu_kernel_benchmarks.cpp
   kv_cache_benchmarks.cpp
+  model_benchmarks.cpp
   paged_attention_benchmarks.cpp
   scheduler_benchmarks.cpp
   tensor_benchmarks.cpp)
@@ -14,6 +15,7 @@ target_link_libraries(
     helix::cpu_kernels
     helix::kv_cache
     helix::memory
+    helix::model
     helix::scheduler
     benchmark::benchmark_main)
 if(HELIX_ENABLE_CUDA)
@@ -47,3 +49,13 @@ add_test(
 set_tests_properties(
   benchmark.scheduler_smoke
   PROPERTIES LABELS "benchmark;scheduler;smoke" TIMEOUT 30)
+
+add_test(
+  NAME benchmark.model_smoke
+  COMMAND helix_benchmarks
+          "--benchmark_filter=BM_CpuLlamaFullPrefill/32/64/2/4/7/128$"
+          --benchmark_min_time=0.001
+          --benchmark_repetitions=1)
+set_tests_properties(
+  benchmark.model_smoke
+  PROPERTIES LABELS "benchmark;model;smoke" TIMEOUT 30)

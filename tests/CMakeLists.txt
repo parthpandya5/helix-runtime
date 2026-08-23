@@ -96,6 +96,24 @@ gtest_discover_tests(
   TEST_PREFIX "scheduler_metrics."
   DISCOVERY_MODE PRE_TEST)
 
+add_executable(helix_llama_model_tests llama_model_test.cpp)
+target_link_libraries(helix_llama_model_tests PRIVATE helix::model GTest::gtest_main)
+helix_configure_target(helix_llama_model_tests)
+
+gtest_discover_tests(
+  helix_llama_model_tests
+  TEST_PREFIX "llama_model."
+  DISCOVERY_MODE PRE_TEST)
+
+add_executable(helix_model_format_tests model_format_test.cpp)
+target_link_libraries(helix_model_format_tests PRIVATE helix::model GTest::gtest_main)
+helix_configure_target(helix_model_format_tests)
+
+gtest_discover_tests(
+  helix_model_format_tests
+  TEST_PREFIX "model_format."
+  DISCOVERY_MODE PRE_TEST)
+
 add_executable(helix_memory_tests memory_allocator_test.cpp)
 target_link_libraries(helix_memory_tests PRIVATE helix::memory GTest::gtest_main)
 helix_configure_target(helix_memory_tests)
