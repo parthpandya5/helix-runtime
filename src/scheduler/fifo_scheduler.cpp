@@ -452,6 +452,10 @@ bool FifoScheduler::contains(RequestId request_id) const noexcept {
   return requests_.contains(request_id);
 }
 
+bool FifoScheduler::has_live_requests() const noexcept {
+  return !waiting_.empty() || !running_.empty();
+}
+
 Request& FifoScheduler::mutable_request(RequestId request_id) {
   const auto position = requests_.find(request_id);
   HELIX_CHECK(position != requests_.end(), ErrorCode::kOutOfRange,

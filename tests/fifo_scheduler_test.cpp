@@ -294,6 +294,7 @@ TEST(FifoSchedulerTest, StatisticsSeparateLiveQueuesAndTerminalHistory) {
   FifoScheduler scheduler(SchedulerConfig{4, 2, 4});
   scheduler.submit(make_request(70, 1, 0));
   scheduler.submit(make_request(71, 1, 1));
+  EXPECT_TRUE(scheduler.has_live_requests());
   EXPECT_EQ(scheduler.stats().submitted_count, 2U);
   EXPECT_EQ(scheduler.stats().waiting_count, 2U);
 
@@ -316,6 +317,7 @@ TEST(FifoSchedulerTest, StatisticsSeparateLiveQueuesAndTerminalHistory) {
   EXPECT_EQ(stats.completed_iteration_count, 1U);
   EXPECT_EQ(stats.scheduled_prefill_tokens, 2U);
   EXPECT_EQ(stats.scheduled_decode_tokens, 0U);
+  EXPECT_FALSE(scheduler.has_live_requests());
 
   const SchedulerMetrics metrics = scheduler.metrics(kStart + 2ms);
   EXPECT_EQ(metrics.finished_count, 1U);

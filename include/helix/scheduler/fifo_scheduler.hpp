@@ -139,6 +139,7 @@ public:
                                     std::string context);
 
   [[nodiscard]] bool contains(RequestId request_id) const noexcept;
+  [[nodiscard]] bool has_live_requests() const noexcept;
   [[nodiscard]] const Request& request(RequestId request_id) const;
   [[nodiscard]] std::span<const RequestId> running_requests() const noexcept;
   [[nodiscard]] std::vector<RequestId> waiting_requests() const;

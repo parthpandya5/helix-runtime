@@ -289,9 +289,8 @@ bool CpuRuntimeEngine::contains(scheduler::RequestId request_id) const noexcept 
   return impl_->scheduler.contains(request_id);
 }
 
-bool CpuRuntimeEngine::has_live_requests() const {
-  const scheduler::SchedulerStats scheduler_stats = impl_->scheduler.stats();
-  return scheduler_stats.waiting_count != 0 || scheduler_stats.running_count != 0;
+bool CpuRuntimeEngine::has_live_requests() const noexcept {
+  return impl_->scheduler.has_live_requests();
 }
 
 const scheduler::Request& CpuRuntimeEngine::request(scheduler::RequestId request_id) const {

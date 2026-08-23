@@ -101,9 +101,10 @@ std::unique_ptr<CpuRuntimeEngine> make_engine(const RuntimeTraceConfig& config) 
   return engine;
 }
 
-CpuRuntimeStats execute_trace(CpuRuntimeEngine& engine) {
+std::uint64_t execute_trace(CpuRuntimeEngine& engine) {
   constexpr std::size_t kIterationLimit = 1'000'000;
   scheduler::RequestTimePoint now{};
+  std::uint64_t executed_iterations = 0;
   for (std::size_t iteration = 0; engine.has_live_requests(); ++iteration) {
     if (iteration == kIterationLimit) {
       throw std::runtime_error("CPU runtime benchmark trace exceeded its progress limit");
@@ -113,8 +114,9 @@ CpuRuntimeStats execute_trace(CpuRuntimeEngine& engine) {
       throw std::runtime_error("CPU runtime benchmark trace made no progress");
     }
     now += std::chrono::microseconds(1);
+    ++executed_iterations;
   }
-  return engine.stats();
+  return executed_iterations;
 }
 
 std::size_t tokens_per_trace(const RuntimeTraceConfig& config) {
@@ -135,23 +137,23 @@ void BM_CpuRuntimeContinuousTrace(benchmark::State& state, CpuPrefillMode prefil
     state.PauseTiming();
     if (!warmed_up) {
       std::unique_ptr<CpuRuntimeEngine> warmup = make_engine(config);
-      const CpuRuntimeStats warmup_stats = execute_trace(*warmup);
-      std::uint64_t warmup_iterations = warmup_stats.executed_iteration_count;
+      std::uint64_t warmup_iterations = execute_trace(*warmup);
       benchmark::DoNotOptimize(warmup_iterations);
       warmed_up = true;
     }
     std::unique_ptr<CpuRuntimeEngine> engine = make_engine(config);
     state.ResumeTiming();
 
-    const CpuRuntimeStats stats = execute_trace(*engine);
+    const std::uint64_t trace_iterations = execute_trace(*engine);
 
     state.PauseTiming();
+    const CpuRuntimeStats stats = engine->stats();
     if (stats.scheduler.finished_count != config.request_count ||
         stats.scheduler.failed_count != 0 || stats.active_session_count != 0 ||
         stats.kv_cache.used_blocks != 0) {
       state.SkipWithError("CPU runtime trace ended with inconsistent ownership or request state");
     }
-    total_runtime_iterations += stats.executed_iteration_count;
+    total_runtime_iterations += trace_iterations;
     peak_kv_bytes = stats.kv_cache.peak_bytes_used;
     engine.reset();
     state.ResumeTiming();

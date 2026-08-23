@@ -70,7 +70,7 @@ public:
                                                  std::string context = "cancelled by caller");
 
   [[nodiscard]] bool contains(scheduler::RequestId request_id) const noexcept;
-  [[nodiscard]] bool has_live_requests() const;
+  [[nodiscard]] bool has_live_requests() const noexcept;
   [[nodiscard]] const scheduler::Request& request(scheduler::RequestId request_id) const;
   [[nodiscard]] scheduler::SchedulerMetrics metrics(scheduler::RequestTimePoint observed_at) const;
   [[nodiscard]] CpuRuntimeStats stats() const;
