@@ -1,11 +1,16 @@
 #include "helix/kv_cache/contiguous.hpp"
 #include "helix/kv_cache/paged.hpp"
+#include "helix/kv_cache/prefix.hpp"
 
 #include <algorithm>
+#include <array>
 #include <benchmark/benchmark.h>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <memory>
+#include <span>
+#include <stdexcept>
 #include <utility>
 #include <vector>
 
@@ -297,6 +302,122 @@ void BM_PagedKvPrefixForkLifecycle(benchmark::State& state, bool share_blocks) {
                           static_cast<benchmark::IterationCount>(prefix_tokens));
 }
 
+constexpr std::size_t kIndexedPrefixTokens = 8;
+constexpr std::size_t kIndexedBlockTokens = 4;
+const PrefixNamespaceId kBenchmarkNamespace(91);
+
+void append_benchmark_prefix(PagedKvCache& cache, const PagedSequenceHandle& sequence,
+                             std::span<const std::uint32_t> tokens) {
+  std::vector<float> key_values(tokens.size());
+  std::vector<float> value_values(tokens.size());
+  for (std::size_t token = 0; token < tokens.size(); ++token) {
+    key_values[token] = static_cast<float>(tokens[token]);
+    value_values[token] = static_cast<float>(tokens[token]) + 1'000.0F;
+  }
+  const Shape shape{1, static_cast<Dimension>(tokens.size()), 1};
+  const std::array<Tensor, 1> keys{Tensor::from_values(shape, key_values)};
+  const std::array<Tensor, 1> values{Tensor::from_values(shape, value_values)};
+  cache.append_layer_major(sequence, keys, values);
+}
+
+struct PrefixIndexFixture {
+  std::shared_ptr<PagedKvCache> cache;
+  std::unique_ptr<PagedPrefixCache> prefixes;
+  std::vector<std::uint32_t> hit_query;
+  std::vector<std::uint32_t> miss_query;
+};
+
+PrefixIndexFixture make_prefix_index_fixture(std::size_t entry_count) {
+  const std::size_t blocks_per_entry = kIndexedPrefixTokens / kIndexedBlockTokens;
+  auto cache = std::make_shared<PagedKvCache>(
+      PagedKvCacheConfig{1, 1, 1, kIndexedBlockTokens, entry_count * blocks_per_entry});
+  auto prefixes = std::make_unique<PagedPrefixCache>(
+      cache, PagedPrefixCacheConfig{entry_count, entry_count * blocks_per_entry});
+  std::vector<std::uint32_t> hit_query;
+  for (std::size_t entry = 0; entry < entry_count; ++entry) {
+    std::vector<std::uint32_t> tokens(kIndexedPrefixTokens);
+    tokens.front() = static_cast<std::uint32_t>(entry + 1);
+    for (std::size_t token = 1; token < tokens.size(); ++token) {
+      tokens[token] = static_cast<std::uint32_t>(10'000 + token);
+    }
+    const PagedSequenceHandle source = cache->create_sequence();
+    append_benchmark_prefix(*cache, source, tokens);
+    const PrefixInsertStatus status = prefixes->insert(kBenchmarkNamespace, tokens, source);
+    if (status != PrefixInsertStatus::kInserted) {
+      throw std::runtime_error("prefix benchmark fixture could not insert a unique entry");
+    }
+    cache->release_sequence(source);
+    if (entry == 0) {
+      hit_query = tokens;
+    }
+  }
+  std::vector<std::uint32_t> miss_query = hit_query;
+  miss_query.front() = std::numeric_limits<std::uint32_t>::max();
+  return PrefixIndexFixture{std::move(cache), std::move(prefixes), std::move(hit_query),
+                            std::move(miss_query)};
+}
+
+void BM_PagedPrefixDirectForkLifecycle(benchmark::State& state) {
+  auto cache = std::make_shared<PagedKvCache>(PagedKvCacheConfig{1, 1, 1, 4, 2});
+  const PagedSequenceHandle source = cache->create_sequence();
+  const std::array<std::uint32_t, kIndexedPrefixTokens> tokens{1,      10'001, 10'002, 10'003,
+                                                               10'004, 10'005, 10'006, 10'007};
+  append_benchmark_prefix(*cache, source, tokens);
+  const PagedSequenceHandle warmup = cache->fork_sequence(source, tokens.size());
+  cache->release_sequence(warmup);
+
+  for ([[maybe_unused]] auto iteration : state) {
+    PagedSequenceHandle fork = cache->fork_sequence(source, tokens.size());
+    benchmark::DoNotOptimize(fork);
+    cache->release_sequence(fork);
+  }
+
+  state.counters["index_entries"] = 0.0;
+  state.counters["prefix_blocks"] = 2.0;
+  state.counters["prefix_tokens"] = static_cast<double>(tokens.size());
+}
+
+void BM_PagedPrefixCacheHotHitLifecycle(benchmark::State& state) {
+  const auto entry_count = static_cast<std::size_t>(state.range(0));
+  PrefixIndexFixture fixture = make_prefix_index_fixture(entry_count);
+  const auto warmup = fixture.prefixes->lookup_longest(kBenchmarkNamespace, fixture.hit_query);
+  if (!warmup.has_value()) {
+    state.SkipWithError("prefix benchmark warmup unexpectedly missed");
+    return;
+  }
+  fixture.cache->release_sequence(warmup->sequence);
+
+  for ([[maybe_unused]] auto iteration : state) {
+    auto match = fixture.prefixes->lookup_longest(kBenchmarkNamespace, fixture.hit_query);
+    benchmark::DoNotOptimize(match);
+    if (!match.has_value()) {
+      state.SkipWithError("prefix benchmark lookup unexpectedly missed");
+      break;
+    }
+    fixture.cache->release_sequence(match->sequence);
+  }
+
+  state.counters["index_entries"] = static_cast<double>(entry_count);
+  state.counters["prefix_blocks"] = 2.0;
+  state.counters["prefix_tokens"] = static_cast<double>(kIndexedPrefixTokens);
+}
+
+void BM_PagedPrefixCacheMiss(benchmark::State& state) {
+  const auto entry_count = static_cast<std::size_t>(state.range(0));
+  PrefixIndexFixture fixture = make_prefix_index_fixture(entry_count);
+  benchmark::DoNotOptimize(
+      fixture.prefixes->lookup_longest(kBenchmarkNamespace, fixture.miss_query));
+
+  for ([[maybe_unused]] auto iteration : state) {
+    auto match = fixture.prefixes->lookup_longest(kBenchmarkNamespace, fixture.miss_query);
+    benchmark::DoNotOptimize(match);
+  }
+
+  state.counters["index_entries"] = static_cast<double>(entry_count);
+  state.counters["prefix_blocks"] = 2.0;
+  state.counters["prefix_tokens"] = static_cast<double>(kIndexedPrefixTokens);
+}
+
 BENCHMARK(BM_ContiguousKvLifecycle)
     ->Args({2, 2, 64, 128, 128})
     ->Args({4, 8, 64, 512, 32})
@@ -340,6 +461,24 @@ BENCHMARK_CAPTURE(BM_PagedKvPrefixForkLifecycle, SharedBlocks, true)
     ->Args({3, 3, 37, 7, 35})
     ->Args({4, 4, 64, 16, 128})
     ->ArgNames({"layers", "heads", "head_dimension", "block_tokens", "prefix_tokens"});
+
+BENCHMARK(BM_PagedPrefixDirectForkLifecycle);
+
+BENCHMARK(BM_PagedPrefixCacheHotHitLifecycle)
+    ->Arg(1)
+    ->Arg(16)
+    ->Arg(64)
+    ->Arg(256)
+    ->Arg(1'024)
+    ->ArgName("entries");
+
+BENCHMARK(BM_PagedPrefixCacheMiss)
+    ->Arg(1)
+    ->Arg(16)
+    ->Arg(64)
+    ->Arg(256)
+    ->Arg(1'024)
+    ->ArgName("entries");
 
 } // namespace
 } // namespace helix::kv_cache

@@ -91,3 +91,13 @@ add_test(
 set_tests_properties(
   benchmark.kv_prefix_smoke
   PROPERTIES LABELS "benchmark;kv_cache;smoke" TIMEOUT 30)
+
+add_test(
+  NAME benchmark.kv_prefix_index_smoke
+  COMMAND helix_benchmarks
+          "--benchmark_filter=BM_PagedPrefixCacheHotHitLifecycle/entries:16$"
+          --benchmark_min_time=0.001s
+          --benchmark_repetitions=1)
+set_tests_properties(
+  benchmark.kv_prefix_index_smoke
+  PROPERTIES LABELS "benchmark;kv_cache;smoke" TIMEOUT 30)
