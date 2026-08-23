@@ -83,6 +83,16 @@ set_tests_properties(
   PROPERTIES LABELS "benchmark;runtime;smoke" TIMEOUT 30)
 
 add_test(
+  NAME benchmark.runtime_prefix_reuse_smoke
+  COMMAND helix_benchmarks
+          "--benchmark_filter=BM_CpuRuntimeHotPrefixReuseTrace/Enabled/hidden:16/intermediate:32/layers:1/heads:4/requests:16/prompt:8$"
+          --benchmark_min_time=1x
+          --benchmark_repetitions=1)
+set_tests_properties(
+  benchmark.runtime_prefix_reuse_smoke
+  PROPERTIES LABELS "benchmark;runtime;smoke" TIMEOUT 30)
+
+add_test(
   NAME benchmark.kv_prefix_smoke
   COMMAND helix_benchmarks
           "--benchmark_filter=BM_PagedKvPrefixForkLifecycle/SharedBlocks/layers:2/heads:2/head_dimension:32/block_tokens:8/prefix_tokens:32$"

@@ -119,6 +119,23 @@ std::uint64_t execute_trace(CpuRuntimeEngine& engine) {
   return executed_iterations;
 }
 
+std::uint64_t execute_until_idle(CpuRuntimeEngine& engine, scheduler::RequestTimePoint& now) {
+  constexpr std::size_t kIterationLimit = 1'000'000;
+  std::uint64_t executed_iterations = 0;
+  for (std::size_t iteration = 0; engine.has_live_requests(); ++iteration) {
+    if (iteration == kIterationLimit) {
+      throw std::runtime_error("CPU runtime prefix benchmark exceeded its progress limit");
+    }
+    const CpuRuntimeIterationResult result = engine.run_iteration(now);
+    if (!result.iteration_id.has_value()) {
+      throw std::runtime_error("CPU runtime prefix benchmark made no progress");
+    }
+    now += std::chrono::microseconds(1);
+    ++executed_iterations;
+  }
+  return executed_iterations;
+}
+
 std::size_t tokens_per_trace(const RuntimeTraceConfig& config) {
   std::size_t tokens = 0;
   for (std::size_t request = 0; request < config.request_count; ++request) {
@@ -181,6 +198,114 @@ void BM_CpuRuntimePagedDecodeTrace(benchmark::State& state,
   run_runtime_trace_benchmark(state, CpuPrefillMode::kFullPrompt, paged_decode_mode);
 }
 
+RuntimeTraceConfig prefix_trace_config(const benchmark::State& state, bool enable_prefix_cache) {
+  constexpr std::size_t kVocabularySize = 128;
+  constexpr std::size_t kBlockTokens = 4;
+  constexpr std::size_t kOutputTokens = 1;
+  const auto hidden = static_cast<std::size_t>(state.range(0));
+  const auto intermediate = static_cast<std::size_t>(state.range(1));
+  const auto layers = static_cast<std::size_t>(state.range(2));
+  const auto heads = static_cast<std::size_t>(state.range(3));
+  const auto request_count = static_cast<std::size_t>(state.range(4));
+  const auto prompt_tokens = static_cast<std::size_t>(state.range(5));
+  const std::size_t physical_blocks = blocks_for_tokens(prompt_tokens, kBlockTokens);
+  CpuRuntimeConfig runtime{scheduler::SchedulerConfig{prompt_tokens, 1, kBlockTokens},
+                           physical_blocks};
+  if (enable_prefix_cache) {
+    runtime.prefix_cache = kv_cache::PagedPrefixCacheConfig{1, (prompt_tokens - 1) / kBlockTokens};
+  }
+  return RuntimeTraceConfig{model::LlamaConfig{kVocabularySize, hidden, intermediate, layers, heads,
+                                               prompt_tokens + kOutputTokens, 1.0e-5F, 10'000.0F},
+                            runtime, request_count, prompt_tokens, kOutputTokens};
+}
+
+std::vector<scheduler::TokenId> make_shared_prefix_prompt(const RuntimeTraceConfig& config,
+                                                          std::size_t request_index) {
+  const std::size_t block_tokens = config.runtime.scheduler.kv_block_tokens;
+  const std::size_t shared_tokens = (config.prompt_tokens - 1) / block_tokens * block_tokens;
+  std::vector<scheduler::TokenId> prompt;
+  prompt.reserve(config.prompt_tokens);
+  for (std::size_t token = 0; token < config.prompt_tokens; ++token) {
+    const std::size_t content =
+        token < shared_tokens ? token * 13 + 5 : request_index * 29 + token * 17 + 7;
+    prompt.emplace_back(static_cast<std::uint32_t>(content % config.model.vocabulary_size));
+  }
+  return prompt;
+}
+
+std::uint64_t execute_prefix_request(CpuRuntimeEngine& engine, const RuntimeTraceConfig& config,
+                                     std::size_t request_index, scheduler::RequestTimePoint& now) {
+  engine.submit(scheduler::Request(scheduler::RequestId{request_index + 1},
+                                   make_shared_prefix_prompt(config, request_index),
+                                   config.long_output_tokens, now));
+  return execute_until_idle(engine, now);
+}
+
+void BM_CpuRuntimeHotPrefixReuseTrace(benchmark::State& state, bool enable_prefix_cache) {
+  const RuntimeTraceConfig config = prefix_trace_config(state, enable_prefix_cache);
+  const std::size_t block_tokens = config.runtime.scheduler.kv_block_tokens;
+  const std::size_t shared_tokens = (config.prompt_tokens - 1) / block_tokens * block_tokens;
+  std::uint64_t total_runtime_iterations = 0;
+  std::uint64_t total_executed_prefill_tokens = 0;
+  std::uint64_t total_reused_prefill_tokens = 0;
+  std::size_t peak_kv_bytes = 0;
+
+  for ([[maybe_unused]] const auto iteration : state) {
+    state.PauseTiming();
+    auto engine = std::make_unique<CpuRuntimeEngine>(
+        model::CpuLlamaModel(config.model, benchmark_weights(config.model)), config.runtime);
+    scheduler::RequestTimePoint now{};
+    static_cast<void>(execute_prefix_request(*engine, config, 0, now));
+    state.ResumeTiming();
+
+    std::uint64_t measured_iterations = 0;
+    for (std::size_t request = 0; request < config.request_count; ++request) {
+      measured_iterations += execute_prefix_request(*engine, config, request + 1, now);
+    }
+
+    state.PauseTiming();
+    const CpuRuntimeStats stats = engine->stats();
+    const std::size_t expected_retained_blocks =
+        enable_prefix_cache ? shared_tokens / block_tokens : 0;
+    const std::size_t expected_active_sequences = enable_prefix_cache ? 1 : 0;
+    bool prefix_stats_consistent = !stats.prefix_cache.has_value();
+    if (enable_prefix_cache && stats.prefix_cache.has_value()) {
+      prefix_stats_consistent = stats.prefix_cache->entry_count == 1 &&
+                                stats.prefix_cache->hit_count == config.request_count &&
+                                stats.prefix_cache->miss_count == 1;
+    }
+    if (stats.scheduler.finished_count != config.request_count + 1 ||
+        stats.scheduler.failed_count != 0 || stats.active_session_count != 0 ||
+        stats.kv_cache.active_sequence_count != expected_active_sequences ||
+        stats.kv_cache.used_blocks != expected_retained_blocks || !prefix_stats_consistent) {
+      state.SkipWithError(
+          "CPU runtime prefix trace ended with inconsistent ownership, cache, or request state");
+    }
+    total_runtime_iterations += measured_iterations;
+    total_executed_prefill_tokens +=
+        stats.scheduler.scheduled_prefill_tokens - config.prompt_tokens;
+    total_reused_prefill_tokens += stats.scheduler.reused_prefill_tokens;
+    peak_kv_bytes = stats.kv_cache.peak_bytes_used;
+    engine.reset();
+    state.ResumeTiming();
+  }
+
+  const double iterations = static_cast<double>(state.iterations());
+  state.counters["runtime_iterations"] = static_cast<double>(total_runtime_iterations) / iterations;
+  state.counters["executed_prefill_tokens"] =
+      static_cast<double>(total_executed_prefill_tokens) / iterations;
+  state.counters["reused_prefill_tokens"] =
+      static_cast<double>(total_reused_prefill_tokens) / iterations;
+  state.counters["peak_kv_bytes"] = static_cast<double>(peak_kv_bytes);
+  const benchmark::IterationCount measured_requests =
+      state.iterations() * static_cast<benchmark::IterationCount>(config.request_count);
+  const benchmark::IterationCount logical_tokens =
+      measured_requests * static_cast<benchmark::IterationCount>(config.prompt_tokens + 1);
+  state.counters["requests_per_second"] =
+      benchmark::Counter(static_cast<double>(measured_requests), benchmark::Counter::kIsRate);
+  state.SetItemsProcessed(logical_tokens);
+}
+
 BENCHMARK_CAPTURE(BM_CpuRuntimeContinuousTrace, SequentialTokenPrefill,
                   CpuPrefillMode::kSequentialDecode)
     ->Args({16, 32, 1, 4, 8, 4, 4, 4})
@@ -208,6 +333,17 @@ BENCHMARK_CAPTURE(BM_CpuRuntimePagedDecodeTrace, DirectBlockTable,
     ->Args({64, 128, 2, 4, 16, 8, 8, 8})
     ->ArgNames({"hidden", "intermediate", "layers", "heads", "requests", "prompt", "output",
                 "active"});
+
+BENCHMARK_CAPTURE(BM_CpuRuntimeHotPrefixReuseTrace, Disabled, false)
+    ->Args({16, 32, 1, 4, 16, 8})
+    ->Args({32, 64, 2, 4, 16, 16})
+    ->Args({64, 128, 2, 4, 16, 32})
+    ->ArgNames({"hidden", "intermediate", "layers", "heads", "requests", "prompt"});
+BENCHMARK_CAPTURE(BM_CpuRuntimeHotPrefixReuseTrace, Enabled, true)
+    ->Args({16, 32, 1, 4, 16, 8})
+    ->Args({32, 64, 2, 4, 16, 16})
+    ->Args({64, 128, 2, 4, 16, 32})
+    ->ArgNames({"hidden", "intermediate", "layers", "heads", "requests", "prompt"});
 
 } // namespace
 } // namespace helix::runtime
