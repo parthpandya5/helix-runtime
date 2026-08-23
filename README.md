@@ -30,7 +30,7 @@ final normalization, and an untied LM head, loads a checksummed versioned native
 weight format, performs greedy generation through a contiguous KV cache, and
 executes scheduler batches against a shared paged KV pool. On
 2026-08-23, Apple Clang 17 built the project on macOS arm64 with warnings as
-errors; 148/148 CPU tests passed in Debug, Release, and ASan/UBSan configurations.
+errors; 152/152 CPU tests passed in Debug, Release, and ASan/UBSan configurations.
 
 CUDA is optional at configure time. The current Apple Silicon development host has
 no NVIDIA GPU or native CUDA toolkit, so no CUDA execution or performance claim is
@@ -40,7 +40,7 @@ compile-validated in an ARM64 CUDA 12.6 development container without a
 driver/device. The M8 stream-ordered allocator and M9 block-reduced RMSNorm,
 grid-stride SwiGLU, adjacent-pair RoPE, and projection adapter are also
 compile-validated, as is the M10 three-stage contiguous attention baseline. None is
-runtime-validated on a GPU. The CUDA-on build passes the same 148 hardware-
+runtime-validated on a GPU. The CUDA-on build passes the same 152 hardware-
 independent tests and registers 57 GPU tests that cannot run without a driver and
 device.
 
@@ -143,8 +143,12 @@ neither is labeled as inference throughput. Complete CPU model prefill and check
 in-memory weight loading have three disclosed synthetic-model baselines; they are
 reference-path measurements, not production inference claims. Paired end-to-end
 CPU runtime traces retain sequential-token and full-prompt prefill modes; the
-measured default reduced median trace CPU time by 15.8%–51.3% across three
-disclosed tiny workloads. Methodology and measurements live in
+measured full-prompt default reduced median trace CPU time by 15.8%–51.3% across
+three disclosed tiny workloads with decode held constant. A later paired
+experiment removes paged-decode history
+compaction: direct block-table attention reduced isolated layer median CPU time by
+13.3%–27.7% while eliminating 2 KiB–1 MiB of combined-K/V temporaries; complete
+trace medians improved by only 0.08%–6.23%. Methodology and measurements live in
 [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md).
 
 ## Tensor runtime
@@ -235,7 +239,9 @@ slower large-history compaction results. See
 The paged cache also exposes a move-only layer read lease that pins pool/table
 lifetime and excludes append/release while attention holds raw spans. This coarse
 cache-wide lock is the current correctness boundary and a documented concurrency
-limitation, not an asynchronous GPU lifetime mechanism.
+limitation, not an asynchronous GPU lifetime mechanism. The default paged model
+decode consumes the cached spans plus the current uncommitted K/V tail directly;
+the older compact-copy path remains selectable for correctness and measurement.
 
 ## Request lifecycle and continuous batching
 
@@ -316,9 +322,11 @@ failure.
 
 The default full-prompt path executes an admitted prompt in one causal model call
 and transactionally bulk-appends layer-major K/V. A retained sequential-token mode
-handles chunked prompts and provides the paired benchmark baseline. Work items are
-still executed serially on the CPU; this is a correctness engine, not fused GPU
-batch execution. Ownership, protocol, measurements, and limitations are in
+handles chunked prompts and provides the paired prefill benchmark baseline. Paged
+decode defaults to direct block-table traversal with an uncommitted current-token
+tail; a compact-copy mode remains available as the paired decode baseline. Work
+items are still executed serially on the CPU; this is a correctness engine, not
+fused GPU batch execution. Ownership, protocol, measurements, and limitations are in
 [`docs/RUNTIME.md`](docs/RUNTIME.md).
 
 ## Supported hardware

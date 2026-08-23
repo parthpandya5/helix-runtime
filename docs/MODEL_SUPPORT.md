@@ -81,12 +81,18 @@ then copied that snapshot into a second buffer with a current-token tail.
 and leaves the tail untouched for the current K/V. This preserves cache ownership
 while removing two Tensor temporaries and one history-copy pass per layer.
 
-The same `decode_one` algorithm is instantiated for `PagedKvCache`: both cache
-types expose checked length, geometry, and prefix-copy contracts, while the model
-never owns or mutates either cache. `CpuRuntimeEngine` uses this overload for one
-paged sequence per live request and appends returned all-layer K/V only after a
-successful model step. A deterministic test crosses a paged block boundary and
-compares every sequential decode position with full-prefix recomputation.
+The paged `decode_one` overload retains two attention modes. `kCompactCopy` uses
+the contiguous history-plus-tail algorithm above. The measured default,
+`kDirectBlockTable`, holds a paged layer read lease and consumes cached physical
+spans plus current K/V as an uncommitted tail. It checks cache length under the
+lease, supports position zero with no pages, and releases the lease before its
+caller appends. The model never owns or mutates either cache.
+
+`CpuRuntimeEngine` selects the mode for one paged sequence per live request and
+appends returned all-layer K/V only after a successful model step. A deterministic
+test crosses a paged block boundary and compares direct, compact, and full-prefix
+results at every sequential position; a separate runtime test compares complete
+generated requests through both modes.
 
 When a new prompt is scheduled as one complete range, the M19 engine calls
 `prefill_with_kv` once, retains only the final `[1,V]` logits row, and passes the
@@ -215,13 +221,12 @@ markers, metadata and payload corruption, nonzero padding, structurally invalid
 but checksum-consistent ranks/offsets, invalid weights, non-finite weights, and
 nonzero stream origins.
 
-Validation on 2026-08-23 through M19 implementation commit `8086257` and benchmark
-methodology commit `2a6b365`:
+Validation on 2026-08-23 through direct paged-decode commit `c9b151c`:
 
-- normal, Release, and Apple Clang ASan/UBSan CPU suites: 148/148 tests passed;
-- relevant Release tests and benchmark smoke workloads passed;
+- Debug, Release, and Apple Clang ASan/UBSan CPU suites: 152/152 tests passed;
+- all Release tests and benchmark smoke workloads passed;
 - CUDA 12.6.85/GCC 13.2 warnings-as-errors build: all targets compiled and all
-  148 hardware-independent tests passed;
+  152 hardware-independent tests passed;
 - 57 GPU runtime tests remained explicitly skipped because the compile container
   has no NVIDIA driver or device.
 
@@ -248,17 +253,25 @@ shapes, repetitions, and commands are in `PERFORMANCE.md`.
 
 The M19 paired engine trace holds scheduler/decode/pool behavior constant and
 compares sequential-token prompt execution with full-prompt execution plus bulk
-paged append. The default reduced median CPU trace time by 15.8%–51.3% across the
-three tiny disclosed workloads. It measures serial CPU orchestration, not fused
-batch or GPU throughput.
+paged append while pinning compact-copy decode. The full-prompt default reduced
+median CPU trace time by 15.8%–51.3% across the three tiny disclosed workloads. It
+measures serial CPU orchestration, not fused batch or GPU throughput.
+
+The post-M19 paged-decode experiment retains compact copy and direct block-table
+execution in the same binary. Direct traversal reduced isolated layer median CPU
+time by 13.3%–27.7% across four histories and removed 2 KiB–1 MiB of combined-K/V
+temporaries. Complete runtime trace medians improved by 0.08%–6.23%; the largest
+case is a practical tie relative to its variation. These are CPU reference-path
+results, not evidence about a future CUDA paged-attention kernel.
 
 ## Deliberate limitations
 
 - CPU Float32 only for complete model execution.
 - Complete new prompts use one full prefill; chunked runtime prefill falls back to
   sequential one-token execution rather than a multi-token continuation kernel.
-- Cached decode uses a fixed-capacity contiguous CPU cache and materializes one
-  `[A,P+1,D]` K/V pair per layer for the current attention call.
+- The standalone generator's contiguous-cache decode materializes one
+  `[A,P+1,D]` K/V pair per layer; the multi-request paged runtime defaults to
+  direct traversal instead.
 - The standalone generator supports one sequence and greedy selection only. The
   runtime supports several paged sessions but executes work items serially and has
   no sampling or fused tensor batch.

@@ -36,6 +36,7 @@ Every recorded experiment must include:
 | M18 cached CPU next-position execution | Full-prefix recomputation for the identical prompt plus one input token | Reuse prefill K/V and execute only the new position | Cached/full-recompute median CPU times: 32.100/118.420 us, 89.580 us/2.113 ms, and 646.960 us/36.741 ms (3.69x, 23.59x, and 56.79x) | The growing advantage demonstrates avoided prefix model work in three tiny single-sequence CPU fixtures. It is not a production model, batched-runtime, tokenizer, or GPU result. |
 | M18 contiguous-KV decode staging | Allocate a compact owning history snapshot, then copy it into the final history-plus-tail buffers | Copy the locked cache prefix directly into the final buffers | Two-stage/direct median CPU times: 858/466 ns, 1,161/634 ns, and 3,784/1,587 ns; reductions 45.7%, 45.4%, and 58.1% | Both paths include final-buffer allocation and current-tail writes. Direct copy removes two temporary tensors and one full history pass; the paired algorithm benchmark isolates this change from model math. |
 | M19 synchronous CPU runtime prefill | Execute every scheduled prompt token through the one-token paged decode path | Execute a complete newly admitted prompt once and bulk-append its layer-major K/V pages | Sequential/full-prompt median CPU trace times: 461.833/224.800 us, 2.616/1.675 ms, and 11.745/9.890 ms; reductions 51.3%, 36.0%, and 15.8% | Full prefill wins all paired tiny traces, but the benefit narrows as decode dominates. The timed region is real serial CPU model/scheduler/cache execution, not GPU or fused-batch throughput. |
+| M19 paged model decode staging | Copy all cached pages into two contiguous history-plus-current K/V tensors per layer | Traverse leased block-table spans plus an uncommitted current K/V tail | Isolated compact/direct medians: 1,609/1,239 ns, 2,359/2,045 ns, 15.667/11.324 us, and 112.007/88.662 us; reductions 23.0%, 13.3%, 27.7%, and 20.8% | Direct traversal eliminates 2 KiB–1 MiB of combined-K/V payload per layer call. Complete tiny trace medians improved only 0.08%–6.23%, so the end-to-end impact is explicitly modest. |
 
 ## M1 CPU tensor baseline — 2026-08-20
 
@@ -795,8 +796,10 @@ The retained `SequentialTokenPrefill` mode invokes paged one-token decode for ea
 prompt position. The `FullPromptPrefill` mode performs one full causal prefill for
 a complete new prompt, retains its last logits row, and transactionally bulk-
 appends layer-major K/V. Both modes use identical decode, scheduler, request, and
-pool logic. The smaller relative gain at the largest case is an honest consequence
-of decode occupying more of the trace; the optimization changes prompt work only.
+pool logic. This historical prefill-only fixture now pins the retained compact-copy
+decode mode so the later direct-decode default cannot contaminate the comparison.
+The smaller relative gain at the largest case is an honest consequence of decode
+occupying more of the trace; the optimization changes prompt work only.
 
 The first fixture revision polled `SchedulerStats` (an O(number of retained
 requests) reporting snapshot) through `has_live_requests` on every iteration and
@@ -813,6 +816,87 @@ Command:
   '--benchmark_filter=BM_CpuRuntimeContinuousTrace' \
   --benchmark_min_time=30x \
   --benchmark_repetitions=9 \
+  --benchmark_enable_random_interleaving=true \
+  --benchmark_report_aggregates_only=true
+```
+
+## M19 direct paged-decode traversal — 2026-08-23
+
+Hypothesis: paged model decode was paying for the cache layout twice. Each layer
+allocated two `[H,history+1,D]` buffers, copied cached page spans into them, wrote
+current K/V into the tail, and only then ran contiguous attention. Since M13
+already had checked direct page traversal, accepting current K/V as an uncommitted
+causal tail should remove that staging without changing model or cache ownership.
+
+Environment:
+
+- source: commit `c9b151c`;
+- host: Apple M3 Pro, 12 CPU cores (6 performance, 6 efficiency), 18 GB RAM;
+- OS/compiler/build: macOS 26.0.1 arm64, Apple Clang 17.0.0, Release,
+  `HELIX_ENABLE_CUDA=OFF`, warnings as errors, Float32;
+- CMake 4.2.3 and Google Benchmark 1.9.1;
+- one benchmark thread; CPU affinity/frequency metadata unavailable, so the
+  displayed synthetic 24 MHz estimate is ignored;
+- load averages at command start: 4.53/4.71/5.83 for the isolated fixture and
+  5.04/6.05/6.60 for the complete runtime fixture.
+
+The isolated fixture owns a one-layer paged cache populated before timing. Each
+mode receives the same deterministic `[H,1,D]` query/current K/V. Both allocating
+attention APIs create output and `[H,1,history+1]` score workspace. `CompactCopy`
+additionally allocates two combined K/V tensors, copies the locked history, writes
+the current row, and calls contiguous attention. `DirectBlockTable` acquires a
+move-only read lease, traverses cached page spans, and consumes current K/V as the
+tail. One complete call per mode/shape warms allocation and code paths; each
+reported repetition then measures exactly 1,000 calls using process CPU time, with
+15 repetitions randomly interleaved.
+
+| H / D / history / page | Compact median / CPU CV | Direct median / CPU CV | Combined K/V payload removed | Reduction / speedup |
+|---|---:|---:|---:|---:|
+| 4 / 16 / 3 / 4 | 1,609 ns / 7.56% | 1,239 ns / 6.30% | 2,048 B | 23.0% / 1.299x |
+| 4 / 16 / 15 / 4 | 2,359 ns / 7.01% | 2,045 ns / 6.74% | 8,192 B | 13.3% / 1.154x |
+| 8 / 32 / 63 / 16 | 15.667 us / 5.02% | 11.324 us / 5.36% | 131,072 B | 27.7% / 1.384x |
+| 8 / 64 / 255 / 16 | 112.007 us / 5.57% | 88.662 us / 4.95% | 1,048,576 B | 20.8% / 1.263x |
+
+The removed payload is the exact logical size of two combined K/V tensors,
+`2 * H * (history + 1) * D * sizeof(float)`. It is not a malloc-overhead or
+whole-process peak-memory measurement. Direct traversal still allocates output and
+score workspace and holds the cache-wide lease throughout attention.
+
+The second fixture measures complete full-prefill runtime traces. It preserves the
+M19 request/model shapes, scheduler, global paged pool, generation lengths, greedy
+selection, completion, and reclamation; only `PagedDecodeMode` changes. Setup,
+submission, destruction, and final statistics are excluded. Each mode receives one
+complete warmup trace, followed by 100 traces per repetition and 15 randomly
+interleaved repetitions.
+
+| H / I / L / heads | Requests / active | Prompt / long / short output | Compact median / CPU CV | Direct median / CPU CV | Reduction / speedup |
+|---|---:|---:|---:|---:|---:|
+| 16 / 32 / 1 / 4 | 8 / 4 | 4 / 4 / 1 | 230.460 us / 5.64% | 221.300 us / 5.50% | 3.97% / 1.041x |
+| 32 / 64 / 2 / 4 | 8 / 4 | 8 / 8 / 2 | 1.640 ms / 5.78% | 1.538 ms / 4.95% | 6.23% / 1.066x |
+| 64 / 128 / 2 / 4 | 16 / 8 | 8 / 8 / 2 | 9.791 ms / 2.84% | 9.783 ms / 4.02% | 0.08% / 1.001x |
+
+The isolated mechanism improves consistently, while full traces spend most time
+in GEMM, normalization, MLP, scheduler, and other model work. In particular, the
+largest end-to-end result is indistinguishable from a tie at this noise level. The
+direct path is the default because it removes deterministic history-sized
+temporaries, matches the compact/full-recompute oracles, wins the isolated paired
+workload, and did not regress these longer trace samples—not because a broad
+end-to-end speedup has been established.
+
+Commands:
+
+```bash
+./build-release/benchmarks/helix_benchmarks \
+  '--benchmark_filter=BM_CpuPagedDecodeAttention' \
+  --benchmark_min_time=1000x \
+  --benchmark_repetitions=15 \
+  --benchmark_enable_random_interleaving=true \
+  --benchmark_report_aggregates_only=true
+
+./build-release/benchmarks/helix_benchmarks \
+  '--benchmark_filter=BM_CpuRuntimePagedDecodeTrace' \
+  --benchmark_min_time=100x \
+  --benchmark_repetitions=15 \
   --benchmark_enable_random_interleaving=true \
   --benchmark_report_aggregates_only=true
 ```

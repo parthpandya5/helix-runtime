@@ -255,8 +255,9 @@ and real block reuse. Preemption and prefix eviction are not implemented.
 ## What would break first at 10x workload?
 
 On the current CPU model, single-threaded reference GEMM would dominate quickly;
-prefill also carries an `O(T^2)` score workspace, while one-token decode still
-materializes a contiguous history-plus-tail pair per layer. The engine executes
+prefill also carries an `O(T^2)` score workspace. Paged one-token decode now avoids
+history compaction, but still traverses all prior K/V, allocates a linear score
+workspace, and holds a coarse cache-wide read lease per layer. The engine executes
 scheduled work serially rather than forming tensor batches, and the scheduler
 retains terminal request history. For KV, fixed pool
 capacity becomes the admission boundary. On GPU, the answer requires profiling;
@@ -315,3 +316,10 @@ the three disclosed tiny CPU traces this reduced median end-to-end trace time by
 15.8%–51.3%. The gain narrowed as decode dominated, which is more informative than
 presenting one favorable small case. Construction, submission, and final reporting
 were excluded; scheduler, model, cache, completion, and reclamation were timed.
+
+A follow-up result was more nuanced. Direct paged decode removed two combined K/V
+tensors and cut the isolated attention-layer median by 13.3%–27.7%, but complete
+runtime traces improved by only 0.08%–6.23%; the largest case was effectively a
+tie relative to variation. That taught me to distinguish a verified local
+bottleneck from overall model throughput. Helix keeps `kCompactCopy` selectable so
+the comparison remains reproducible.

@@ -125,11 +125,37 @@ bad shapes, zero token ranges, or metadata allocation failure leave sequence
 length and block ownership unchanged. Its `append_count` continues to count
 tokens, not API calls.
 
-The paired Release benchmark retains both prefill modes. Full-prompt execution
-reduced median CPU trace time by 51.3%, 36.0%, and 15.8% in three disclosed tiny
-workloads. The decreasing benefit is expected because decode accounts for more of
-the larger trace. Exact environments, shapes, timing boundaries, variation, and
-commands are in `PERFORMANCE.md`.
+The paired Release benchmark retains both prefill modes and pins compact-copy
+decode so only prompt execution changes. Full-prompt execution reduced median CPU
+trace time by 51.3%, 36.0%, and 15.8% in three disclosed tiny workloads. The
+decreasing benefit is expected because decode accounts for more of the larger
+trace. Exact environments, shapes, timing boundaries, variation, and commands are
+in `PERFORMANCE.md`.
+
+## Paged decode paths
+
+`CpuRuntimeConfig::paged_decode_mode` retains two implementations:
+
+- `kCompactCopy` allocates `[heads,history+1,head_dimension]` key and value
+  tensors per layer, copies every cached page prefix into them, writes current K/V
+  into the final row, then calls contiguous attention.
+- `kDirectBlockTable` is the measured default. It acquires a move-only layer read
+  lease and computes attention over cached physical spans plus the current
+  uncommitted K/V tail. The model returns that tail for one all-layer append only
+  after complete token execution succeeds.
+
+The direct path preserves physical sequence length throughout model execution and
+checks the leased length against the scheduled position under the cache lock. It
+supports an empty history, which is required by sequential prefill at position
+zero. The lease is released before the engine appends; attempting to append while
+holding it would deadlock on the cache's nonrecursive mutex.
+
+In paired isolated layer calls, direct traversal reduced median CPU time by
+13.3%–27.7% and removed 2 KiB–1 MiB of combined-K/V temporaries. Complete runtime
+trace medians fell by 3.97%, 6.23%, and 0.08%; the largest case is effectively a
+tie relative to measured variation. Both modes remain executable so this tradeoff
+can be remeasured on different workloads rather than encoded as an unsupported
+universal claim.
 
 ## Completion, failure, and cancellation
 
@@ -167,10 +193,11 @@ observation time.
 
 ## Correctness coverage
 
-Eight engine tests exercise:
+Nine engine tests exercise:
 
 - chunked prefill and multi-step paged decode against full-prefix recomputation;
 - full-prompt prefill and bulk K/V append across page boundaries;
+- compact-copy and direct block-table decode producing identical request output;
 - real-model continuous replacement with mixed prefill/decode work;
 - exact-boundary physical exhaustion, reclamation, and block reuse;
 - EOS, running cancellation, waiting cancellation, and complete reclamation;
@@ -180,8 +207,8 @@ Eight engine tests exercise:
 - injected non-finite model output converted to request failure and reclaimed K/V.
 
 The bulk cache, scheduler final-token rule, and paged model decode have additional
-focused tests. The full Debug, Release, and ASan/UBSan CPU suites pass 148/148. A
-CUDA 12.6 warnings-as-errors build passes the same 148 host tests and registers 57
+focused tests. The full Debug, Release, and ASan/UBSan CPU suites pass 152/152. A
+CUDA 12.6 warnings-as-errors build passes the same 152 host tests and registers 57
 GPU tests, all skipped without an NVIDIA driver/device.
 
 ## Current limitations
@@ -189,8 +216,8 @@ GPU tests, all skipped without an NVIDIA driver/device.
 - Work items execute serially; this engine does not form vectorized model batches.
 - Full-prompt prefill is used only for a complete first prompt chunk. Partial
   prefill remains the slower one-token baseline.
-- One-token attention materializes `[heads,history+1,head_dimension]` K/V buffers
-  per layer instead of consuming pages directly in the model path.
+- Direct one-token attention holds a cache-wide read lease for each layer, so it
+  serializes unrelated mutation in the same physical pool.
 - The physical K/V pool is CPU Tensor storage and does not use `HelixAllocator`.
 - There are no CUDA streams, events, asynchronous copies, or device execution.
 - The strict FIFO policy has no preemption, priority, prefix sharing, or terminal

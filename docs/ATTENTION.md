@@ -2,13 +2,15 @@
 
 ## Validation status
 
-The Milestone 10 contiguous CPU reference and Milestone 13 direct paged CPU path
-are **implemented, CPU-validated, sanitizer-validated, and benchmarked**. Eight
-focused attention tests and the full 93-test CPU suite pass in normal and
-ASan/UBSan builds. The contiguous CUDA baseline, four GPU tests, and CUDA-event
-benchmark fixtures compile with NVCC 12.6.85 and warnings as errors, but have not
-run without an NVIDIA driver/device. Paged attention is CPU-only. No GPU
-correctness or performance claim is made.
+The Milestone 10 contiguous CPU reference, Milestone 13 direct paged CPU path, and
+post-M19 paged-history-plus-tail decode path are **implemented, CPU-validated,
+sanitizer-validated, and benchmarked**. Ten focused attention tests and the full
+152-test CPU suite pass in Debug, Release, and ASan/UBSan builds. The contiguous
+CUDA baseline, four GPU tests, and CUDA-event benchmark fixtures compile with NVCC
+12.6.85 and warnings as errors, but have not run without an NVIDIA driver/device.
+The CUDA-on build passes the same 152 host tests and registers 57 hardware-gated
+GPU tests. Paged attention is CPU-only. No GPU correctness or performance claim is
+made.
 
 ## Tensor contract
 
@@ -122,11 +124,22 @@ default fixed 32-coordinate tile reduces page lookups from
 values. Its 256-byte double-accumulator array has fixed stack size; odd dimensions
 use a checked tail tile.
 
-Four tests compare direct paging against compact contiguous attention for causal
-prefill, chunked decode, multiple heads, odd dimension 5, odd dimension 37, and
-non-divisible block boundaries. They also cover empty query work and contract
-errors. A KV-cache test independently proves storage pinning and written-prefix
-visibility.
+For decode or continuation, the cache does not yet contain the current token.
+`paged_scaled_dot_product_attention_with_tail` therefore accepts query, key-tail,
+and value-tail tensors shaped `[H,T,D]`. Query row `q` attends to every cached token
+and tail rows through `q`; the caller commits the tail only after the complete
+model step succeeds. Empty history is valid for this API, so the first token uses
+the same path. The cache read lease remains held throughout score, softmax, and
+value traversal, preventing concurrent append/release from invalidating raw page
+spans. Output and `[H,T,history+T]` workspace are the only allocating convenience-
+API tensors; no contiguous history-plus-tail K/V pair is created.
+
+Six paged-attention tests compare direct paging against compact contiguous
+attention for causal prefill, chunked decode, cached-plus-tail continuation,
+multiple heads, odd dimensions, empty history, and non-divisible block boundaries.
+They also cover zero query work, shape/range/dtype failures, and output/workspace/
+tail alias rejection. A KV-cache test independently proves storage pinning and
+written-prefix visibility.
 
 ## CUDA baseline
 
@@ -199,6 +212,16 @@ groups work by physical block—so even the equal-value comparison is an end-to-
 path comparison, not a pure instruction-level cost of one table lookup. Full
 methodology and coefficients of variation are in `docs/PERFORMANCE.md`.
 
+The post-M19 decode experiment compares the actual compact-copy boundary with the
+history-plus-tail API. Both allocating paths create output and score workspace;
+the baseline additionally creates and fills two combined K/V tensors. Across
+histories of 3, 15, 63, and 255 tokens, direct traversal reduced isolated median
+CPU time by 23.0%, 13.3%, 27.7%, and 20.8%, while eliminating 2,048 B, 8,192 B,
+131,072 B, and 1,048,576 B of combined-K/V temporaries per layer call. Complete
+tiny runtime traces showed much smaller 3.97%, 6.23%, and 0.08% median reductions;
+the last is effectively a tie relative to 2.84%–4.02% variation. Exact shapes,
+timing boundaries, and commands are in `docs/PERFORMANCE.md`.
+
 ## Limitations and next step
 
 - materialized workspace is `O(heads * query_tokens * kv_tokens)`,
@@ -211,6 +234,7 @@ methodology and coefficients of variation are in `docs/PERFORMANCE.md`.
 - no CUDA paged storage/kernel, attention fusion, GQA, or GPU page-table analysis
   is claimed.
 
-The next correctness dependency is deterministic request/scheduler ownership.
-GPU paged attention remains a later hardware-dependent implementation and must be
-validated against this CPU oracle before optimization.
+GPU paged attention remains the next hardware-dependent implementation and must be
+validated against this CPU oracle before optimization. A future concurrent CPU or
+GPU executor also needs a finer-grained lifetime mechanism than the current
+cache-wide read lease.

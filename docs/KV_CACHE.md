@@ -3,8 +3,8 @@
 ## Status
 
 The M11 contiguous cache, M12 paged cache, M13 direct paged-attention read path,
-and M19 layer-major bulk append/runtime integration are implemented, CPU-validated,
-sanitized, and benchmarked in Float32. They expose
+and M19 bulk-append/runtime/direct-decode integration are implemented,
+CPU-validated, sanitized, and benchmarked in Float32. They expose
 the memory-capacity, compaction, and direct-traversal tradeoffs between a
 per-sequence allocation and a global fixed-block pool. There is not yet a GPU-
 resident KV-cache or CUDA paged-attention path.
@@ -278,14 +278,24 @@ device view needs a device-resident table and stream-ordered ownership whose
 lifetime extends through kernel completion, not a host mutex held across an
 asynchronous launch.
 
+The runtime's default one-token paged decode now uses the same lease without first
+committing the current token. The attention API consumes cached pages plus
+contiguous `[heads,tail_tokens,head_dimension]` current K/V tensors, applies causal
+masking across the combined logical positions, and returns before the lease is
+released. Only after every model layer succeeds does the engine append the
+all-layer token K/V. The retained compact-copy mode still calls
+`copy_layer_prefix_out` and is used as a correctness/performance baseline. Paired
+tests compare both model/runtime modes; isolated benchmarks show the direct path's
+benefit and the much smaller end-to-end effect in `docs/PERFORMANCE.md`.
+
 ## Current limitations
 
 - Float32 CPU tensors only; no GPU-resident cache or asynchronous copy contract.
 - Keys and values use the same head dimension.
 - Compact retrieval still copies; direct CPU attention consumes a read lease
   instead.
-- M19 model decode reads paged prefixes through the copy-out API; it does not yet
-  invoke direct block-table attention inside the model executor.
+- The direct CPU path holds the cache-wide lease throughout attention, blocking
+  unrelated sequence mutation during that layer call.
 - Contiguous sequence capacity cannot grow; the paged pool cannot grow after
   construction.
 - No prefix sharing, eviction, preemption, or reference counting yet.

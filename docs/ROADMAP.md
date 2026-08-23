@@ -434,6 +434,16 @@ median time by 2.36x–2.99x; with equal tiled traversal, direct paging cost 2.1
 6.7% more CPU time than contiguous storage across the four measured cases. Exact
 shapes, variation, methodology, and caveats are in `docs/PERFORMANCE.md`.
 
+Post-M19 integration (2026-08-23, commit `c9b151c`) adds a cached-history-plus-
+tail attention contract. The model can traverse paged spans while treating current
+K/V as an uncommitted causal tail, so token execution no longer needs two compact
+history-plus-tail tensors per layer. The compact path remains selectable. Two new
+attention tests cover odd multi-token tails, empty history, causal masking, and
+invalid/alias contracts; model and runtime tests compare both decode modes.
+Isolated paired measurements reduced median CPU time by 13.3%–27.7% and removed
+2 KiB–1 MiB of temporary combined K/V, while full tiny runtime traces improved by
+only 0.08%–6.23%.
+
 This completes the CPU correctness and measurement gate, not the GPU portion of
 M13. There is no device-resident block pool/table or CUDA paged-attention kernel,
 so coalescing, occupancy, GPU latency, and capacity remain pending NVIDIA hardware
@@ -636,22 +646,29 @@ chunks and paired measurement. Scheduler capacity accounting now recognizes that
 the final length-limited output is selected from existing logits and needs no new
 K/V, preventing an exact-block-boundary deadlock.
 
-Eight engine tests cover full and chunked prefill, greedy equivalence with full
+Nine engine tests cover full and chunked prefill, greedy equivalence with full
 recomputation, genuine mixed-work continuous replacement, physical exhaustion and
 reuse, EOS/cancellation, invalid submission rollback, injected model failure, and
-complete reclamation. The eighth runs 32 mixed-length requests through a constrained
+complete reclamation. One compares compact and direct paged decode through complete
+requests. The stress case runs 32 mixed-length requests through a constrained
 pool, compares every output with full recomputation, and verifies reuse plus final
-zero ownership. Normal, Release, and ASan/UBSan suites pass 148/148. A CUDA 12.6.85
-warnings-as-errors build compiles every target and passes the same 148 host tests;
+zero ownership. Normal, Release, and ASan/UBSan suites pass 152/152. A CUDA 12.6.85
+warnings-as-errors build compiles every target and passes the same 152 host tests;
 57 GPU tests remain skipped without a driver/device.
 
 On three disclosed tiny Apple M3 Pro CPU traces, the full-prompt default reduced
 median process CPU time by 51.3%, 36.0%, and 15.8% versus retained sequential-token
-prefill. Exact model/request shapes, peak K/V bytes, iterations, timing boundaries,
-variation, and command are in `docs/PERFORMANCE.md`. This completes M19's CPU
-correctness-engine gate, not CUDA model execution: work items are serial, the pool
-is host Tensor storage, and streams/events plus `HelixAllocator` integration remain
-pending. See `docs/RUNTIME.md`.
+prefill with compact-copy decode pinned in both cases. Exact model/request shapes,
+peak K/V bytes, iterations, timing boundaries, variation, and command are in
+`docs/PERFORMANCE.md`. This completes M19's CPU correctness-engine gate, not CUDA
+model execution: work items are serial, the pool is host Tensor storage, and
+streams/events plus `HelixAllocator` integration remain pending. See
+`docs/RUNTIME.md`.
+
+The direct-decode integration in commit `c9b151c` makes block-table plus
+uncommitted-tail attention the measured default while retaining compact copy in
+`CpuRuntimeConfig`. See the M13 post-integration record and paired measurements in
+`docs/PERFORMANCE.md`; no GPU result is implied.
 
 ## Phase G: measured advanced work
 

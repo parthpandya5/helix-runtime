@@ -8,7 +8,7 @@ that into a GPU performance claim.
 
 - Engineered a CPU-first C++20/CUDA inference runtime with checked Tensor/storage
   ownership, deterministic reference kernels, causal attention, contiguous and
-  paged KV caches, request scheduling, and continuous batching; maintained 148
+  paged KV caches, request scheduling, and continuous batching; maintained 152
   passing Debug, Release, and ASan/UBSan CPU tests.
 - Implemented manual CUDA elementwise, reduction, stable-softmax, naive/tiled
   SGEMM, RMSNorm, RoPE, SwiGLU, and attention paths with RAII streams/events and
@@ -31,6 +31,10 @@ that into a GPU performance claim.
   synchronous multi-request engine with transactional failure/cancellation cleanup;
   optimized complete-prompt execution with bulk page append, reducing median CPU
   trace time by 15.8%–51.3% across three disclosed synthetic workloads.
+- Removed paged-decode history compaction with block-table attention over an
+  uncommitted K/V tail, eliminating 2 KiB–1 MiB of temporary payload per measured
+  layer call and reducing isolated median CPU time by 13.3%–27.7%; complete trace
+  gains were a more modest 0.08%–6.23%.
 - Composed the reference kernels into a narrow Float32 Llama-style full-prefill
   model and created a deterministic versioned weight container with checked
   tensor roles/shapes/offsets, 64-byte payload alignment, corruption checksums,

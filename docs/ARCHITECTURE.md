@@ -338,6 +338,14 @@ dimension-major baselines, equal tiled traversals, and the page-table overhead.
 There is no CUDA paged-attention implementation yet; CPU locality results are not
 GPU coalescing evidence.
 
+The runtime decode variant logically extends the leased history with an
+uncommitted contiguous `[heads,tail_tokens,head_dimension]` K/V tail. Tail query
+row `q` sees all cached positions plus tail rows through `q`; the cache is not
+mutated while attention runs. The model returns all-layer tail K/V and the engine
+appends it only after successful execution. This removes two combined-history
+tensors per layer while retaining the compact-copy implementation as an explicit
+oracle and benchmark baseline.
+
 ## KV cache
 
 For each layer, cached keys and values avoid recomputing projections for prior
@@ -533,14 +541,15 @@ flowchart LR
     Decode --> Select
 ```
 
-Prefill performs all model math before populating cache storage. Decode validates
-that the supplied position equals the current cache length, copies each cached
-layer prefix directly into a caller-owned buffer with one reserved tail row,
-writes the current token's K/V into that tail, and computes attention. The model
-returns the new K/V separately; the session appends it only after the entire token
-step and final logits projection succeed. This keeps model failures from advancing
-logical cache length. Multi-call execution assumes the caller does not mutate the
-same sequence concurrently.
+Prefill performs all model math before populating cache storage. The standalone
+contiguous-cache generator validates that the supplied position equals cache
+length, copies each layer prefix into a caller-owned buffer with one tail row, and
+writes current K/V there. The paged runtime defaults to direct block-table
+attention over the cached history plus an uncommitted current tail; compact copy is
+still selectable. Both paths return new K/V separately, and their caller appends
+only after the entire token step and final logits projection succeed. This keeps
+model failures from advancing logical cache length. Multi-call execution assumes
+the caller does not mutate the same sequence concurrently.
 
 The `HELIXLM1` container is a deterministic little-endian format with a fixed
 128-byte versioned header, fixed-size tensor directory, exact role/layer/shape
@@ -594,8 +603,9 @@ sequenceDiagram
 Every operation checks that paged-cache length equals the scheduler's token offset.
 Complete new prompts use one full causal prefill and a transactional layer-major
 bulk append; chunked prompts retain a selectable token-at-a-time baseline. The
-paired benchmark supports the full-prompt default, while the retained baseline
-makes the change reproducible. Model/cache failures become failed ordered
+default paged decode traverses block-table spans with a current-token tail; its
+compact-copy predecessor remains selectable for paired tests and benchmarks.
+Model/cache failures become failed ordered
 completions and reclaim their sequence; cancellation reclaims waiting or running
 sessions immediately when no batch is in flight. See `docs/RUNTIME.md`.
 
