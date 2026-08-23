@@ -225,6 +225,18 @@ target_include_directories(
     $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
 helix_configure_target(helix_model)
 
+add_library(helix_runtime src/runtime/cpu_engine.cpp)
+add_library(helix::runtime ALIAS helix_runtime)
+target_compile_features(helix_runtime PUBLIC cxx_std_20)
+target_link_libraries(helix_runtime PUBLIC helix::model helix::scheduler)
+target_include_directories(
+  helix_runtime
+  PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+    $<BUILD_INTERFACE:${HELIX_GENERATED_INCLUDE_DIR}>
+    $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
+helix_configure_target(helix_runtime)
+
 helix_add_format_targets()
 
 if(HELIX_BUILD_TESTS)
@@ -252,6 +264,7 @@ set(HELIX_INSTALL_TARGETS
   helix_attention
   helix_kv_cache
   helix_model
+  helix_runtime
   helix_scheduler)
 if(HELIX_ENABLE_CUDA)
   list(APPEND HELIX_INSTALL_TARGETS helix_cuda_runtime helix_cuda_kernels)

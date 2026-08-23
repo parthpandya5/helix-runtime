@@ -1,6 +1,7 @@
 #pragma once
 
 #include "helix/kv_cache/contiguous.hpp"
+#include "helix/kv_cache/paged.hpp"
 #include "helix/tensor/tensor.hpp"
 
 #include <cstddef>
@@ -97,7 +98,8 @@ struct CpuLlamaDecodeResult final {
 // Float32 CPU baseline for one precisely scoped Llama-style architecture:
 // bias-free projections, equal Q/K/V head counts, full adjacent-pair RoPE,
 // pre-attention/pre-MLP RMSNorm, SwiGLU, residual connections, and an explicit
-// untied LM head. It performs full causal prefill and does not use a KV cache.
+// untied LM head. It offers full causal prefill plus cache-explicit one-token
+// decode helpers; the model never owns or implicitly mutates a cache.
 class CpuLlamaModel final {
 public:
   CpuLlamaModel(LlamaConfig config, LlamaWeights weights);
@@ -117,6 +119,9 @@ public:
   [[nodiscard]] CpuLlamaDecodeResult decode_one(std::uint32_t token_id, std::size_t position,
                                                 const kv_cache::ContiguousKvCache& cache,
                                                 const kv_cache::SequenceHandle& sequence) const;
+  [[nodiscard]] CpuLlamaDecodeResult
+  decode_one(std::uint32_t token_id, std::size_t position, const kv_cache::PagedKvCache& cache,
+             const kv_cache::PagedSequenceHandle& sequence) const;
 
 private:
   LlamaConfig config_;

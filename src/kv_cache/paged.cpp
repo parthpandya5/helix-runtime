@@ -132,11 +132,9 @@ void require_shape(const Tensor& tensor, const Shape& expected, std::string_view
   }
 }
 
-#ifndef NDEBUG
 std::size_t blocks_for_tokens(std::size_t tokens, std::size_t block_tokens) noexcept {
   return tokens / block_tokens + static_cast<std::size_t>(tokens % block_tokens != 0);
 }
-#endif
 
 class FreeBlockQueue final {
 public:
@@ -549,6 +547,125 @@ void PagedKvCache::append(const PagedSequenceHandle& sequence, const Tensor& tok
   impl_->validate_invariants();
 }
 
+void PagedKvCache::append_layer_major(const PagedSequenceHandle& sequence,
+                                      std::span<const Tensor> layer_keys,
+                                      std::span<const Tensor> layer_values) {
+  constexpr std::string_view kOperation = "PagedKvCache::append_layer_major";
+  std::scoped_lock lock(impl_->mutex);
+  SequenceState& state = impl_->require_sequence(sequence, kOperation);
+  HELIX_CHECK(layer_keys.size() == impl_->config.layers &&
+                  layer_values.size() == impl_->config.layers,
+              ErrorCode::kInvalidArgument,
+              "PagedKvCache::append_layer_major requires one key/value tensor per layer");
+
+  require_cpu_float_tensor(layer_keys.front(), "layer keys", kOperation);
+  HELIX_CHECK(layer_keys.front().rank() == 3, ErrorCode::kInvalidArgument,
+              "PagedKvCache::append_layer_major tensors must have rank three");
+  const std::size_t token_count = static_cast<std::size_t>(layer_keys.front().shape()[1]);
+  HELIX_CHECK(token_count != 0, ErrorCode::kInvalidArgument,
+              "PagedKvCache::append_layer_major token count must be positive");
+  const Shape layer_shape{checked_dimension(impl_->config.kv_heads, "KV head count"),
+                          checked_dimension(token_count, "KV append token count"),
+                          checked_dimension(impl_->config.head_dimension, "KV head dimension")};
+  for (std::size_t layer = 0; layer < impl_->config.layers; ++layer) {
+    require_cpu_float_tensor(layer_keys[layer], "layer keys", kOperation);
+    require_cpu_float_tensor(layer_values[layer], "layer values", kOperation);
+    require_shape(layer_keys[layer], layer_shape, "layer keys", kOperation);
+    require_shape(layer_values[layer], layer_shape, "layer values", kOperation);
+  }
+
+  HELIX_CHECK(token_count <= std::numeric_limits<std::size_t>::max() - state.length,
+              ErrorCode::kResourceExhausted,
+              "PagedKvCache::append_layer_major sequence length would overflow");
+  const std::size_t resulting_length = state.length + token_count;
+  const std::size_t resulting_blocks =
+      blocks_for_tokens(resulting_length, impl_->config.block_tokens);
+  HELIX_ASSERT(resulting_blocks >= state.blocks.size(),
+               "paged KV bulk append would shrink a sequence block table");
+  const std::size_t additional_blocks = resulting_blocks - state.blocks.size();
+  HELIX_CHECK(additional_blocks <= impl_->free_blocks.size(), ErrorCode::kResourceExhausted,
+              "PagedKvCache::append_layer_major has insufficient free physical KV blocks");
+  HELIX_CHECK(token_count <= std::numeric_limits<std::uint64_t>::max() - impl_->stats.append_count,
+              ErrorCode::kResourceExhausted,
+              "PagedKvCache::append_layer_major append counter would overflow");
+  HELIX_CHECK(additional_blocks <=
+                  std::numeric_limits<std::uint64_t>::max() - impl_->stats.block_allocation_count,
+              ErrorCode::kResourceExhausted,
+              "PagedKvCache::append_layer_major allocation counter would overflow");
+
+  std::uint64_t reused_blocks = 0;
+  for (std::size_t index = 0; index < additional_blocks; ++index) {
+    const PhysicalBlockId block = impl_->free_blocks.at(index);
+    reused_blocks += static_cast<std::uint64_t>(impl_->block_was_allocated[block.value()] != 0);
+  }
+  HELIX_CHECK(reused_blocks <=
+                  std::numeric_limits<std::uint64_t>::max() - impl_->stats.block_reuse_count,
+              ErrorCode::kResourceExhausted,
+              "PagedKvCache::append_layer_major reuse counter would overflow");
+  try {
+    state.blocks.reserve(resulting_blocks);
+  } catch (const std::bad_alloc&) {
+    throw_error(ErrorCode::kResourceExhausted,
+                "PagedKvCache::append_layer_major could not grow the sequence block table");
+  }
+
+  for (std::size_t index = 0; index < additional_blocks; ++index) {
+    const PhysicalBlockId block = impl_->free_blocks.front();
+    impl_->free_blocks.pop();
+    HELIX_ASSERT(impl_->block_is_free[block.value()] != 0 &&
+                     impl_->block_owners[block.value()] == 0,
+                 "paged KV free block has conflicting ownership");
+    state.blocks.push_back(block);
+    impl_->block_is_free[block.value()] = 0;
+    impl_->block_owners[block.value()] = sequence.id();
+    impl_->block_was_allocated[block.value()] = 1;
+  }
+
+  const std::size_t old_length = state.length;
+  auto* keys_destination = impl_->keys.data_as<float>();
+  auto* values_destination = impl_->values.data_as<float>();
+  std::size_t source_token = 0;
+  while (source_token < token_count) {
+    const std::size_t destination_token = old_length + source_token;
+    const std::size_t logical_block = destination_token / impl_->config.block_tokens;
+    const std::size_t block_offset = destination_token % impl_->config.block_tokens;
+    const std::size_t copied_tokens =
+        std::min(token_count - source_token, impl_->config.block_tokens - block_offset);
+    const std::size_t copy_elements = checked_multiply(copied_tokens, impl_->config.head_dimension,
+                                                       "paged KV bulk append copy elements");
+    const std::size_t copy_bytes =
+        checked_multiply(copy_elements, sizeof(float), "paged KV bulk append copy bytes");
+    const PhysicalBlockId block = state.blocks[logical_block];
+    for (std::size_t layer = 0; layer < impl_->config.layers; ++layer) {
+      const float* keys_source = layer_keys[layer].data_as<float>();
+      const float* values_source = layer_values[layer].data_as<float>();
+      for (std::size_t head = 0; head < impl_->config.kv_heads; ++head) {
+        const std::size_t source_offset =
+            (head * token_count + source_token) * impl_->config.head_dimension;
+        const std::size_t destination_offset = impl_->pool_offset(block, layer, head, block_offset);
+        std::memcpy(keys_destination + destination_offset, keys_source + source_offset, copy_bytes);
+        std::memcpy(values_destination + destination_offset, values_source + source_offset,
+                    copy_bytes);
+      }
+    }
+    source_token += copied_tokens;
+  }
+
+  state.length = resulting_length;
+  impl_->stats.used_blocks += additional_blocks;
+  impl_->stats.free_blocks -= additional_blocks;
+  const std::size_t allocated_bytes = additional_blocks * impl_->per_block_bytes;
+  impl_->stats.bytes_used += allocated_bytes;
+  impl_->stats.bytes_free -= allocated_bytes;
+  impl_->stats.peak_bytes_used = std::max(impl_->stats.peak_bytes_used, impl_->stats.bytes_used);
+  impl_->stats.allocated_token_slots += additional_blocks * impl_->config.block_tokens;
+  impl_->stats.active_tokens += token_count;
+  impl_->stats.append_count += static_cast<std::uint64_t>(token_count);
+  impl_->stats.block_allocation_count += static_cast<std::uint64_t>(additional_blocks);
+  impl_->stats.block_reuse_count += reused_blocks;
+  impl_->validate_invariants();
+}
+
 KvLayer PagedKvCache::retrieve_layer(const PagedSequenceHandle& sequence, std::size_t layer) const {
   constexpr std::string_view kOperation = "PagedKvCache::retrieve_layer";
   std::scoped_lock lock(impl_->mutex);
@@ -569,6 +686,63 @@ void PagedKvCache::copy_layer_out(const PagedSequenceHandle& sequence, std::size
   std::scoped_lock lock(impl_->mutex);
   const SequenceState& state = impl_->require_sequence(sequence, kOperation);
   impl_->copy_layer(state, layer, keys, values, kOperation);
+}
+
+void PagedKvCache::copy_layer_prefix_out(const PagedSequenceHandle& sequence, std::size_t layer,
+                                         std::size_t expected_length, Tensor& keys,
+                                         Tensor& values) const {
+  constexpr std::string_view kOperation = "PagedKvCache::copy_layer_prefix_out";
+  std::scoped_lock lock(impl_->mutex);
+  const SequenceState& state = impl_->require_sequence(sequence, kOperation);
+  HELIX_CHECK(state.length == expected_length, ErrorCode::kInvalidArgument,
+              "PagedKvCache::copy_layer_prefix_out cached length does not match the caller's "
+              "expected length");
+  HELIX_CHECK(layer < impl_->config.layers, ErrorCode::kOutOfRange,
+              "PagedKvCache::copy_layer_prefix_out layer index is out of range");
+  require_cpu_float_tensor(keys, "keys output", kOperation);
+  require_cpu_float_tensor(values, "values output", kOperation);
+  HELIX_CHECK(keys.rank() == 3 && keys.shape() == values.shape(), ErrorCode::kInvalidArgument,
+              "PagedKvCache::copy_layer_prefix_out outputs must have equal rank-three shapes");
+  HELIX_CHECK(keys.shape()[0] == checked_dimension(impl_->config.kv_heads, "KV head count") &&
+                  keys.shape()[2] ==
+                      checked_dimension(impl_->config.head_dimension, "KV head dimension"),
+              ErrorCode::kInvalidArgument,
+              "PagedKvCache::copy_layer_prefix_out output geometry does not match the cache");
+  const std::size_t destination_tokens = static_cast<std::size_t>(keys.shape()[1]);
+  HELIX_CHECK(destination_tokens >= state.length, ErrorCode::kInvalidArgument,
+              "PagedKvCache::copy_layer_prefix_out output token capacity is smaller than the "
+              "cached history");
+  HELIX_CHECK(keys.nbytes() == 0 || keys.data() != values.data(), ErrorCode::kInvalidArgument,
+              "PagedKvCache::copy_layer_prefix_out key and value outputs must not alias");
+  if (state.length == 0) {
+    return;
+  }
+
+  const float* keys_source = impl_->keys.data_as<float>();
+  const float* values_source = impl_->values.data_as<float>();
+  float* keys_destination = keys.data_as<float>();
+  float* values_destination = values.data_as<float>();
+  const std::size_t destination_head_elements = checked_multiply(
+      destination_tokens, impl_->config.head_dimension, "paged KV prefix destination stride");
+  for (std::size_t head = 0; head < impl_->config.kv_heads; ++head) {
+    for (std::size_t logical_block = 0; logical_block < state.blocks.size(); ++logical_block) {
+      const std::size_t logical_start = checked_multiply(logical_block, impl_->config.block_tokens,
+                                                         "paged KV prefix logical block offset");
+      const std::size_t tokens_in_block =
+          std::min(impl_->config.block_tokens, state.length - logical_start);
+      const std::size_t copy_elements = checked_multiply(
+          tokens_in_block, impl_->config.head_dimension, "paged KV prefix copy elements");
+      const std::size_t copy_bytes =
+          checked_multiply(copy_elements, sizeof(float), "paged KV prefix copy bytes");
+      const std::size_t source_offset =
+          impl_->pool_offset(state.blocks[logical_block], layer, head, 0);
+      const std::size_t destination_offset =
+          head * destination_head_elements + logical_start * impl_->config.head_dimension;
+      std::memcpy(keys_destination + destination_offset, keys_source + source_offset, copy_bytes);
+      std::memcpy(values_destination + destination_offset, values_source + source_offset,
+                  copy_bytes);
+    }
+  }
 }
 
 void PagedKvCache::release_sequence(const PagedSequenceHandle& sequence) {

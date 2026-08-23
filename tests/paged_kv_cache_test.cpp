@@ -26,6 +26,29 @@ Tensor make_token(std::size_t layers, std::size_t heads, std::size_t dimension, 
                              values);
 }
 
+std::vector<Tensor> make_layer_major(std::size_t layers, std::size_t heads, std::size_t token_begin,
+                                     std::size_t token_count, std::size_t dimension, float base) {
+  std::vector<Tensor> result;
+  result.reserve(layers);
+  for (std::size_t layer = 0; layer < layers; ++layer) {
+    Tensor tensor =
+        Tensor::empty({static_cast<Dimension>(heads), static_cast<Dimension>(token_count),
+                       static_cast<Dimension>(dimension)});
+    for (std::size_t head = 0; head < heads; ++head) {
+      for (std::size_t token = 0; token < token_count; ++token) {
+        for (std::size_t coordinate = 0; coordinate < dimension; ++coordinate) {
+          const std::size_t destination = (head * token_count + token) * dimension + coordinate;
+          const std::size_t token_major = (layer * heads + head) * dimension + coordinate;
+          tensor.data_as<float>()[destination] =
+              base + static_cast<float>((token_begin + token) * 100 + token_major);
+        }
+      }
+    }
+    result.push_back(std::move(tensor));
+  }
+  return result;
+}
+
 void expect_values(const Tensor& tensor, std::span<const float> expected) {
   ASSERT_EQ(tensor.numel(), expected.size());
   for (std::size_t index = 0; index < expected.size(); ++index) {
@@ -59,6 +82,25 @@ TEST(PagedKvCacheTest, MapsLogicalHistoryAcrossPhysicalBlockBoundaries) {
                 std::array{1'004.0F, 1'005.0F, 1'104.0F, 1'105.0F, 1'204.0F, 1'205.0F, 1'304.0F,
                            1'305.0F, 1'404.0F, 1'405.0F, 1'006.0F, 1'007.0F, 1'106.0F, 1'107.0F,
                            1'206.0F, 1'207.0F, 1'306.0F, 1'307.0F, 1'406.0F, 1'407.0F});
+
+  Tensor prefixed_keys = Tensor::from_values({2, 6, 2}, std::vector<float>(24, -99.0F));
+  Tensor prefixed_values = Tensor::from_values({2, 6, 2}, std::vector<float>(24, 99.0F));
+  cache.copy_layer_prefix_out(sequence, 1, 5, prefixed_keys, prefixed_values);
+  for (std::size_t head = 0; head < 2; ++head) {
+    for (std::size_t token = 0; token < 5; ++token) {
+      for (std::size_t coordinate = 0; coordinate < 2; ++coordinate) {
+        const std::size_t compact = (head * 5 + token) * 2 + coordinate;
+        const std::size_t prefixed = (head * 6 + token) * 2 + coordinate;
+        EXPECT_FLOAT_EQ(prefixed_keys.data_as<float>()[prefixed],
+                        layer.keys.data_as<float>()[compact]);
+        EXPECT_FLOAT_EQ(prefixed_values.data_as<float>()[prefixed],
+                        layer.values.data_as<float>()[compact]);
+      }
+    }
+    EXPECT_FLOAT_EQ(prefixed_keys.data_as<float>()[(head * 6 + 5) * 2], -99.0F);
+    EXPECT_FLOAT_EQ(prefixed_values.data_as<float>()[(head * 6 + 5) * 2], 99.0F);
+  }
+  EXPECT_THROW(cache.copy_layer_prefix_out(sequence, 1, 4, prefixed_keys, prefixed_values), Error);
 
   const PagedKvCacheStats stats = cache.stats();
   EXPECT_EQ(stats.bytes_reserved, 512U);
@@ -129,6 +171,51 @@ TEST(PagedKvCacheTest, BlockExhaustionIsTransactionalAndPartialBlocksRemainWrita
   EXPECT_EQ(cache.block_table(second)[0].value(), 0U);
   EXPECT_EQ(cache.stats().block_reuse_count, 1U);
   expect_values(cache.retrieve_layer(second, 0).keys, std::array{9.0F, 8.0F});
+}
+
+TEST(PagedKvCacheTest, BulkLayerMajorAppendSpansPartialAndWholeBlocksTransactionally) {
+  PagedKvCache bulk(PagedKvCacheConfig{2, 2, 2, 2, 3});
+  PagedKvCache scalar(PagedKvCacheConfig{2, 2, 2, 2, 3});
+  const PagedSequenceHandle bulk_sequence = bulk.create_sequence();
+  const PagedSequenceHandle scalar_sequence = scalar.create_sequence();
+  bulk.append(bulk_sequence, make_token(2, 2, 2, 0.0F), make_token(2, 2, 2, 1'000.0F));
+  const std::vector<Tensor> keys = make_layer_major(2, 2, 1, 4, 2, 0.0F);
+  const std::vector<Tensor> values = make_layer_major(2, 2, 1, 4, 2, 1'000.0F);
+  bulk.append_layer_major(bulk_sequence, keys, values);
+
+  for (std::size_t token = 0; token < 5; ++token) {
+    scalar.append(scalar_sequence, make_token(2, 2, 2, static_cast<float>(token * 100)),
+                  make_token(2, 2, 2, static_cast<float>(1'000 + token * 100)));
+  }
+  for (std::size_t layer = 0; layer < 2; ++layer) {
+    const KvLayer bulk_layer = bulk.retrieve_layer(bulk_sequence, layer);
+    const KvLayer scalar_layer = scalar.retrieve_layer(scalar_sequence, layer);
+    expect_values(bulk_layer.keys, std::span<const float>(scalar_layer.keys.data_as<float>(),
+                                                          scalar_layer.keys.numel()));
+    expect_values(bulk_layer.values, std::span<const float>(scalar_layer.values.data_as<float>(),
+                                                            scalar_layer.values.numel()));
+  }
+  EXPECT_EQ(bulk.length(bulk_sequence), 5U);
+  EXPECT_EQ(bulk.stats().append_count, 5U);
+  EXPECT_EQ(bulk.stats().block_allocation_count, 3U);
+
+  PagedKvCache exhausted(PagedKvCacheConfig{2, 2, 2, 2, 2});
+  const PagedSequenceHandle exhausted_sequence = exhausted.create_sequence();
+  const std::vector<Tensor> too_many_keys = make_layer_major(2, 2, 0, 5, 2, 0.0F);
+  const std::vector<Tensor> too_many_values = make_layer_major(2, 2, 0, 5, 2, 1'000.0F);
+  EXPECT_THROW(exhausted.append_layer_major(exhausted_sequence, too_many_keys, too_many_values),
+               Error);
+  EXPECT_EQ(exhausted.length(exhausted_sequence), 0U);
+  EXPECT_TRUE(exhausted.block_table(exhausted_sequence).empty());
+  EXPECT_EQ(exhausted.stats().append_count, 0U);
+
+  const std::vector<Tensor> zero_keys{Tensor::zeros({2, 0, 2}), Tensor::zeros({2, 0, 2})};
+  const std::vector<Tensor> zero_values{Tensor::zeros({2, 0, 2}), Tensor::zeros({2, 0, 2})};
+  EXPECT_THROW(exhausted.append_layer_major(exhausted_sequence, zero_keys, zero_values), Error);
+  EXPECT_THROW(exhausted.append_layer_major(exhausted_sequence, std::span<const Tensor>{},
+                                            std::span<const Tensor>{}),
+               Error);
+  EXPECT_EQ(exhausted.length(exhausted_sequence), 0U);
 }
 
 TEST(PagedKvCacheTest, FreePoolIsDeterministicFifoAndReleaseReclaimsEveryBlock) {

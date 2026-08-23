@@ -146,10 +146,21 @@ public:
   [[nodiscard]] PagedSequenceHandle create_sequence();
   void append(const PagedSequenceHandle& sequence, const Tensor& token_keys,
               const Tensor& token_values);
+  // Appends a nonempty token range from one [kv_heads, tokens,
+  // head_dimension] tensor per layer. Validation and block-table reservation
+  // complete before ownership or sequence length changes.
+  void append_layer_major(const PagedSequenceHandle& sequence, std::span<const Tensor> layer_keys,
+                          std::span<const Tensor> layer_values);
   [[nodiscard]] KvLayer retrieve_layer(const PagedSequenceHandle& sequence,
                                        std::size_t layer) const;
   void copy_layer_out(const PagedSequenceHandle& sequence, std::size_t layer, Tensor& keys,
                       Tensor& values) const;
+  // Copies exactly expected_length cached tokens into the prefix of caller-owned
+  // [kv_heads, destination_tokens, head_dimension] tensors and leaves any
+  // trailing rows untouched. The expected length is checked while holding the
+  // cache lock so stale runtime work cannot silently consume a newer sequence.
+  void copy_layer_prefix_out(const PagedSequenceHandle& sequence, std::size_t layer,
+                             std::size_t expected_length, Tensor& keys, Tensor& values) const;
   void release_sequence(const PagedSequenceHandle& sequence);
 
   [[nodiscard]] bool contains(const PagedSequenceHandle& sequence) const;

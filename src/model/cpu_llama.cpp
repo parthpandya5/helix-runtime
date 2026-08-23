@@ -195,27 +195,30 @@ CpuLlamaModel::prefill_with_kv(std::span<const std::uint32_t> token_ids) const {
                                std::move(result.logits)};
 }
 
-CpuLlamaDecodeResult CpuLlamaModel::decode_one(std::uint32_t token_id, std::size_t position,
-                                               const kv_cache::ContiguousKvCache& cache,
-                                               const kv_cache::SequenceHandle& sequence) const {
-  HELIX_CHECK(position < config_.max_sequence_length, ErrorCode::kOutOfRange,
+namespace {
+
+template <typename Cache, typename Sequence>
+CpuLlamaDecodeResult execute_decode_one(const LlamaConfig& config, const LlamaWeights& weights,
+                                        std::uint32_t token_id, std::size_t position,
+                                        const Cache& cache, const Sequence& sequence) {
+  HELIX_CHECK(position < config.max_sequence_length, ErrorCode::kOutOfRange,
               "model::CpuLlamaModel::decode_one: position exceeds configured maximum");
   HELIX_CHECK(cache.length(sequence) == position, ErrorCode::kInvalidArgument,
               "model::CpuLlamaModel::decode_one: cache length must equal decode position");
-  const kv_cache::ContiguousKvCacheConfig& cache_config = cache.config();
-  HELIX_CHECK(cache_config.layers == config_.layer_count &&
-                  cache_config.kv_heads == config_.attention_head_count &&
-                  cache_config.head_dimension == config_.head_dimension(),
+  const auto& cache_config = cache.config();
+  HELIX_CHECK(cache_config.layers == config.layer_count &&
+                  cache_config.kv_heads == config.attention_head_count &&
+                  cache_config.head_dimension == config.head_dimension(),
               ErrorCode::kInvalidArgument,
               "model::CpuLlamaModel::decode_one: cache geometry does not match the model");
 
-  const std::size_t layers = config_.layer_count;
-  const std::size_t heads = config_.attention_head_count;
-  const std::size_t head_dimension = config_.hidden_size / heads;
+  const std::size_t layers = config.layer_count;
+  const std::size_t heads = config.attention_head_count;
+  const std::size_t head_dimension = config.hidden_size / heads;
   const std::array<std::uint32_t, 1> input_ids{token_id};
-  const RopeCache rope = make_rope_cache(1, head_dimension, config_.rope_theta, position);
-  Tensor hidden = embed_tokens(input_ids, weights_.token_embedding(), config_.hidden_size,
-                               config_.vocabulary_size);
+  const RopeCache rope = make_rope_cache(1, head_dimension, config.rope_theta, position);
+  Tensor hidden = embed_tokens(input_ids, weights.token_embedding(), config.hidden_size,
+                               config.vocabulary_size);
   Tensor token_keys =
       Tensor::empty({dimension(layers), dimension(heads), dimension(head_dimension)});
   Tensor token_values =
@@ -225,9 +228,9 @@ CpuLlamaDecodeResult CpuLlamaModel::decode_one(std::uint32_t token_id, std::size
   const std::size_t layer_elements = heads * head_dimension;
 
   for (std::size_t layer_index = 0; layer_index < layers; ++layer_index) {
-    const LlamaLayerWeights& layer = weights_.layers()[layer_index];
+    const LlamaLayerWeights& layer = weights.layers()[layer_index];
     const Tensor attention_input =
-        cpu::rms_norm(hidden, layer.attention_norm_weight, config_.rms_norm_epsilon);
+        cpu::rms_norm(hidden, layer.attention_norm_weight, config.rms_norm_epsilon);
     const Tensor query_projection = cpu::linear(attention_input, layer.query_weight);
     const Tensor key_projection = cpu::linear(attention_input, layer.key_weight);
     const Tensor value_projection = cpu::linear(attention_input, layer.value_weight);
@@ -268,7 +271,7 @@ CpuLlamaDecodeResult CpuLlamaModel::decode_one(std::uint32_t token_id, std::size
     const Tensor attention_output = cpu::linear(merged_attention, layer.attention_output_weight);
     hidden = cpu::add(hidden, attention_output);
 
-    const Tensor ffn_input = cpu::rms_norm(hidden, layer.ffn_norm_weight, config_.rms_norm_epsilon);
+    const Tensor ffn_input = cpu::rms_norm(hidden, layer.ffn_norm_weight, config.rms_norm_epsilon);
     const Tensor gate = cpu::linear(ffn_input, layer.gate_weight);
     const Tensor up = cpu::linear(ffn_input, layer.up_weight);
     const Tensor activated = cpu::swiglu(gate, up);
@@ -281,9 +284,24 @@ CpuLlamaDecodeResult CpuLlamaModel::decode_one(std::uint32_t token_id, std::size
   }
 
   const Tensor normalized =
-      cpu::rms_norm(hidden, weights_.final_norm_weight(), config_.rms_norm_epsilon);
-  Tensor logits = cpu::linear(normalized, weights_.lm_head_weight());
+      cpu::rms_norm(hidden, weights.final_norm_weight(), config.rms_norm_epsilon);
+  Tensor logits = cpu::linear(normalized, weights.lm_head_weight());
   return CpuLlamaDecodeResult{std::move(token_keys), std::move(token_values), std::move(logits)};
+}
+
+} // namespace
+
+CpuLlamaDecodeResult CpuLlamaModel::decode_one(std::uint32_t token_id, std::size_t position,
+                                               const kv_cache::ContiguousKvCache& cache,
+                                               const kv_cache::SequenceHandle& sequence) const {
+  return execute_decode_one(config_, weights_, token_id, position, cache, sequence);
+}
+
+CpuLlamaDecodeResult
+CpuLlamaModel::decode_one(std::uint32_t token_id, std::size_t position,
+                          const kv_cache::PagedKvCache& cache,
+                          const kv_cache::PagedSequenceHandle& sequence) const {
+  return execute_decode_one(config_, weights_, token_id, position, cache, sequence);
 }
 
 } // namespace helix::model

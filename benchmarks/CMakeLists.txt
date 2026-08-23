@@ -6,6 +6,7 @@ add_executable(helix_benchmarks
   kv_cache_benchmarks.cpp
   model_benchmarks.cpp
   paged_attention_benchmarks.cpp
+  runtime_benchmarks.cpp
   scheduler_benchmarks.cpp
   tensor_benchmarks.cpp)
 target_link_libraries(
@@ -16,6 +17,7 @@ target_link_libraries(
     helix::kv_cache
     helix::memory
     helix::model
+    helix::runtime
     helix::scheduler
     benchmark::benchmark_main)
 if(HELIX_ENABLE_CUDA)
@@ -36,7 +38,7 @@ add_test(
   NAME benchmark.smoke
   COMMAND helix_benchmarks
           --benchmark_filter=BM_DTypeMetadata
-          --benchmark_min_time=0.001
+          --benchmark_min_time=0.001s
           --benchmark_repetitions=1)
 set_tests_properties(benchmark.smoke PROPERTIES LABELS "benchmark;smoke" TIMEOUT 30)
 
@@ -44,7 +46,7 @@ add_test(
   NAME benchmark.scheduler_smoke
   COMMAND helix_benchmarks
           "--benchmark_filter=BM_(ContinuousBatchingPolicy|StaticCohortPolicy)"
-          --benchmark_min_time=0.001
+          --benchmark_min_time=0.001s
           --benchmark_repetitions=1)
 set_tests_properties(
   benchmark.scheduler_smoke
@@ -53,9 +55,19 @@ set_tests_properties(
 add_test(
   NAME benchmark.model_smoke
   COMMAND helix_benchmarks
-          "--benchmark_filter=BM_CpuLlamaFullPrefill/32/64/2/4/7/128$"
-          --benchmark_min_time=0.001
+          "--benchmark_filter=BM_CpuLlamaFullPrefill/hidden:32/intermediate:64/layers:2/heads:4/tokens:7/vocabulary:128$"
+          --benchmark_min_time=0.001s
           --benchmark_repetitions=1)
 set_tests_properties(
   benchmark.model_smoke
   PROPERTIES LABELS "benchmark;model;smoke" TIMEOUT 30)
+
+add_test(
+  NAME benchmark.runtime_smoke
+  COMMAND helix_benchmarks
+          "--benchmark_filter=BM_CpuRuntimeContinuousTrace/FullPromptPrefill/hidden:16/intermediate:32/layers:1/heads:4/requests:8/prompt:4/output:4/active:4$"
+          --benchmark_min_time=0.001s
+          --benchmark_repetitions=1)
+set_tests_properties(
+  benchmark.runtime_smoke
+  PROPERTIES LABELS "benchmark;runtime;smoke" TIMEOUT 30)

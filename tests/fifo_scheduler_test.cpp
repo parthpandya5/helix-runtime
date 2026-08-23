@@ -139,6 +139,31 @@ TEST(FifoSchedulerTest, KvExhaustionChunksPrefillAndUsesExistingBlockSlack) {
   EXPECT_TRUE(scheduler.running_requests().empty());
 }
 
+TEST(FifoSchedulerTest, FinalDecodeNeedsNoNewBlockAtAnExactBoundary) {
+  FifoScheduler scheduler(SchedulerConfig{4, 1, 2});
+  scheduler.submit(make_request(11, 2, 1));
+
+  const ScheduleResult prefill = scheduler.schedule_iteration(1, kStart);
+  ASSERT_TRUE(prefill.batch.has_value());
+  ASSERT_EQ(prefill.batch->work.size(), 1U);
+  EXPECT_EQ(prefill.batch->work[0].new_kv_blocks, 1U);
+  static_cast<void>(scheduler.complete_iteration(
+      prefill.batch->id, std::vector{prefill_success(RequestId{11})}, kStart + 1ms));
+
+  const ScheduleResult final_decode = scheduler.schedule_iteration(0, kStart + 2ms);
+  ASSERT_TRUE(final_decode.batch.has_value());
+  ASSERT_EQ(final_decode.batch->work.size(), 1U);
+  EXPECT_EQ(final_decode.batch->work[0].kind, WorkKind::kDecode);
+  EXPECT_EQ(final_decode.batch->work[0].kv_blocks_before, 1U);
+  EXPECT_EQ(final_decode.batch->work[0].new_kv_blocks, 0U);
+  EXPECT_FALSE(final_decode.kv_capacity_limited);
+
+  const CompletionReport completion = scheduler.complete_iteration(
+      final_decode.batch->id, std::vector{decode_success(RequestId{11}, 778)}, kStart + 3ms);
+  EXPECT_EQ(completion.released_kv_blocks, 1U);
+  EXPECT_EQ(scheduler.request(RequestId{11}).finish_reason(), FinishReason::kLength);
+}
+
 TEST(FifoSchedulerTest, RunningCapacityLeavesLaterRequestsInFifoOrder) {
   FifoScheduler scheduler(SchedulerConfig{16, 1, 4});
   scheduler.submit(make_request(20, 1, 2));

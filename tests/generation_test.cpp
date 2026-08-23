@@ -134,6 +134,24 @@ TEST(CpuLlamaGeneratorTest, CachedDecodeMatchesFullPrefixRecomputation) {
   EXPECT_EQ(generator.cache_stats().active_tokens, context.size());
 }
 
+TEST(CpuLlamaModelTest, PagedSequentialDecodeMatchesEveryFullPrefixPosition) {
+  const LlamaConfig config = generation_config();
+  CpuLlamaModel model = make_model(config);
+  kv_cache::PagedKvCache cache(kv_cache::PagedKvCacheConfig{
+      config.layer_count, config.attention_head_count, config.head_dimension(), 2, 4});
+  const kv_cache::PagedSequenceHandle sequence = cache.create_sequence();
+  std::vector<std::uint32_t> context;
+
+  for (const std::uint32_t token : std::array<std::uint32_t, 4>{2, 5, 1, 4}) {
+    const CpuLlamaDecodeResult decoded = model.decode_one(token, context.size(), cache, sequence);
+    context.push_back(token);
+    expect_decode_matches_last_row(decoded.logits, model.forward(context), 5.0e-5F);
+    cache.append(sequence, decoded.token_keys, decoded.token_values);
+    EXPECT_EQ(cache.length(sequence), context.size());
+  }
+  EXPECT_EQ(cache.block_table(sequence).size(), 2U);
+}
+
 TEST(CpuLlamaGeneratorTest, GreedyGenerationMatchesRepeatedFullRecomputation) {
   const LlamaConfig config = generation_config();
   const std::vector<std::uint32_t> prompt{6, 1, 4};

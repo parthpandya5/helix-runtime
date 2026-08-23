@@ -152,8 +152,17 @@ ScheduleResult FifoScheduler::schedule_iteration(std::size_t available_kv_blocks
     HELIX_ASSERT(desired_tokens != 0, "scheduler selected zero work for an active request");
     const std::size_t budgeted_tokens = std::min(desired_tokens, remaining_tokens);
     const std::size_t current_tokens = current_kv_tokens(request);
+    // The final length-limited decode token is selected from logits already
+    // produced by the preceding model step. It retires immediately and is never
+    // fed back through the model, so it consumes execution budget but no new KV
+    // storage. EOS cannot be predicted before execution and remains conservatively
+    // reserved like any other non-final decode.
+    const bool final_length_decode =
+        state == RequestState::kDecoding && request.remaining_generation_tokens() == 1;
     const std::size_t scheduled_tokens =
-        max_append_for_blocks(current_tokens, budgeted_tokens, remaining_blocks);
+        final_length_decode
+            ? budgeted_tokens
+            : max_append_for_blocks(current_tokens, budgeted_tokens, remaining_blocks);
     if (scheduled_tokens == 0) {
       kv_limited = true;
       stop = true;
@@ -161,7 +170,8 @@ ScheduleResult FifoScheduler::schedule_iteration(std::size_t available_kv_blocks
     }
 
     const std::size_t blocks_before = kv_block_count(current_tokens);
-    const std::size_t new_blocks = additional_kv_blocks(current_tokens, scheduled_tokens);
+    const std::size_t new_blocks =
+        final_length_decode ? 0 : additional_kv_blocks(current_tokens, scheduled_tokens);
     planned.work.push_back(ScheduledWork{
         request.id(), state == RequestState::kPrefill ? WorkKind::kPrefill : WorkKind::kDecode,
         state == RequestState::kPrefill ? request.prompt_tokens_processed() : current_tokens,
