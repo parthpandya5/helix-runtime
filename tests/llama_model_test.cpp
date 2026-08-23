@@ -286,6 +286,12 @@ TEST(LlamaConfigTest, ValidatesNarrowArchitectureContract) {
 
   config.vocabulary_size = 0;
   EXPECT_THROW(config.validate(), Error);
+  if constexpr (sizeof(std::size_t) > sizeof(std::uint32_t)) {
+    config = tiny_config();
+    config.vocabulary_size =
+        static_cast<std::size_t>(std::numeric_limits<std::uint32_t>::max()) + 2;
+    EXPECT_THROW(config.validate(), Error);
+  }
   config = tiny_config();
   config.hidden_size = 5;
   EXPECT_THROW(config.validate(), Error);

@@ -9,3 +9,7 @@ helix_configure_target(helix_tensor_demo)
 add_executable(helix_cpu_kernels_demo cpu_kernels_demo.cpp)
 target_link_libraries(helix_cpu_kernels_demo PRIVATE helix::cpu_kernels)
 helix_configure_target(helix_cpu_kernels_demo)
+
+add_executable(helix_generate generate.cpp)
+target_link_libraries(helix_generate PRIVATE helix::model)
+helix_configure_target(helix_generate)

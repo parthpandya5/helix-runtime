@@ -1,4 +1,5 @@
 #include "helix/model/format.hpp"
+#include "helix/model/generation.hpp"
 #include "helix/model/llama.hpp"
 
 #include <benchmark/benchmark.h>
@@ -120,6 +121,61 @@ void BM_LlamaModelLoadFromMemory(benchmark::State& state) {
   set_model_counters(state, config, serialized->size());
 }
 
+std::vector<std::uint32_t> make_prompt(std::size_t token_count, std::size_t vocabulary_size) {
+  std::vector<std::uint32_t> token_ids(token_count);
+  for (std::size_t index = 0; index < token_ids.size(); ++index) {
+    token_ids[index] = static_cast<std::uint32_t>((index * 13 + 5) % vocabulary_size);
+  }
+  return token_ids;
+}
+
+void BM_CpuLlamaNextPosition(benchmark::State& state, bool cached_decode) {
+  LlamaConfig config = config_from_state(state);
+  const std::size_t prompt_tokens = config.max_sequence_length;
+  ++config.max_sequence_length;
+  const std::vector<std::uint32_t> prompt = make_prompt(prompt_tokens, config.vocabulary_size);
+  const std::uint32_t decode_token =
+      static_cast<std::uint32_t>((prompt_tokens * 17 + 3) % config.vocabulary_size);
+  std::optional<CpuLlamaModel> full_model;
+  std::optional<CpuLlamaGenerator> generator;
+  std::vector<std::uint32_t> full_context = prompt;
+  full_context.push_back(decode_token);
+
+  for ([[maybe_unused]] const auto iteration : state) {
+    if (cached_decode) {
+      state.PauseTiming();
+      if (!generator.has_value()) {
+        CpuLlamaGenerator warmup(CpuLlamaModel(config, benchmark_weights(config)));
+        static_cast<void>(warmup.prefill(prompt));
+        const Tensor warmup_logits = warmup.decode(decode_token);
+        benchmark::DoNotOptimize(warmup_logits.data());
+      }
+      generator.reset();
+      generator.emplace(CpuLlamaModel(config, benchmark_weights(config)));
+      static_cast<void>(generator->prefill(prompt));
+      state.ResumeTiming();
+      const Tensor logits = generator->decode(decode_token);
+      benchmark::DoNotOptimize(logits.data());
+    } else {
+      if (!full_model.has_value()) {
+        state.PauseTiming();
+        full_model.emplace(config, benchmark_weights(config));
+        const Tensor warmup_logits = full_model->forward(full_context);
+        benchmark::DoNotOptimize(warmup_logits.data());
+        state.ResumeTiming();
+      }
+      const Tensor logits = full_model->forward(full_context);
+      benchmark::DoNotOptimize(logits.data());
+    }
+    benchmark::ClobberMemory();
+  }
+
+  set_model_counters(state, config);
+  state.counters["prompt_tokens"] = static_cast<double>(prompt_tokens);
+  state.counters["positions_per_second"] =
+      benchmark::Counter(static_cast<double>(state.iterations()), benchmark::Counter::kIsRate);
+}
+
 void model_arguments(benchmark::internal::Benchmark* benchmark) {
   benchmark->Args({32, 64, 2, 4, 7, 128});
   benchmark->Args({64, 128, 2, 4, 31, 256});
@@ -132,6 +188,12 @@ BENCHMARK(BM_CpuLlamaFullPrefill)
 BENCHMARK(BM_LlamaModelLoadFromMemory)
     ->Apply(model_arguments)
     ->ArgNames({"hidden", "intermediate", "layers", "heads", "tokens", "vocabulary"});
+BENCHMARK_CAPTURE(BM_CpuLlamaNextPosition, CachedKvDecode, true)
+    ->Apply(model_arguments)
+    ->ArgNames({"hidden", "intermediate", "layers", "heads", "prompt", "vocabulary"});
+BENCHMARK_CAPTURE(BM_CpuLlamaNextPosition, FullPrefixRecompute, false)
+    ->Apply(model_arguments)
+    ->ArgNames({"hidden", "intermediate", "layers", "heads", "prompt", "vocabulary"});
 
 } // namespace
 } // namespace helix::model

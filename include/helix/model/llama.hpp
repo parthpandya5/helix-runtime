@@ -1,5 +1,6 @@
 #pragma once
 
+#include "helix/kv_cache/contiguous.hpp"
 #include "helix/tensor/tensor.hpp"
 
 #include <cstddef>
@@ -75,6 +76,24 @@ struct CpuLlamaForwardTrace final {
   Tensor logits;
 };
 
+// Full-prefill artifacts for populating a KV cache. Each layer tensor is
+// head-major [heads, tokens, head_dimension]. Keys have RoPE applied; values do
+// not. Logits contain every prompt position [tokens, vocabulary].
+struct CpuLlamaPrefillResult final {
+  std::vector<Tensor> layer_keys;
+  std::vector<Tensor> layer_values;
+  Tensor logits;
+};
+
+// One-token decode is computed transactionally against existing history. The
+// caller appends token_keys/token_values [layers, heads, head_dimension] only
+// after this method succeeds.
+struct CpuLlamaDecodeResult final {
+  Tensor token_keys;
+  Tensor token_values;
+  Tensor logits;
+};
+
 // Float32 CPU baseline for one precisely scoped Llama-style architecture:
 // bias-free projections, equal Q/K/V head counts, full adjacent-pair RoPE,
 // pre-attention/pre-MLP RMSNorm, SwiGLU, residual connections, and an explicit
@@ -93,6 +112,11 @@ public:
   [[nodiscard]] Tensor forward(std::span<const std::uint32_t> token_ids) const;
   [[nodiscard]] CpuLlamaForwardTrace
   forward_with_trace(std::span<const std::uint32_t> token_ids) const;
+  [[nodiscard]] CpuLlamaPrefillResult
+  prefill_with_kv(std::span<const std::uint32_t> token_ids) const;
+  [[nodiscard]] CpuLlamaDecodeResult decode_one(std::uint32_t token_id, std::size_t position,
+                                                const kv_cache::ContiguousKvCache& cache,
+                                                const kv_cache::SequenceHandle& sequence) const;
 
 private:
   LlamaConfig config_;

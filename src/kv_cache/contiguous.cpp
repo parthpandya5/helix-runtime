@@ -265,6 +265,58 @@ void ContiguousKvCache::copy_layer_out(const SequenceHandle& sequence, std::size
   impl_->copy_layer(state, layer, keys, values, kOperation);
 }
 
+void ContiguousKvCache::copy_layer_prefix_out(const SequenceHandle& sequence, std::size_t layer,
+                                              std::size_t expected_length, Tensor& keys,
+                                              Tensor& values) const {
+  constexpr std::string_view kOperation = "ContiguousKvCache::copy_layer_prefix_out";
+  std::scoped_lock lock(impl_->mutex);
+  const Impl::SequenceState& state = impl_->require_sequence(sequence, kOperation);
+  HELIX_CHECK(state.length == expected_length, ErrorCode::kInvalidArgument,
+              "ContiguousKvCache::copy_layer_prefix_out cached length does not match the "
+              "caller's expected length");
+  HELIX_CHECK(layer < impl_->config.layers, ErrorCode::kOutOfRange,
+              "ContiguousKvCache::copy_layer_prefix_out layer index is out of range");
+  require_cpu_float_tensor(keys, "keys output", kOperation);
+  require_cpu_float_tensor(values, "values output", kOperation);
+  HELIX_CHECK(keys.rank() == 3 && keys.shape() == values.shape(), ErrorCode::kInvalidArgument,
+              "ContiguousKvCache::copy_layer_prefix_out outputs must have equal rank-three "
+              "shapes");
+  HELIX_CHECK(keys.shape()[0] == checked_dimension(impl_->config.kv_heads, "KV head count") &&
+                  keys.shape()[2] ==
+                      checked_dimension(impl_->config.head_dimension, "KV head dimension"),
+              ErrorCode::kInvalidArgument,
+              "ContiguousKvCache::copy_layer_prefix_out output geometry does not match the "
+              "cache");
+  const std::size_t destination_tokens = static_cast<std::size_t>(keys.shape()[1]);
+  HELIX_CHECK(destination_tokens >= state.length, ErrorCode::kInvalidArgument,
+              "ContiguousKvCache::copy_layer_prefix_out output token capacity is smaller than "
+              "the cached history");
+  HELIX_CHECK(keys.nbytes() == 0 || keys.data() != values.data(), ErrorCode::kInvalidArgument,
+              "ContiguousKvCache::copy_layer_prefix_out key and value outputs must not alias");
+  if (state.length == 0) {
+    return;
+  }
+
+  const auto* keys_source = state.keys.data_as<float>();
+  const auto* values_source = state.values.data_as<float>();
+  auto* keys_destination = keys.data_as<float>();
+  auto* values_destination = values.data_as<float>();
+  const std::size_t copied_elements =
+      checked_multiply(state.length, impl_->config.head_dimension, "KV prefix copy elements");
+  const std::size_t copied_bytes =
+      checked_multiply(copied_elements, sizeof(float), "KV prefix copy bytes");
+  const std::size_t destination_head_elements = checked_multiply(
+      destination_tokens, impl_->config.head_dimension, "KV prefix destination stride");
+  for (std::size_t head = 0; head < impl_->config.kv_heads; ++head) {
+    const std::size_t source_offset =
+        ((layer * impl_->config.kv_heads + head) * state.capacity) * impl_->config.head_dimension;
+    const std::size_t destination_offset = head * destination_head_elements;
+    std::memcpy(keys_destination + destination_offset, keys_source + source_offset, copied_bytes);
+    std::memcpy(values_destination + destination_offset, values_source + source_offset,
+                copied_bytes);
+  }
+}
+
 void ContiguousKvCache::release_sequence(const SequenceHandle& sequence) {
   constexpr std::string_view kOperation = "ContiguousKvCache::release_sequence";
   std::scoped_lock lock(impl_->mutex);

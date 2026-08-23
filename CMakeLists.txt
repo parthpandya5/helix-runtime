@@ -210,12 +210,13 @@ target_include_directories(
 helix_configure_target(helix_scheduler)
 
 add_library(helix_model
+  src/model/cpu_generation.cpp
   src/model/cpu_llama.cpp
   src/model/format.cpp
   src/model/llama.cpp)
 add_library(helix::model ALIAS helix_model)
 target_compile_features(helix_model PUBLIC cxx_std_20)
-target_link_libraries(helix_model PUBLIC helix::attention helix::cpu_kernels)
+target_link_libraries(helix_model PUBLIC helix::attention helix::cpu_kernels helix::kv_cache)
 target_include_directories(
   helix_model
   PUBLIC

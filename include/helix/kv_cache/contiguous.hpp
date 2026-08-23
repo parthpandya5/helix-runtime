@@ -68,6 +68,13 @@ public:
   [[nodiscard]] KvLayer retrieve_layer(const SequenceHandle& sequence, std::size_t layer) const;
   void copy_layer_out(const SequenceHandle& sequence, std::size_t layer, Tensor& keys,
                       Tensor& values) const;
+  // Copies the current cached history into the prefix of caller-owned
+  // [kv_heads, destination_tokens, head_dimension] tensors. The destination
+  // may reserve trailing token rows, which are left untouched. Requiring the
+  // expected length prevents a caller from silently consuming a stale snapshot
+  // if the sequence changes before the copy acquires the cache lock.
+  void copy_layer_prefix_out(const SequenceHandle& sequence, std::size_t layer,
+                             std::size_t expected_length, Tensor& keys, Tensor& values) const;
   void release_sequence(const SequenceHandle& sequence);
 
   [[nodiscard]] bool contains(const SequenceHandle& sequence) const;

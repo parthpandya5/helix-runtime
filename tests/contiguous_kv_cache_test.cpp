@@ -81,6 +81,34 @@ TEST(ContiguousKvCacheTest, RetrievedHistoryFeedsDecodeAttentionWithoutRecomputi
                 std::span<const float>(explicit_result.data_as<float>(), explicit_result.numel()));
 }
 
+TEST(ContiguousKvCacheTest, CopiesHistoryIntoLargerPrefixBuffersWithoutTouchingTail) {
+  ContiguousKvCache cache(ContiguousKvCacheConfig{1, 2, 2, 1'024});
+  const SequenceHandle sequence = cache.create_sequence(3);
+  cache.append(sequence, Tensor::from_values({1, 2, 2}, std::array{1.0F, 2.0F, 3.0F, 4.0F}),
+               Tensor::from_values({1, 2, 2}, std::array{-1.0F, -2.0F, -3.0F, -4.0F}));
+  cache.append(sequence, Tensor::from_values({1, 2, 2}, std::array{5.0F, 6.0F, 7.0F, 8.0F}),
+               Tensor::from_values({1, 2, 2}, std::array{-5.0F, -6.0F, -7.0F, -8.0F}));
+
+  Tensor keys =
+      Tensor::from_values({2, 3, 2}, std::array{-99.0F, -99.0F, -99.0F, -99.0F, -99.0F, -99.0F,
+                                                -99.0F, -99.0F, -99.0F, -99.0F, -99.0F, -99.0F});
+  Tensor values =
+      Tensor::from_values({2, 3, 2}, std::array{99.0F, 99.0F, 99.0F, 99.0F, 99.0F, 99.0F, 99.0F,
+                                                99.0F, 99.0F, 99.0F, 99.0F, 99.0F});
+  cache.copy_layer_prefix_out(sequence, 0, 2, keys, values);
+
+  expect_values(keys, std::array{1.0F, 2.0F, 5.0F, 6.0F, -99.0F, -99.0F, 3.0F, 4.0F, 7.0F, 8.0F,
+                                 -99.0F, -99.0F});
+  expect_values(values, std::array{-1.0F, -2.0F, -5.0F, -6.0F, 99.0F, 99.0F, -3.0F, -4.0F, -7.0F,
+                                   -8.0F, 99.0F, 99.0F});
+
+  EXPECT_THROW(cache.copy_layer_prefix_out(sequence, 0, 1, keys, values), Error);
+  EXPECT_THROW(cache.copy_layer_prefix_out(sequence, 0, 2, keys, keys), Error);
+  Tensor too_short = Tensor::zeros({2, 1, 2});
+  Tensor too_short_values = too_short.clone();
+  EXPECT_THROW(cache.copy_layer_prefix_out(sequence, 0, 2, too_short, too_short_values), Error);
+}
+
 TEST(ContiguousKvCacheTest, CapacityAndReservationFailuresPreserveExistingState) {
   ContiguousKvCache cache(ContiguousKvCacheConfig{1, 1, 2, 32});
   const SequenceHandle sequence = cache.create_sequence(2);

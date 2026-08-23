@@ -39,6 +39,11 @@ void require_weight(const Tensor& tensor, const Shape& expected, std::string_vie
 void LlamaConfig::validate() const {
   HELIX_CHECK(vocabulary_size != 0, ErrorCode::kInvalidArgument,
               "model::LlamaConfig: vocabulary size must be positive");
+  constexpr std::uint64_t kMaximumVocabulary =
+      static_cast<std::uint64_t>(std::numeric_limits<std::uint32_t>::max()) + 1;
+  HELIX_CHECK(static_cast<std::uint64_t>(vocabulary_size) <= kMaximumVocabulary,
+              ErrorCode::kOutOfRange,
+              "model::LlamaConfig: vocabulary size exceeds the uint32 token range");
   HELIX_CHECK(hidden_size != 0, ErrorCode::kInvalidArgument,
               "model::LlamaConfig: hidden size must be positive");
   HELIX_CHECK(intermediate_size != 0, ErrorCode::kInvalidArgument,

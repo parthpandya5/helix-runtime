@@ -114,6 +114,15 @@ gtest_discover_tests(
   TEST_PREFIX "model_format."
   DISCOVERY_MODE PRE_TEST)
 
+add_executable(helix_generation_tests generation_test.cpp)
+target_link_libraries(helix_generation_tests PRIVATE helix::model GTest::gtest_main)
+helix_configure_target(helix_generation_tests)
+
+gtest_discover_tests(
+  helix_generation_tests
+  TEST_PREFIX "generation."
+  DISCOVERY_MODE PRE_TEST)
+
 add_executable(helix_memory_tests memory_allocator_test.cpp)
 target_link_libraries(helix_memory_tests PRIVATE helix::memory GTest::gtest_main)
 helix_configure_target(helix_memory_tests)
