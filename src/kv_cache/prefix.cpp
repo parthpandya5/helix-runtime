@@ -15,6 +15,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -22,6 +23,8 @@ namespace helix::kv_cache {
 namespace {
 
 constexpr std::string_view kTypeName = "PagedPrefixCache";
+constexpr std::uint64_t kFnvOffsetBasis = 14'695'981'039'346'656'037ULL;
+constexpr std::uint64_t kFnvPrime = 1'099'511'628'211ULL;
 
 void require_namespace(PrefixNamespaceId namespace_id, std::string_view operation) {
   HELIX_CHECK(namespace_id.valid(), ErrorCode::kInvalidArgument,
@@ -47,6 +50,34 @@ bool token_vector_is_prefix(const std::vector<std::uint32_t>& stored,
          std::equal(stored.begin(), stored.end(), candidate.begin());
 }
 
+std::uint64_t extend_token_digest(std::uint64_t digest, std::uint32_t token) noexcept {
+  for (std::uint32_t shift = 0; shift < 32; shift += 8) {
+    digest ^= static_cast<std::uint8_t>(token >> shift);
+    digest *= kFnvPrime;
+  }
+  return digest;
+}
+
+std::uint64_t token_digest(std::span<const std::uint32_t> tokens) noexcept {
+  std::uint64_t digest = kFnvOffsetBasis;
+  for (const std::uint32_t token : tokens) {
+    digest = extend_token_digest(digest, token);
+  }
+  return digest;
+}
+
+std::size_t fold_digest(std::uint64_t value) noexcept {
+  value ^= value >> 30;
+  value *= 0xbf58'476d'1ce4'e5b9ULL;
+  value ^= value >> 27;
+  value *= 0x94d0'49bb'1331'11ebULL;
+  value ^= value >> 31;
+  if constexpr (sizeof(std::size_t) < sizeof(std::uint64_t)) {
+    value ^= value >> 32;
+  }
+  return static_cast<std::size_t>(value);
+}
+
 } // namespace
 
 struct PagedPrefixCache::Impl {
@@ -55,11 +86,35 @@ struct PagedPrefixCache::Impl {
     std::vector<std::uint32_t> tokens;
     PagedSequenceHandle anchor;
     std::size_t block_references = 0;
+    std::uint64_t digest = kFnvOffsetBasis;
   };
 
   using EntryList = std::list<Entry>;
   using Iterator = EntryList::iterator;
   using ConstIterator = EntryList::const_iterator;
+
+  struct IndexKey {
+    PrefixNamespaceId namespace_id;
+    std::size_t token_count = 0;
+    std::uint64_t digest = kFnvOffsetBasis;
+
+    friend bool operator==(const IndexKey&, const IndexKey&) = default;
+  };
+
+  struct IndexKeyHash {
+    [[nodiscard]] std::size_t operator()(const IndexKey& key) const noexcept {
+      std::uint64_t mixed = key.digest;
+      mixed ^= key.namespace_id.value() + 0x9e37'79b9'7f4a'7c15ULL + (mixed << 6) + (mixed >> 2);
+      mixed ^= static_cast<std::uint64_t>(key.token_count) + 0x9e37'79b9'7f4a'7c15ULL +
+               (mixed << 6) + (mixed >> 2);
+      return fold_digest(mixed);
+    }
+  };
+
+  // List iterators survive MRU splices, so the content index never needs repair
+  // when an entry is touched. Exact token verification makes digest collisions
+  // a performance concern rather than an identity or correctness concern.
+  using ContentIndex = std::unordered_multimap<IndexKey, Iterator, IndexKeyHash>;
 
   Impl(std::shared_ptr<PagedKvCache> owned_cache, PagedPrefixCacheConfig prefix_config)
       : cache(std::move(owned_cache)), config(prefix_config) {
@@ -78,18 +133,31 @@ struct PagedPrefixCache::Impl {
     validate_invariants();
   }
 
+  [[nodiscard]] static IndexKey index_key(PrefixNamespaceId namespace_id, std::size_t token_count,
+                                          std::uint64_t digest) noexcept {
+    return IndexKey{namespace_id, token_count, digest};
+  }
+
   [[nodiscard]] Iterator find_exact(PrefixNamespaceId namespace_id,
-                                    std::span<const std::uint32_t> tokens) noexcept {
-    return std::find_if(entries.begin(), entries.end(), [&](const Entry& entry) {
-      return entry.namespace_id == namespace_id && token_vectors_equal(entry.tokens, tokens);
-    });
+                                    std::span<const std::uint32_t> tokens) {
+    const auto candidates =
+        index.equal_range(index_key(namespace_id, tokens.size(), token_digest(tokens)));
+    const auto match =
+        std::find_if(candidates.first, candidates.second, [&](const auto& candidate) {
+          return token_vectors_equal(candidate.second->tokens, tokens);
+        });
+    return match == candidates.second ? entries.end() : match->second;
   }
 
   [[nodiscard]] ConstIterator find_exact(PrefixNamespaceId namespace_id,
-                                         std::span<const std::uint32_t> tokens) const noexcept {
-    return std::find_if(entries.cbegin(), entries.cend(), [&](const Entry& entry) {
-      return entry.namespace_id == namespace_id && token_vectors_equal(entry.tokens, tokens);
-    });
+                                         std::span<const std::uint32_t> tokens) const {
+    const auto candidates =
+        index.equal_range(index_key(namespace_id, tokens.size(), token_digest(tokens)));
+    const auto match =
+        std::find_if(candidates.first, candidates.second, [&](const auto& candidate) {
+          return token_vectors_equal(candidate.second->tokens, tokens);
+        });
+    return match == candidates.second ? entries.cend() : ConstIterator(match->second);
   }
 
   void validate_key(PrefixNamespaceId namespace_id, std::span<const std::uint32_t> tokens,
@@ -105,7 +173,15 @@ struct PagedPrefixCache::Impl {
 
   void erase_locked(Iterator position, bool eviction) {
     HELIX_ASSERT(position != entries.end(), "prefix cache attempted to erase its end iterator");
+    const auto candidates = index.equal_range(
+        index_key(position->namespace_id, position->tokens.size(), position->digest));
+    const auto indexed =
+        std::find_if(candidates.first, candidates.second,
+                     [&](const auto& candidate) { return candidate.second == position; });
+    HELIX_ASSERT(indexed != candidates.second,
+                 "prefix cache LRU entry is absent from the content index");
     cache->release_sequence(position->anchor);
+    index.erase(indexed);
     cache_stats.retained_tokens -= position->tokens.size();
     cache_stats.retained_block_references -= position->block_references;
     --cache_stats.entry_count;
@@ -140,6 +216,8 @@ struct PagedPrefixCache::Impl {
                    "prefix cache entry is empty or not block aligned");
       HELIX_ASSERT(outer->block_references == outer->tokens.size() / cache->config().block_tokens,
                    "prefix cache entry block count disagrees with its token count");
+      HELIX_ASSERT(outer->digest == token_digest(outer->tokens),
+                   "prefix cache entry digest disagrees with its content key");
       HELIX_ASSERT(cache->contains(outer->anchor), "prefix cache anchor is not live");
       HELIX_ASSERT(cache->length(outer->anchor) == outer->tokens.size(),
                    "prefix cache anchor length disagrees with its content key");
@@ -151,10 +229,26 @@ struct PagedPrefixCache::Impl {
                        std::numeric_limits<std::size_t>::max() - retained_blocks,
                    "prefix cache retained-block invariant sum would overflow");
       retained_blocks += outer->block_references;
-      for (auto inner = std::next(outer); inner != entries.cend(); ++inner) {
-        HELIX_ASSERT(outer->namespace_id != inner->namespace_id || outer->tokens != inner->tokens,
-                     "prefix cache contains a duplicate exact key");
+      const auto candidates =
+          index.equal_range(index_key(outer->namespace_id, outer->tokens.size(), outer->digest));
+      std::size_t exact_key_count = 0;
+      std::size_t entry_mapping_count = 0;
+      for (auto candidate = candidates.first; candidate != candidates.second; ++candidate) {
+        exact_key_count +=
+            static_cast<std::size_t>(token_vectors_equal(candidate->second->tokens, outer->tokens));
+        entry_mapping_count += static_cast<std::size_t>(candidate->second == outer);
       }
+      HELIX_ASSERT(exact_key_count == 1, "prefix cache contains a duplicate exact key");
+      HELIX_ASSERT(entry_mapping_count == 1,
+                   "prefix cache entry does not have exactly one index mapping");
+    }
+    HELIX_ASSERT(index.size() == entries.size(),
+                 "prefix cache content-index size disagrees with its LRU size");
+    for (const auto& [key, position] : index) {
+      HELIX_ASSERT(position != entries.end(), "prefix cache index stores its end iterator");
+      HELIX_ASSERT(key.namespace_id == position->namespace_id &&
+                       key.token_count == position->tokens.size() && key.digest == position->digest,
+                   "prefix cache index key disagrees with its LRU entry");
     }
     HELIX_ASSERT(entries.size() <= config.maximum_entries, "prefix cache entry limit is exceeded");
     HELIX_ASSERT(retained_blocks <= config.maximum_block_references,
@@ -176,6 +270,7 @@ struct PagedPrefixCache::Impl {
   PagedPrefixCacheConfig config;
   mutable std::mutex mutex;
   EntryList entries;
+  ContentIndex index;
   PagedPrefixCacheStats cache_stats;
 };
 
@@ -227,6 +322,8 @@ PrefixInsertStatus PagedPrefixCache::insert(PrefixNamespaceId namespace_id,
   Impl::Entry staged;
   staged.namespace_id = namespace_id;
   staged.block_references = block_references;
+  const std::uint64_t digest = token_digest(tokens);
+  staged.digest = digest;
   try {
     staged.tokens.assign(tokens.begin(), tokens.end());
   } catch (const std::bad_alloc&) {
@@ -241,6 +338,15 @@ PrefixInsertStatus PagedPrefixCache::insert(PrefixNamespaceId namespace_id,
     impl_->cache->release_sequence(anchor);
     throw_error(ErrorCode::kResourceExhausted,
                 "PagedPrefixCache::insert could not allocate the LRU entry");
+  }
+  try {
+    impl_->index.emplace(Impl::index_key(namespace_id, tokens.size(), digest),
+                         impl_->entries.begin());
+  } catch (const std::bad_alloc&) {
+    impl_->cache->release_sequence(anchor);
+    impl_->entries.pop_front();
+    throw_error(ErrorCode::kResourceExhausted,
+                "PagedPrefixCache::insert could not allocate the content index entry");
   }
 
   impl_->evict_for_insert_locked(block_references);
@@ -269,11 +375,21 @@ PagedPrefixCache::lookup_longest(PrefixNamespaceId namespace_id,
 
   Impl::Iterator best = impl_->entries.end();
   std::size_t best_tokens = 0;
-  for (auto position = impl_->entries.begin(); position != impl_->entries.end(); ++position) {
-    if (position->namespace_id == namespace_id && position->tokens.size() <= aligned_limit &&
-        position->tokens.size() > best_tokens && token_vector_is_prefix(position->tokens, tokens)) {
-      best = position;
-      best_tokens = position->tokens.size();
+  std::uint64_t digest = kFnvOffsetBasis;
+  for (std::size_t token = 0; token < aligned_limit; ++token) {
+    digest = extend_token_digest(digest, tokens[token]);
+    const std::size_t prefix_tokens = token + 1;
+    if (prefix_tokens % page_tokens != 0) {
+      continue;
+    }
+    const auto candidates =
+        impl_->index.equal_range(Impl::index_key(namespace_id, prefix_tokens, digest));
+    for (auto candidate = candidates.first; candidate != candidates.second; ++candidate) {
+      if (token_vector_is_prefix(candidate->second->tokens, tokens)) {
+        best = candidate->second;
+        best_tokens = prefix_tokens;
+        break;
+      }
     }
   }
 
