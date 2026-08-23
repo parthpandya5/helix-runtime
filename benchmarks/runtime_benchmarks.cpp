@@ -127,9 +127,11 @@ std::size_t tokens_per_trace(const RuntimeTraceConfig& config) {
   return tokens;
 }
 
-void BM_CpuRuntimeContinuousTrace(benchmark::State& state, CpuPrefillMode prefill_mode) {
+void run_runtime_trace_benchmark(benchmark::State& state, CpuPrefillMode prefill_mode,
+                                 model::PagedDecodeMode paged_decode_mode) {
   RuntimeTraceConfig config = trace_config(state);
   config.runtime.prefill_mode = prefill_mode;
+  config.runtime.paged_decode_mode = paged_decode_mode;
   bool warmed_up = false;
   std::uint64_t total_runtime_iterations = 0;
   std::size_t peak_kv_bytes = 0;
@@ -170,6 +172,15 @@ void BM_CpuRuntimeContinuousTrace(benchmark::State& state, CpuPrefillMode prefil
   state.SetItemsProcessed(state.iterations() * static_cast<benchmark::IterationCount>(token_count));
 }
 
+void BM_CpuRuntimeContinuousTrace(benchmark::State& state, CpuPrefillMode prefill_mode) {
+  run_runtime_trace_benchmark(state, prefill_mode, model::PagedDecodeMode::kCompactCopy);
+}
+
+void BM_CpuRuntimePagedDecodeTrace(benchmark::State& state,
+                                   model::PagedDecodeMode paged_decode_mode) {
+  run_runtime_trace_benchmark(state, CpuPrefillMode::kFullPrompt, paged_decode_mode);
+}
+
 BENCHMARK_CAPTURE(BM_CpuRuntimeContinuousTrace, SequentialTokenPrefill,
                   CpuPrefillMode::kSequentialDecode)
     ->Args({16, 32, 1, 4, 8, 4, 4, 4})
@@ -178,6 +189,20 @@ BENCHMARK_CAPTURE(BM_CpuRuntimeContinuousTrace, SequentialTokenPrefill,
     ->ArgNames({"hidden", "intermediate", "layers", "heads", "requests", "prompt", "output",
                 "active"});
 BENCHMARK_CAPTURE(BM_CpuRuntimeContinuousTrace, FullPromptPrefill, CpuPrefillMode::kFullPrompt)
+    ->Args({16, 32, 1, 4, 8, 4, 4, 4})
+    ->Args({32, 64, 2, 4, 8, 8, 8, 4})
+    ->Args({64, 128, 2, 4, 16, 8, 8, 8})
+    ->ArgNames({"hidden", "intermediate", "layers", "heads", "requests", "prompt", "output",
+                "active"});
+
+BENCHMARK_CAPTURE(BM_CpuRuntimePagedDecodeTrace, CompactCopy, model::PagedDecodeMode::kCompactCopy)
+    ->Args({16, 32, 1, 4, 8, 4, 4, 4})
+    ->Args({32, 64, 2, 4, 8, 8, 8, 4})
+    ->Args({64, 128, 2, 4, 16, 8, 8, 8})
+    ->ArgNames({"hidden", "intermediate", "layers", "heads", "requests", "prompt", "output",
+                "active"});
+BENCHMARK_CAPTURE(BM_CpuRuntimePagedDecodeTrace, DirectBlockTable,
+                  model::PagedDecodeMode::kDirectBlockTable)
     ->Args({16, 32, 1, 4, 8, 4, 4, 4})
     ->Args({32, 64, 2, 4, 8, 8, 8, 4})
     ->Args({64, 128, 2, 4, 16, 8, 8, 8})

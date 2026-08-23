@@ -71,3 +71,13 @@ add_test(
 set_tests_properties(
   benchmark.runtime_smoke
   PROPERTIES LABELS "benchmark;runtime;smoke" TIMEOUT 30)
+
+add_test(
+  NAME benchmark.runtime_paged_decode_smoke
+  COMMAND helix_benchmarks
+          "--benchmark_filter=BM_CpuRuntimePagedDecodeTrace/DirectBlockTable/hidden:16/intermediate:32/layers:1/heads:4/requests:8/prompt:4/output:4/active:4$"
+          --benchmark_min_time=0.001s
+          --benchmark_repetitions=1)
+set_tests_properties(
+  benchmark.runtime_paged_decode_smoke
+  PROPERTIES LABELS "benchmark;runtime;smoke" TIMEOUT 30)

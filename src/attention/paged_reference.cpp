@@ -19,6 +19,8 @@ namespace {
 struct PagedAttentionDimensions {
   std::size_t heads;
   std::size_t queries;
+  std::size_t history_keys;
+  std::size_t tail_keys;
   std::size_t keys;
   std::size_t head_dimension;
   std::size_t logical_blocks;
@@ -41,24 +43,66 @@ void require_cpu_float_tensor(const Tensor& tensor, std::string_view name,
               tensor_error(operation, name, "must be contiguous"));
 }
 
-PagedAttentionDimensions validate_inputs(const Tensor& query,
-                                         const kv_cache::PagedKvCache::LayerReadView& kv_layer,
-                                         std::string_view operation) {
+PagedAttentionDimensions
+validate_query_and_history(const Tensor& query,
+                           const kv_cache::PagedKvCache::LayerReadView& kv_layer,
+                           std::string_view operation) {
   require_cpu_float_tensor(query, "query", operation);
   HELIX_CHECK(query.rank() == 3, ErrorCode::kInvalidArgument,
               tensor_error(operation, "query", "must have rank three"));
-  const std::size_t keys = kv_layer.length();
+  const std::size_t history_keys = kv_layer.length();
   const std::size_t heads = kv_layer.kv_heads();
   const std::size_t head_dimension = kv_layer.head_dimension();
-  HELIX_CHECK(keys != 0, ErrorCode::kInvalidArgument,
-              tensor_error(operation, "KV token count", "must be positive"));
   HELIX_CHECK(query.shape()[0] == static_cast<Dimension>(heads), ErrorCode::kInvalidArgument,
               tensor_error(operation, "query and KV cache", "must have equal head counts"));
   HELIX_CHECK(query.shape()[2] == static_cast<Dimension>(head_dimension),
               ErrorCode::kInvalidArgument,
               tensor_error(operation, "query and KV cache", "must have equal head dimensions"));
-  return PagedAttentionDimensions{heads, static_cast<std::size_t>(query.shape()[1]), keys,
-                                  head_dimension, kv_layer.logical_block_count()};
+  return PagedAttentionDimensions{heads,
+                                  static_cast<std::size_t>(query.shape()[1]),
+                                  history_keys,
+                                  0,
+                                  history_keys,
+                                  head_dimension,
+                                  kv_layer.logical_block_count()};
+}
+
+PagedAttentionDimensions validate_inputs(const Tensor& query,
+                                         const kv_cache::PagedKvCache::LayerReadView& kv_layer,
+                                         std::string_view operation) {
+  PagedAttentionDimensions dimensions = validate_query_and_history(query, kv_layer, operation);
+  HELIX_CHECK(dimensions.history_keys != 0, ErrorCode::kInvalidArgument,
+              tensor_error(operation, "KV token count", "must be positive"));
+  return dimensions;
+}
+
+PagedAttentionDimensions validate_tail_inputs(const Tensor& query,
+                                              const kv_cache::PagedKvCache::LayerReadView& kv_layer,
+                                              const Tensor& tail_key, const Tensor& tail_value,
+                                              std::string_view operation) {
+  PagedAttentionDimensions dimensions = validate_query_and_history(query, kv_layer, operation);
+  require_cpu_float_tensor(tail_key, "tail key", operation);
+  require_cpu_float_tensor(tail_value, "tail value", operation);
+  HELIX_CHECK(tail_key.rank() == 3 && tail_value.rank() == 3, ErrorCode::kInvalidArgument,
+              tensor_error(operation, "tail key and value", "must have rank three"));
+  HELIX_CHECK(tail_key.shape() == tail_value.shape(), ErrorCode::kInvalidArgument,
+              tensor_error(operation, "tail key and value", "must have equal shapes"));
+  HELIX_CHECK(query.shape() == tail_key.shape(), ErrorCode::kInvalidArgument,
+              tensor_error(operation, "query and tail", "must have equal shapes"));
+  HELIX_CHECK(tail_key.shape()[0] == static_cast<Dimension>(dimensions.heads) &&
+                  tail_key.shape()[2] == static_cast<Dimension>(dimensions.head_dimension),
+              ErrorCode::kInvalidArgument,
+              tensor_error(operation, "tail and KV cache", "must have equal geometry"));
+  dimensions.tail_keys = static_cast<std::size_t>(tail_key.shape()[1]);
+  HELIX_CHECK(dimensions.tail_keys != 0, ErrorCode::kInvalidArgument,
+              tensor_error(operation, "tail token count", "must be positive"));
+  constexpr auto kMaximumDimension =
+      static_cast<std::size_t>(std::numeric_limits<Dimension>::max());
+  HELIX_CHECK(dimensions.history_keys <= kMaximumDimension - dimensions.tail_keys,
+              ErrorCode::kResourceExhausted,
+              tensor_error(operation, "history plus tail token count", "overflows shape range"));
+  dimensions.keys = dimensions.history_keys + dimensions.tail_keys;
+  return dimensions;
 }
 
 void validate_offset(const PagedAttentionDimensions& dimensions, std::size_t query_position_offset,
@@ -102,6 +146,23 @@ std::size_t paged_score_workspace_bytes(const Tensor& query,
   return checked_nbytes(paged_score_workspace_shape(query, kv_layer), DType::kFloat32);
 }
 
+Shape paged_tail_score_workspace_shape(const Tensor& query,
+                                       const kv_cache::PagedKvCache::LayerReadView& kv_layer,
+                                       const Tensor& tail_key, const Tensor& tail_value) {
+  constexpr std::string_view kOperation = "attention::cpu::paged_tail_score_workspace_shape";
+  const PagedAttentionDimensions dimensions =
+      validate_tail_inputs(query, kv_layer, tail_key, tail_value, kOperation);
+  return Shape{static_cast<Dimension>(dimensions.heads), static_cast<Dimension>(dimensions.queries),
+               static_cast<Dimension>(dimensions.keys)};
+}
+
+std::size_t paged_tail_score_workspace_bytes(const Tensor& query,
+                                             const kv_cache::PagedKvCache::LayerReadView& kv_layer,
+                                             const Tensor& tail_key, const Tensor& tail_value) {
+  return checked_nbytes(paged_tail_score_workspace_shape(query, kv_layer, tail_key, tail_value),
+                        DType::kFloat32);
+}
+
 namespace {
 
 enum class ValueTraversal {
@@ -111,32 +172,45 @@ enum class ValueTraversal {
 
 void paged_scaled_dot_product_attention_out_impl(
     const Tensor& query, const kv_cache::PagedKvCache::LayerReadView& kv_layer,
-    std::size_t query_position_offset, Tensor& output, Tensor& score_workspace,
-    ValueTraversal value_traversal) {
-  constexpr std::string_view kOperation = "attention::cpu::paged_scaled_dot_product_attention_out";
-  const PagedAttentionDimensions dimensions = validate_inputs(query, kv_layer, kOperation);
-  validate_offset(dimensions, query_position_offset, kOperation);
-  require_cpu_float_tensor(output, "output", kOperation);
-  require_cpu_float_tensor(score_workspace, "score workspace", kOperation);
+    const Tensor* tail_key, const Tensor* tail_value, std::size_t query_position_offset,
+    Tensor& output, Tensor& score_workspace, ValueTraversal value_traversal,
+    std::string_view operation) {
+  HELIX_ASSERT((tail_key == nullptr) == (tail_value == nullptr),
+               "paged attention tail pointers must be both null or both nonnull");
+  const bool has_tail = tail_key != nullptr;
+  const PagedAttentionDimensions dimensions =
+      has_tail ? validate_tail_inputs(query, kv_layer, *tail_key, *tail_value, operation)
+               : validate_inputs(query, kv_layer, operation);
+  validate_offset(dimensions, query_position_offset, operation);
+  require_cpu_float_tensor(output, "output", operation);
+  require_cpu_float_tensor(score_workspace, "score workspace", operation);
   require_shape(output,
                 Shape{static_cast<Dimension>(dimensions.heads),
                       static_cast<Dimension>(dimensions.queries),
                       static_cast<Dimension>(dimensions.head_dimension)},
-                "output", kOperation);
+                "output", operation);
   require_shape(score_workspace,
                 Shape{static_cast<Dimension>(dimensions.heads),
                       static_cast<Dimension>(dimensions.queries),
                       static_cast<Dimension>(dimensions.keys)},
-                "score workspace", kOperation);
-  require_no_alias(query, output, "query", "output", kOperation);
-  require_no_alias(query, score_workspace, "query", "score workspace", kOperation);
-  require_no_alias(score_workspace, output, "score workspace", "output", kOperation);
+                "score workspace", operation);
+  require_no_alias(query, output, "query", "output", operation);
+  require_no_alias(query, score_workspace, "query", "score workspace", operation);
+  require_no_alias(score_workspace, output, "score workspace", "output", operation);
+  if (has_tail) {
+    require_no_alias(*tail_key, output, "tail key", "output", operation);
+    require_no_alias(*tail_value, output, "tail value", "output", operation);
+    require_no_alias(*tail_key, score_workspace, "tail key", "score workspace", operation);
+    require_no_alias(*tail_value, score_workspace, "tail value", "score workspace", operation);
+  }
 
   if (dimensions.queries == 0) {
     return;
   }
 
   const auto* query_values = query.data_as<float>();
+  const float* tail_key_values = has_tail ? tail_key->data_as<float>() : nullptr;
+  const float* tail_value_values = has_tail ? tail_value->data_as<float>() : nullptr;
   auto* scores = score_workspace.data_as<float>();
   auto* output_values = output.data_as<float>();
   const double scale = 1.0 / std::sqrt(static_cast<double>(dimensions.head_dimension));
@@ -172,8 +246,32 @@ void paged_scaled_dot_product_attention_out_impl(
       }
       key_start += tokens_in_block;
     }
-    HELIX_ASSERT(key_start == dimensions.keys,
-                 "paged attention block traversal did not cover the KV sequence");
+    HELIX_ASSERT(key_start == dimensions.history_keys,
+                 "paged attention block traversal did not cover the cached history");
+    if (has_tail) {
+      for (std::size_t query_index = 0; query_index < dimensions.queries; ++query_index) {
+        const std::size_t query_offset =
+            (head * dimensions.queries + query_index) * dimensions.head_dimension;
+        const std::size_t score_offset =
+            (head * dimensions.queries + query_index) * dimensions.keys;
+        const std::size_t query_position = query_position_offset + query_index;
+        for (std::size_t token = 0; token < dimensions.tail_keys; ++token) {
+          const std::size_t key_index = dimensions.history_keys + token;
+          if (key_index > query_position) {
+            scores[score_offset + key_index] = -std::numeric_limits<float>::infinity();
+            continue;
+          }
+          const std::size_t key_offset =
+              (head * dimensions.tail_keys + token) * dimensions.head_dimension;
+          double dot_product = 0.0;
+          for (std::size_t dimension = 0; dimension < dimensions.head_dimension; ++dimension) {
+            dot_product += static_cast<double>(query_values[query_offset + dimension]) *
+                           static_cast<double>(tail_key_values[key_offset + dimension]);
+          }
+          scores[score_offset + key_index] = static_cast<float>(dot_product * scale);
+        }
+      }
+    }
   }
 
   helix::cpu::softmax_out(score_workspace, score_workspace);
@@ -207,8 +305,17 @@ void paged_scaled_dot_product_attention_out_impl(
             }
             value_start += tokens_in_block;
           }
-          HELIX_ASSERT(value_start == dimensions.keys,
-                       "paged attention value traversal did not cover the KV sequence");
+          HELIX_ASSERT(value_start == dimensions.history_keys,
+                       "paged attention value traversal did not cover the cached history");
+          if (has_tail) {
+            for (std::size_t token = 0; token < dimensions.tail_keys; ++token) {
+              const std::size_t key_index = dimensions.history_keys + token;
+              const std::size_t value_offset =
+                  (head * dimensions.tail_keys + token) * dimensions.head_dimension + dimension;
+              accumulator += static_cast<double>(scores[score_offset + key_index]) *
+                             static_cast<double>(tail_value_values[value_offset]);
+            }
+          }
           output_values[output_offset + dimension] = static_cast<float>(accumulator);
         }
         continue;
@@ -238,8 +345,22 @@ void paged_scaled_dot_product_attention_out_impl(
           }
           value_start += tokens_in_block;
         }
-        HELIX_ASSERT(value_start == dimensions.keys,
-                     "paged attention value traversal did not cover the KV sequence");
+        HELIX_ASSERT(value_start == dimensions.history_keys,
+                     "paged attention value traversal did not cover the cached history");
+        if (has_tail) {
+          for (std::size_t token = 0; token < dimensions.tail_keys; ++token) {
+            const std::size_t key_index = dimensions.history_keys + token;
+            const std::size_t value_offset =
+                (head * dimensions.tail_keys + token) * dimensions.head_dimension + dimension_start;
+            const double probability = static_cast<double>(scores[score_offset + key_index]);
+            for (std::size_t tile_dimension = 0; tile_dimension < tile_dimensions;
+                 ++tile_dimension) {
+              accumulators[tile_dimension] +=
+                  probability *
+                  static_cast<double>(tail_value_values[value_offset + tile_dimension]);
+            }
+          }
+        }
         for (std::size_t tile_dimension = 0; tile_dimension < tile_dimensions; ++tile_dimension) {
           output_values[output_offset + dimension_start + tile_dimension] =
               static_cast<float>(accumulators[tile_dimension]);
@@ -255,15 +376,30 @@ void paged_scaled_dot_product_attention_out(const Tensor& query,
                                             const kv_cache::PagedKvCache::LayerReadView& kv_layer,
                                             std::size_t query_position_offset, Tensor& output,
                                             Tensor& score_workspace) {
-  paged_scaled_dot_product_attention_out_impl(query, kv_layer, query_position_offset, output,
-                                              score_workspace, ValueTraversal::kDimensionTiled);
+  constexpr std::string_view kOperation = "attention::cpu::paged_scaled_dot_product_attention_out";
+  paged_scaled_dot_product_attention_out_impl(query, kv_layer, nullptr, nullptr,
+                                              query_position_offset, output, score_workspace,
+                                              ValueTraversal::kDimensionTiled, kOperation);
+}
+
+void paged_scaled_dot_product_attention_with_tail_out(
+    const Tensor& query, const kv_cache::PagedKvCache::LayerReadView& kv_layer,
+    const Tensor& tail_key, const Tensor& tail_value, Tensor& output, Tensor& score_workspace) {
+  constexpr std::string_view kOperation =
+      "attention::cpu::paged_scaled_dot_product_attention_with_tail_out";
+  paged_scaled_dot_product_attention_out_impl(query, kv_layer, &tail_key, &tail_value,
+                                              kv_layer.length(), output, score_workspace,
+                                              ValueTraversal::kDimensionTiled, kOperation);
 }
 
 void paged_scaled_dot_product_attention_dimension_major_out(
     const Tensor& query, const kv_cache::PagedKvCache::LayerReadView& kv_layer,
     std::size_t query_position_offset, Tensor& output, Tensor& score_workspace) {
-  paged_scaled_dot_product_attention_out_impl(query, kv_layer, query_position_offset, output,
-                                              score_workspace, ValueTraversal::kDimensionMajor);
+  constexpr std::string_view kOperation =
+      "attention::cpu::paged_scaled_dot_product_attention_dimension_major_out";
+  paged_scaled_dot_product_attention_out_impl(query, kv_layer, nullptr, nullptr,
+                                              query_position_offset, output, score_workspace,
+                                              ValueTraversal::kDimensionMajor, kOperation);
 }
 
 Tensor paged_scaled_dot_product_attention(const Tensor& query,
@@ -279,6 +415,25 @@ Tensor paged_scaled_dot_product_attention(const Tensor& query,
                                     static_cast<Dimension>(dimensions.queries),
                                     static_cast<Dimension>(dimensions.keys)});
   paged_scaled_dot_product_attention_out(query, kv_layer, query_position_offset, output, workspace);
+  return output;
+}
+
+Tensor
+paged_scaled_dot_product_attention_with_tail(const Tensor& query,
+                                             const kv_cache::PagedKvCache::LayerReadView& kv_layer,
+                                             const Tensor& tail_key, const Tensor& tail_value) {
+  constexpr std::string_view kOperation =
+      "attention::cpu::paged_scaled_dot_product_attention_with_tail";
+  const PagedAttentionDimensions dimensions =
+      validate_tail_inputs(query, kv_layer, tail_key, tail_value, kOperation);
+  Tensor output = Tensor::empty({static_cast<Dimension>(dimensions.heads),
+                                 static_cast<Dimension>(dimensions.queries),
+                                 static_cast<Dimension>(dimensions.head_dimension)});
+  Tensor workspace = Tensor::empty({static_cast<Dimension>(dimensions.heads),
+                                    static_cast<Dimension>(dimensions.queries),
+                                    static_cast<Dimension>(dimensions.keys)});
+  paged_scaled_dot_product_attention_with_tail_out(query, kv_layer, tail_key, tail_value, output,
+                                                   workspace);
   return output;
 }
 

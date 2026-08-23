@@ -137,19 +137,36 @@ TEST(CpuLlamaGeneratorTest, CachedDecodeMatchesFullPrefixRecomputation) {
 TEST(CpuLlamaModelTest, PagedSequentialDecodeMatchesEveryFullPrefixPosition) {
   const LlamaConfig config = generation_config();
   CpuLlamaModel model = make_model(config);
-  kv_cache::PagedKvCache cache(kv_cache::PagedKvCacheConfig{
-      config.layer_count, config.attention_head_count, config.head_dimension(), 2, 4});
-  const kv_cache::PagedSequenceHandle sequence = cache.create_sequence();
+  const kv_cache::PagedKvCacheConfig cache_config{config.layer_count, config.attention_head_count,
+                                                  config.head_dimension(), 2, 4};
+  kv_cache::PagedKvCache direct_cache(cache_config);
+  kv_cache::PagedKvCache compact_cache(cache_config);
+  const kv_cache::PagedSequenceHandle direct_sequence = direct_cache.create_sequence();
+  const kv_cache::PagedSequenceHandle compact_sequence = compact_cache.create_sequence();
   std::vector<std::uint32_t> context;
 
   for (const std::uint32_t token : std::array<std::uint32_t, 4>{2, 5, 1, 4}) {
-    const CpuLlamaDecodeResult decoded = model.decode_one(token, context.size(), cache, sequence);
+    const CpuLlamaDecodeResult direct = model.decode_one(
+        token, context.size(), direct_cache, direct_sequence, PagedDecodeMode::kDirectBlockTable);
+    const CpuLlamaDecodeResult compact = model.decode_one(
+        token, context.size(), compact_cache, compact_sequence, PagedDecodeMode::kCompactCopy);
     context.push_back(token);
-    expect_decode_matches_last_row(decoded.logits, model.forward(context), 5.0e-5F);
-    cache.append(sequence, decoded.token_keys, decoded.token_values);
-    EXPECT_EQ(cache.length(sequence), context.size());
+    expect_decode_matches_last_row(direct.logits, model.forward(context), 5.0e-5F);
+    expect_tensor_near(direct.logits, compact.logits, 5.0e-5F);
+    expect_tensor_near(direct.token_keys, compact.token_keys, 5.0e-5F);
+    expect_tensor_near(direct.token_values, compact.token_values, 5.0e-5F);
+    direct_cache.append(direct_sequence, direct.token_keys, direct.token_values);
+    compact_cache.append(compact_sequence, compact.token_keys, compact.token_values);
+    EXPECT_EQ(direct_cache.length(direct_sequence), context.size());
+    EXPECT_EQ(compact_cache.length(compact_sequence), context.size());
   }
-  EXPECT_EQ(cache.block_table(sequence).size(), 2U);
+  EXPECT_EQ(direct_cache.block_table(direct_sequence).size(), 2U);
+  EXPECT_EQ(compact_cache.block_table(compact_sequence).size(), 2U);
+
+  EXPECT_THROW(static_cast<void>(model.decode_one(3, context.size(), direct_cache, direct_sequence,
+                                                  static_cast<PagedDecodeMode>(255))),
+               Error);
+  EXPECT_EQ(direct_cache.length(direct_sequence), context.size());
 }
 
 TEST(CpuLlamaGeneratorTest, GreedyGenerationMatchesRepeatedFullRecomputation) {

@@ -2,6 +2,7 @@
 #include "helix/attention/reference.hpp"
 #include "helix/kv_cache/paged.hpp"
 
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstddef>
@@ -17,6 +18,24 @@ void expect_near(const Tensor& actual, const Tensor& expected, float tolerance =
     EXPECT_NEAR(actual.data_as<float>()[index], expected.data_as<float>()[index], tolerance)
         << "at index " << index;
   }
+}
+
+Tensor concatenate_token_axis(const Tensor& history, const Tensor& tail) {
+  const std::size_t heads = static_cast<std::size_t>(history.shape()[0]);
+  const std::size_t history_tokens = static_cast<std::size_t>(history.shape()[1]);
+  const std::size_t tail_tokens = static_cast<std::size_t>(tail.shape()[1]);
+  const std::size_t dimensions = static_cast<std::size_t>(history.shape()[2]);
+  Tensor result =
+      Tensor::empty({history.shape()[0], history.shape()[1] + tail.shape()[1], history.shape()[2]});
+  for (std::size_t head = 0; head < heads; ++head) {
+    float* destination =
+        result.data_as<float>() + head * (history_tokens + tail_tokens) * dimensions;
+    std::copy_n(history.data_as<float>() + head * history_tokens * dimensions,
+                history_tokens * dimensions, destination);
+    std::copy_n(tail.data_as<float>() + head * tail_tokens * dimensions, tail_tokens * dimensions,
+                destination + history_tokens * dimensions);
+  }
+  return result;
 }
 
 TEST(PagedAttentionTest, MatchesContiguousCausalPrefillAcrossBlockBoundaries) {
@@ -78,6 +97,87 @@ TEST(PagedAttentionTest, MatchesOddMultiHeadChunkedDecodeWithoutCompaction) {
   auto view = cache.read_layer(sequence, 1);
   const Tensor actual = paged_scaled_dot_product_attention(query, view, 6);
   expect_near(actual, expected, 2.0e-5F);
+}
+
+TEST(PagedAttentionTest, TailContinuationMatchesCompactedHistoryAcrossOddPages) {
+  constexpr std::size_t kHeads = 2;
+  constexpr std::size_t kDimension = 3;
+  constexpr std::size_t kHistoryTokens = 3;
+  constexpr std::size_t kTailTokens = 2;
+  kv_cache::PagedKvCache cache(kv_cache::PagedKvCacheConfig{1, kHeads, kDimension, 2, 2});
+  const kv_cache::PagedSequenceHandle sequence = cache.create_sequence();
+  for (std::size_t token = 0; token < kHistoryTokens; ++token) {
+    cache.append(sequence,
+                 Tensor::random_uniform({1, kHeads, kDimension}, 94'000 + token, -1.0F, 1.0F),
+                 Tensor::random_uniform({1, kHeads, kDimension}, 95'000 + token, -1.0F, 1.0F));
+  }
+
+  const Tensor query =
+      Tensor::random_uniform({kHeads, kTailTokens, kDimension}, 96'000, -1.0F, 1.0F);
+  const Tensor tail_key =
+      Tensor::random_uniform({kHeads, kTailTokens, kDimension}, 96'001, -1.0F, 1.0F);
+  const Tensor tail_value =
+      Tensor::random_uniform({kHeads, kTailTokens, kDimension}, 96'002, -1.0F, 1.0F);
+  const kv_cache::KvLayer compact = cache.retrieve_layer(sequence, 0);
+  const Tensor combined_key = concatenate_token_axis(compact.keys, tail_key);
+  const Tensor combined_value = concatenate_token_axis(compact.values, tail_value);
+  Tensor expected_output = Tensor::empty({kHeads, kTailTokens, kDimension});
+  Tensor expected_workspace = Tensor::empty({kHeads, kTailTokens, kHistoryTokens + kTailTokens});
+  scaled_dot_product_attention_out(query, combined_key, combined_value, kHistoryTokens,
+                                   expected_output, expected_workspace);
+
+  auto view = cache.read_layer(sequence, 0);
+  EXPECT_EQ(paged_tail_score_workspace_shape(query, view, tail_key, tail_value),
+            (Shape{kHeads, kTailTokens, kHistoryTokens + kTailTokens}));
+  EXPECT_EQ(paged_tail_score_workspace_bytes(query, view, tail_key, tail_value), 80U);
+  Tensor output = Tensor::empty({kHeads, kTailTokens, kDimension});
+  Tensor workspace = Tensor::empty({kHeads, kTailTokens, kHistoryTokens + kTailTokens});
+  paged_scaled_dot_product_attention_with_tail_out(query, view, tail_key, tail_value, output,
+                                                   workspace);
+  expect_near(output, expected_output, 2.0e-5F);
+  expect_near(workspace, expected_workspace, 2.0e-5F);
+  expect_near(paged_scaled_dot_product_attention_with_tail(query, view, tail_key, tail_value),
+              expected_output, 2.0e-5F);
+}
+
+TEST(PagedAttentionTest, TailContinuationSupportsEmptyHistoryAndRejectsInvalidContracts) {
+  kv_cache::PagedKvCache cache(kv_cache::PagedKvCacheConfig{1, 2, 3, 2, 1});
+  const kv_cache::PagedSequenceHandle sequence = cache.create_sequence();
+  const Tensor query = Tensor::random_uniform({2, 1, 3}, 97'000, -1.0F, 1.0F);
+  const Tensor tail_key = Tensor::random_uniform({2, 1, 3}, 97'001, -1.0F, 1.0F);
+  const Tensor tail_value = Tensor::random_uniform({2, 1, 3}, 97'002, -1.0F, 1.0F);
+  const Tensor expected = scaled_dot_product_attention(query, tail_key, tail_value, 0);
+  auto view = cache.read_layer(sequence, 0);
+  expect_near(paged_scaled_dot_product_attention_with_tail(query, view, tail_key, tail_value),
+              expected);
+
+  EXPECT_THROW(static_cast<void>(paged_tail_score_workspace_shape(Tensor::zeros({2, 0, 3}), view,
+                                                                  Tensor::zeros({2, 0, 3}),
+                                                                  Tensor::zeros({2, 0, 3}))),
+               Error);
+  EXPECT_THROW(static_cast<void>(paged_tail_score_workspace_shape(
+                   query, view, Tensor::zeros({1, 1, 3}), tail_value)),
+               Error);
+  EXPECT_THROW(static_cast<void>(paged_tail_score_workspace_shape(query, view, tail_key,
+                                                                  Tensor::zeros({2, 1, 2}))),
+               Error);
+  EXPECT_THROW(static_cast<void>(paged_tail_score_workspace_shape(Tensor::zeros({2, 2, 3}), view,
+                                                                  tail_key, tail_value)),
+               Error);
+  EXPECT_THROW(static_cast<void>(paged_tail_score_workspace_shape(
+                   query, view, Tensor::zeros({2, 1, 3}, DType::kFloat16), tail_value)),
+               Error);
+
+  Tensor output_alias = tail_key;
+  Tensor workspace = Tensor::empty({2, 1, 1});
+  EXPECT_THROW(paged_scaled_dot_product_attention_with_tail_out(query, view, tail_key, tail_value,
+                                                                output_alias, workspace),
+               Error);
+  Tensor output = Tensor::empty({2, 1, 3});
+  Tensor wrong_workspace = Tensor::empty({2, 1, 2});
+  EXPECT_THROW(paged_scaled_dot_product_attention_with_tail_out(query, view, tail_key, tail_value,
+                                                                output, wrong_workspace),
+               Error);
 }
 
 TEST(PagedAttentionTest, SupportsZeroQueriesWithPositiveKvHistory) {

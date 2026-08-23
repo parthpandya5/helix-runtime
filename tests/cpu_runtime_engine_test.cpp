@@ -170,6 +170,29 @@ TEST(CpuRuntimeEngineTest, FullPromptPrefillMatchesReferenceAndUsesBulkPagedAppe
   EXPECT_EQ(stats.active_session_count, 0U);
 }
 
+TEST(CpuRuntimeEngineTest, DirectAndCompactedPagedDecodeModesProduceIdenticalRequests) {
+  const model::LlamaConfig model_config = runtime_model_config();
+  const std::vector<std::uint32_t> prompt{2, 5, 1};
+  CpuRuntimeConfig direct_config{scheduler::SchedulerConfig{8, 2, 2}, 8};
+  direct_config.paged_decode_mode = model::PagedDecodeMode::kDirectBlockTable;
+  CpuRuntimeConfig compact_config = direct_config;
+  compact_config.paged_decode_mode = model::PagedDecodeMode::kCompactCopy;
+  CpuRuntimeEngine direct(make_model(model_config), direct_config);
+  CpuRuntimeEngine compact(make_model(model_config), compact_config);
+  direct.submit(make_request(3, prompt, 4));
+  compact.submit(make_request(3, prompt, 4));
+
+  run_to_completion(direct, kStart);
+  run_to_completion(compact, kStart);
+  const scheduler::Request& direct_request = direct.request(scheduler::RequestId{3});
+  const scheduler::Request& compact_request = compact.request(scheduler::RequestId{3});
+  EXPECT_EQ(generated_values(direct_request), generated_values(compact_request));
+  EXPECT_EQ(direct_request.finish_reason(), compact_request.finish_reason());
+  EXPECT_EQ(direct.stats().executed_iteration_count, compact.stats().executed_iteration_count);
+  EXPECT_EQ(direct.stats().kv_cache.used_blocks, 0U);
+  EXPECT_EQ(compact.stats().kv_cache.used_blocks, 0U);
+}
+
 TEST(CpuRuntimeEngineTest, RefillsFinishedSlotWithRealModelWork) {
   const model::LlamaConfig model_config = runtime_model_config();
   CpuRuntimeEngine engine(make_model(model_config),
@@ -320,6 +343,12 @@ TEST(CpuRuntimeEngineTest, RejectsInvalidSubmissionsWithoutLeakingSessions) {
       static_cast<void>(CpuRuntimeEngine(make_model(model_config),
                                          CpuRuntimeConfig{scheduler::SchedulerConfig{4, 2, 2}, 2,
                                                           static_cast<CpuPrefillMode>(255)})),
+      Error);
+  EXPECT_THROW(
+      static_cast<void>(CpuRuntimeEngine(
+          make_model(model_config),
+          CpuRuntimeConfig{scheduler::SchedulerConfig{4, 2, 2}, 2, CpuPrefillMode::kFullPrompt,
+                           static_cast<model::PagedDecodeMode>(255)})),
       Error);
   CpuRuntimeEngine engine(make_model(model_config),
                           CpuRuntimeConfig{scheduler::SchedulerConfig{4, 2, 2}, 2});

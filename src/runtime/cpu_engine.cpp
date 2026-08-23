@@ -53,6 +53,10 @@ struct CpuRuntimeEngine::Impl {
                     config.prefill_mode == CpuPrefillMode::kFullPrompt,
                 ErrorCode::kInvalidArgument,
                 engine_context("constructor") + ": unknown CPU prefill mode");
+    HELIX_CHECK(config.paged_decode_mode == model::PagedDecodeMode::kCompactCopy ||
+                    config.paged_decode_mode == model::PagedDecodeMode::kDirectBlockTable,
+                ErrorCode::kInvalidArgument,
+                engine_context("constructor") + ": unknown paged decode mode");
   }
 
   void validate_submission(const scheduler::Request& request,
@@ -148,7 +152,8 @@ struct CpuRuntimeEngine::Impl {
                   engine_context("execute_prefill") + ": sequential-prefill counter exhausted");
       const scheduler::TokenId token = request.prompt_tokens()[work.token_offset + index];
       model::CpuLlamaDecodeResult decoded =
-          model.decode_one(token.value(), cache.length(active.sequence), cache, active.sequence);
+          model.decode_one(token.value(), cache.length(active.sequence), cache, active.sequence,
+                           config.paged_decode_mode);
       cache.append(active.sequence, decoded.token_keys, decoded.token_values);
       active.next_logits = std::move(decoded.logits);
       ++sequential_prefill_token_count;
@@ -171,8 +176,9 @@ struct CpuRuntimeEngine::Impl {
         active.end_of_sequence.has_value() && generated == *active.end_of_sequence;
     const bool terminal = end_of_sequence || request.remaining_generation_tokens() == 1;
     if (!terminal) {
-      model::CpuLlamaDecodeResult decoded = model.decode_one(
-          generated.value(), cache.length(active.sequence), cache, active.sequence);
+      model::CpuLlamaDecodeResult decoded =
+          model.decode_one(generated.value(), cache.length(active.sequence), cache, active.sequence,
+                           config.paged_decode_mode);
       cache.append(active.sequence, decoded.token_keys, decoded.token_values);
       active.next_logits = std::move(decoded.logits);
     }

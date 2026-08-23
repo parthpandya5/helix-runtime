@@ -22,6 +22,7 @@ struct CpuRuntimeConfig {
   scheduler::SchedulerConfig scheduler;
   std::size_t physical_kv_blocks = 0;
   CpuPrefillMode prefill_mode = CpuPrefillMode::kFullPrompt;
+  model::PagedDecodeMode paged_decode_mode = model::PagedDecodeMode::kDirectBlockTable;
 };
 
 struct CpuRuntimeIterationResult {

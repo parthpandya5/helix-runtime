@@ -95,6 +95,15 @@ struct CpuLlamaDecodeResult final {
   Tensor logits;
 };
 
+enum class PagedDecodeMode : std::uint8_t {
+  // Retained correctness/performance baseline: copy cached pages into a
+  // contiguous history-plus-current pair before ordinary attention.
+  kCompactCopy,
+  // Traverse cached physical pages directly and consume the current K/V as an
+  // uncommitted tail. This avoids two history-sized tensors and their copies.
+  kDirectBlockTable,
+};
+
 // Float32 CPU baseline for one precisely scoped Llama-style architecture:
 // bias-free projections, equal Q/K/V head counts, full adjacent-pair RoPE,
 // pre-attention/pre-MLP RMSNorm, SwiGLU, residual connections, and an explicit
@@ -121,7 +130,8 @@ public:
                                                 const kv_cache::SequenceHandle& sequence) const;
   [[nodiscard]] CpuLlamaDecodeResult
   decode_one(std::uint32_t token_id, std::size_t position, const kv_cache::PagedKvCache& cache,
-             const kv_cache::PagedSequenceHandle& sequence) const;
+             const kv_cache::PagedSequenceHandle& sequence,
+             PagedDecodeMode mode = PagedDecodeMode::kDirectBlockTable) const;
 
 private:
   LlamaConfig config_;
