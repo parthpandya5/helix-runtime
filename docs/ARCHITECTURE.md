@@ -466,15 +466,51 @@ the per-iteration scheduling hot path.
 
 ## Model executor
 
-The first supported model is a narrowly specified Llama-style decoder-only
-architecture using pre-normalization, RoPE, grouped heads only if required by the
-chosen checkpoint, SwiGLU MLPs, and a final RMSNorm/LM head. Exact tensor names,
-layouts, supported dimensions, precision, and tokenizer boundary will be recorded
-in `docs/MODEL_SUPPORT.md` before claiming model compatibility.
+The implemented M17 baseline is a narrowly specified CPU Float32 Llama-style
+decoder. It uses equal Q/K/V head counts, full adjacent-pair RoPE over an even head
+dimension, pre-attention and pre-MLP RMSNorm, bias-free projections, causal
+attention, residuals, SwiGLU, final normalization, and an explicit untied LM head.
+All projection weights use row-major `[input_features,output_features]` layout.
+GQA/MQA, partial rotary dimensions, biases, tied embeddings, quantization, and
+arbitrary checkpoint graphs are rejected rather than guessed.
 
-Weight conversion may use a one-time Python tool. The execution runtime remains
-C++/CUDA. The Helix weight container will include a versioned header, dtype, rank,
-dimensions, byte length, alignment, and validated offsets.
+```mermaid
+flowchart LR
+    Tokens[Token IDs T] --> Embed[Embedding V x H]
+    Embed --> Block[Repeat L decoder blocks]
+    Block --> ANorm[Attention RMSNorm]
+    ANorm --> QKV[Q / K / V projections]
+    QKV --> Rope[RoPE on Q and K]
+    Rope --> Causal[Causal attention]
+    Causal --> Residual1[O projection + residual]
+    Residual1 --> FNorm[FFN RMSNorm]
+    FNorm --> SwiGLU[Gate / up + SwiGLU]
+    SwiGLU --> Residual2[Down projection + residual]
+    Residual2 --> Block
+    Block --> Final[Final RMSNorm + LM head]
+    Final --> Logits[Logits T x V]
+```
+
+`CpuLlamaModel` moves a validated `LlamaWeights` bundle into one model owner. Its
+const forward path allocates independent activations and has no shared mutable
+state. Because Tensor storage is reference-counted, thread safety still requires
+that a caller not mutate a shallow weight alias retained before construction. The
+optional diagnostic path preserves post-layer Tensor handles and the final
+normalized state; ordinary execution does not retain those intermediates.
+
+The `HELIXLM1` container is a deterministic little-endian format with a fixed
+128-byte versioned header, fixed-size tensor directory, exact role/layer/shape
+records, and 64-byte-aligned Float32 payloads. Loading validates file size,
+configuration arithmetic, canonical nonoverlapping offsets, zero padding, finite
+values, an FNV-1a metadata checksum, and one checksum per payload before returning
+a model. FNV provides accidental-corruption detection, not authenticity. Details
+and the exact byte layout are in `docs/MODEL_SUPPORT.md`.
+
+The current executor performs full causal prefill only and repacks token-major
+Q/K/V tensors around the existing head-major attention API. KV-cached decode,
+token selection, tokenizer integration, scheduler/KV ownership, and CUDA model
+dispatch remain M18–M19 work. No public checkpoint compatibility is claimed yet,
+so a model-specific conversion utility has intentionally not been guessed.
 
 ## Runtime execution and asynchronous work
 

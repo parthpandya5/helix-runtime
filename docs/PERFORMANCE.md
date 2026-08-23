@@ -32,6 +32,7 @@ Every recorded experiment must include:
 | M13 CPU attention value traversal | Dimension-major probability-times-V for contiguous and direct paged storage | Accumulate fixed 32-coordinate tiles while each V row/page is hot; retain both baselines | Contiguous speedup 1.31x–2.47x and paged speedup 2.36x–2.99x across four paired cases. With equal tiling, paged CPU time was 2.1%–6.7% higher. | The original apparent paged win was confounded by a general loop-locality improvement. Applying the same traversal to both paths isolates a modest end-to-end paging cost on this CPU; it is not GPU evidence. |
 | M15 FIFO scheduler host trace | No earlier scheduler implementation | Schedule and complete deterministic mixed prefill/decode traces under token, running-request, and logical KV-block limits | Corrected median CPU time per complete trace: 48.777 us (16 requests/256 tokens) through 1.342 ms (128 requests/6,144 tokens) | A first fixture revision accidentally polled the O(N) statistics snapshot inside timing; those values were discarded. The corrected trace measures host policy and completion-vector work, not inference. |
 | M16 continuous batching policy | Static cohorts on the same mixed-length request sequence | Refill finished slots between iterations and aggregate lifecycle metrics | Under an explicit constant-1-ms iteration model, continuous/static makespans were 48/132 ms and 92/260 ms (2.75x and 2.83x modeled rates). Median host control CPU times differed by 1.3% and 4.1%. | Modeled results demonstrate policy utilization only; they are not measured model throughput. Host differences are small relative to local variation and do not establish a CPU optimization. |
+| M17 CPU Llama-style prefill and model load | No earlier complete model path | Compose the tested CPU kernels into full causal prefill and add checked `HELIXLM1` deserialization | Prefill medians: 97.942 us, 2.099 ms, and 34.104 ms for the three disclosed tiny configurations; checked in-memory load: 183.744 us, 640.046 us, and 3.967 ms | These establish single-threaded Float32 reference baselines, including forward temporaries or loader validation/allocation as specified. They do not demonstrate an optimization, GPU performance, disk-loading speed, or production model throughput. |
 
 ## M1 CPU tensor baseline — 2026-08-20
 
@@ -575,6 +576,76 @@ Command:
   --benchmark_repetitions=5 \
   --benchmark_report_aggregates_only=true
 ```
+
+## M17 CPU model baseline — 2026-08-23
+
+Environment:
+
+- source: implementation and benchmark commit `987c3b2`;
+- host: Apple M3 Pro, 12 CPU cores (6 performance, 6 efficiency), 18 GB RAM;
+- OS/compiler/build: macOS 26.0.1 arm64, Apple Clang 17.0.0, Release,
+  `HELIX_ENABLE_CUDA=OFF`, warnings as errors, Float32;
+- CMake 4.2.3 and Google Benchmark 1.9.1;
+- concurrency: one benchmark thread; CPU reference kernels are single-threaded;
+- warmup: one complete untimed operation after fixture setup for each benchmark
+  invocation;
+- measurement: minimum 0.1 seconds, seven repetitions, median CPU time reported;
+- one-minute load average at start: 9.08; affinity and CPU-frequency metadata were
+  unavailable on this host.
+
+The full-prefill fixture constructs deterministic model weights and token IDs
+outside timing. Each measured iteration calls `CpuLlamaModel::forward` and includes
+embedding lookup, RoPE-cache construction, all layer math, causal attention,
+token/head repacking, every temporary Tensor allocation/destruction, final norm,
+and the full `[T,V]` logits projection. It excludes model construction, weight
+initialization, token construction, and diagnostic trace retention.
+
+| H / I / L / heads / T / V | Parameters / bytes | Iterations per repetition | Median CPU time | CPU-time CV | Prompt tokens/s |
+|---|---:|---:|---:|---:|---:|
+| 32 / 64 / 2 / 4 / 7 / 128 | 28,832 / 115,328 B | 1,494 | 97.942 us | 2.15% | 71,470.6 |
+| 64 / 128 / 2 / 4 / 31 / 256 | 115,008 / 460,032 B | 68 | 2.099 ms | 2.95% | 14,768.7 |
+| 128 / 256 / 4 / 8 / 63 / 512 | 787,584 / 3,150,336 B | 4 | 34.104 ms | 4.52% | 1,847.3 |
+
+“Prompt tokens/s” is `T / full-prefill latency` for this one-sequence fixture. It
+is not autoregressive decode throughput: no generation loop, KV reuse, scheduler,
+batch, tokenizer, disk I/O, or CUDA operation runs. The models are deterministic
+synthetic weights and are orders of magnitude smaller than production LLMs. The
+falling rate reflects changing model dimensions and quadratic attention together;
+the fixture does not isolate an individual bottleneck.
+
+The load fixture serializes deterministic weights and performs one load outside
+timing. Each measured iteration constructs an in-memory input stream, validates
+the fixed header and complete tensor directory, verifies metadata and payload
+checksums, checks zero padding and finite values, decodes little-endian Float32
+payloads into aligned Tensor allocations, assembles move-only layer weights, and
+validates the final model. Serialization and filesystem I/O are excluded.
+
+| H / I / L / heads / T / V | File bytes | Iterations per repetition | Median CPU time | CPU-time CV |
+|---|---:|---:|---:|---:|
+| 32 / 64 / 2 / 4 / 7 / 128 | 117,184 B | 820 | 183.744 us | 2.86% |
+| 64 / 128 / 2 / 4 / 31 / 256 | 461,888 B | 216 | 640.046 us | 6.01% |
+| 128 / 256 / 4 / 8 / 63 / 512 | 3,153,600 B | 37 | 3.967 ms | 5.07% |
+
+The loader values are memory-resident parsing/allocation baselines, not storage
+throughput. They intentionally include portable byte decoding and two FNV-1a
+passes (one metadata, one per payload during decoding). No alternate loader exists
+yet, so there is no optimization result or checksum-cost conclusion.
+
+Command:
+
+```bash
+./build-release/benchmarks/helix_benchmarks \
+  '--benchmark_filter=BM_(CpuLlamaFullPrefill|LlamaModelLoadFromMemory)' \
+  --benchmark_min_time=0.1s \
+  --benchmark_repetitions=7 \
+  --benchmark_report_aggregates_only=false
+```
+
+An earlier fixture revision paused Google Benchmark timing before entering the
+state iteration loop; its nonsensical uptime-scale real-time values were discarded.
+The recorded fixture enters the loop first, pauses only to initialize and warm up
+once, then resumes before its first measured operation. This correction is
+methodology repair, not a runtime speedup.
 
 ## Timing rules
 

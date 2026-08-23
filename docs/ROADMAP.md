@@ -530,7 +530,7 @@ benchmark-observer correction.
 
 ## Phase F: narrow end-to-end inference
 
-### M17 — Minimal transformer runtime — Planned
+### M17 — Minimal transformer runtime — Implemented, CPU-validated, sanitized, and benchmarked
 
 - one precisely documented Llama-style architecture
 - embedding, pre-norm blocks, Q/K/V, RoPE, attention, projection, SwiGLU,
@@ -538,6 +538,35 @@ benchmark-observer correction.
 - versioned checked Helix weight format
 - one-time model conversion tool if required
 - tiny deterministic model compared layer-by-layer with an independent oracle
+
+Implementation/validation record (2026-08-23, commit `987c3b2`):
+`CpuLlamaModel` implements full causal prefill for a deliberately narrow Float32
+Llama-style architecture: equal Q/K/V head counts, even full rotary head
+dimensions, bias-free row-major projections, pre-attention/pre-MLP RMSNorm,
+adjacent-pair RoPE, causal attention, residuals, SwiGLU, final norm, and an untied
+LM head. The ordinary path returns `[tokens,vocabulary]` logits; an opt-in trace
+retains every post-layer hidden state and final normalized state for diagnostics.
+
+A standalone vector oracle independently evaluates all stages for a deterministic
+two-layer, odd-length model. Tests compare each layer state, the final normalized
+state, and every logit, then cover maximum/empty/overlength/OOV inputs, invalid
+configuration geometry, dtype/layer-count/shape errors, and repeat determinism.
+
+The `HELIXLM1` format uses a fixed little-endian header and directory, exact tensor
+roles/shapes, 64-byte payload alignment, checked offsets/lengths, zero padding,
+metadata and per-payload FNV-1a checksums, finite-weight validation, and exact file
+coverage. Tests exercise bit-exact deterministic round trips plus truncated,
+trailing, corrupted, noncanonical, non-finite, and structurally invalid inputs.
+FNV detects accidental corruption and is explicitly not an authenticity scheme.
+
+Normal, Release, and ASan/UBSan CPU suites pass 129/129. The CUDA 12.6.85/GCC 13.2
+warnings-as-errors build compiles all targets and passes the same 129 host tests;
+57 GPU tests remain hardware-gated. Release CPU prefill and checked in-memory load
+baselines are recorded in `docs/PERFORMANCE.md`. This completes M17's narrow CPU
+gate, not CUDA model execution or general checkpoint compatibility. A public
+checkpoint converter was not added because no checkpoint is yet claimed; the
+native writer API is tested and ready for a later explicit mapping tool. See
+`docs/MODEL_SUPPORT.md`.
 
 ### M18 — Autoregressive generation — Planned
 
@@ -602,6 +631,6 @@ mock or single-GPU tests as distributed validation.
 
 The first portfolio release requires excellent M0–M8 work, correct attention and
 paged KV state through M13, deterministic continuous batching through M16, and a
-credible attempt at M17–M19 without weakening earlier quality. If end-to-end model
-execution is deferred, the release must say so plainly and present the deeply
-validated lower-level systems as the project scope.
+credible implementation of M17–M19 without weakening earlier quality. If
+end-to-end generation/runtime integration is deferred, the release must say so
+plainly and present the deeply validated lower-level systems as the project scope.
