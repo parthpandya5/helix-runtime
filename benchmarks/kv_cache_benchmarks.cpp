@@ -8,7 +8,10 @@
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <list>
 #include <memory>
+#include <mutex>
+#include <optional>
 #include <span>
 #include <stdexcept>
 #include <utility>
@@ -327,6 +330,77 @@ struct PrefixIndexFixture {
   std::vector<std::uint32_t> miss_query;
 };
 
+class LinearPrefixBenchmarkIndex final {
+public:
+  explicit LinearPrefixBenchmarkIndex(std::shared_ptr<PagedKvCache> cache)
+      : cache_(std::move(cache)) {}
+
+  ~LinearPrefixBenchmarkIndex() {
+    for (const Entry& entry : entries_) {
+      cache_->release_sequence(entry.anchor);
+    }
+  }
+
+  LinearPrefixBenchmarkIndex(const LinearPrefixBenchmarkIndex&) = delete;
+  LinearPrefixBenchmarkIndex& operator=(const LinearPrefixBenchmarkIndex&) = delete;
+
+  void insert(PrefixNamespaceId namespace_id, std::span<const std::uint32_t> tokens,
+              const PagedSequenceHandle& source) {
+    entries_.push_front(Entry{namespace_id,
+                              std::vector<std::uint32_t>(tokens.begin(), tokens.end()),
+                              cache_->fork_sequence(source, tokens.size())});
+  }
+
+  [[nodiscard]] std::optional<PagedPrefixMatch>
+  lookup_longest(PrefixNamespaceId namespace_id, std::span<const std::uint32_t> tokens) {
+    std::scoped_lock lock(mutex_);
+    auto best = entries_.end();
+    std::size_t best_tokens = 0;
+    for (auto position = entries_.begin(); position != entries_.end(); ++position) {
+      if (position->namespace_id == namespace_id && position->tokens.size() > best_tokens &&
+          position->tokens.size() <= tokens.size() &&
+          std::equal(position->tokens.begin(), position->tokens.end(), tokens.begin())) {
+        best = position;
+        best_tokens = position->tokens.size();
+      }
+    }
+    ++lookup_count_;
+    if (best == entries_.end()) {
+      ++miss_count_;
+      return std::nullopt;
+    }
+    PagedSequenceHandle result = cache_->fork_sequence(best->anchor, best_tokens);
+    entries_.splice(entries_.begin(), entries_, best);
+    ++hit_count_;
+    return PagedPrefixMatch{result, best_tokens};
+  }
+
+  [[nodiscard]] std::uint64_t operation_count() const noexcept {
+    return lookup_count_ + hit_count_ + miss_count_;
+  }
+
+private:
+  struct Entry {
+    PrefixNamespaceId namespace_id;
+    std::vector<std::uint32_t> tokens;
+    PagedSequenceHandle anchor;
+  };
+
+  std::shared_ptr<PagedKvCache> cache_;
+  std::mutex mutex_;
+  std::list<Entry> entries_;
+  std::uint64_t lookup_count_ = 0;
+  std::uint64_t hit_count_ = 0;
+  std::uint64_t miss_count_ = 0;
+};
+
+struct LinearPrefixIndexFixture {
+  std::shared_ptr<PagedKvCache> cache;
+  std::unique_ptr<LinearPrefixBenchmarkIndex> prefixes;
+  std::vector<std::uint32_t> hit_query;
+  std::vector<std::uint32_t> miss_query;
+};
+
 PrefixIndexFixture make_prefix_index_fixture(std::size_t entry_count) {
   const std::size_t blocks_per_entry = kIndexedPrefixTokens / kIndexedBlockTokens;
   auto cache = std::make_shared<PagedKvCache>(
@@ -355,6 +429,32 @@ PrefixIndexFixture make_prefix_index_fixture(std::size_t entry_count) {
   miss_query.front() = std::numeric_limits<std::uint32_t>::max();
   return PrefixIndexFixture{std::move(cache), std::move(prefixes), std::move(hit_query),
                             std::move(miss_query)};
+}
+
+LinearPrefixIndexFixture make_linear_prefix_index_fixture(std::size_t entry_count) {
+  const std::size_t blocks_per_entry = kIndexedPrefixTokens / kIndexedBlockTokens;
+  auto cache = std::make_shared<PagedKvCache>(
+      PagedKvCacheConfig{1, 1, 1, kIndexedBlockTokens, entry_count * blocks_per_entry});
+  auto prefixes = std::make_unique<LinearPrefixBenchmarkIndex>(cache);
+  std::vector<std::uint32_t> hit_query;
+  for (std::size_t entry = 0; entry < entry_count; ++entry) {
+    std::vector<std::uint32_t> tokens(kIndexedPrefixTokens);
+    tokens.front() = static_cast<std::uint32_t>(entry + 1);
+    for (std::size_t token = 1; token < tokens.size(); ++token) {
+      tokens[token] = static_cast<std::uint32_t>(10'000 + token);
+    }
+    const PagedSequenceHandle source = cache->create_sequence();
+    append_benchmark_prefix(*cache, source, tokens);
+    prefixes->insert(kBenchmarkNamespace, tokens, source);
+    cache->release_sequence(source);
+    if (entry == 0) {
+      hit_query = tokens;
+    }
+  }
+  std::vector<std::uint32_t> miss_query = hit_query;
+  miss_query.front() = std::numeric_limits<std::uint32_t>::max();
+  return LinearPrefixIndexFixture{std::move(cache), std::move(prefixes), std::move(hit_query),
+                                  std::move(miss_query)};
 }
 
 void BM_PagedPrefixDirectForkLifecycle(benchmark::State& state) {
@@ -396,7 +496,6 @@ void BM_PagedPrefixCacheHotHitLifecycle(benchmark::State& state) {
     }
     fixture.cache->release_sequence(match->sequence);
   }
-
   state.counters["index_entries"] = static_cast<double>(entry_count);
   state.counters["prefix_blocks"] = 2.0;
   state.counters["prefix_tokens"] = static_cast<double>(kIndexedPrefixTokens);
@@ -412,6 +511,48 @@ void BM_PagedPrefixCacheMiss(benchmark::State& state) {
     auto match = fixture.prefixes->lookup_longest(kBenchmarkNamespace, fixture.miss_query);
     benchmark::DoNotOptimize(match);
   }
+  state.counters["index_entries"] = static_cast<double>(entry_count);
+  state.counters["prefix_blocks"] = 2.0;
+  state.counters["prefix_tokens"] = static_cast<double>(kIndexedPrefixTokens);
+}
+
+void BM_PagedPrefixLinearHotHitLifecycle(benchmark::State& state) {
+  const auto entry_count = static_cast<std::size_t>(state.range(0));
+  LinearPrefixIndexFixture fixture = make_linear_prefix_index_fixture(entry_count);
+  const auto warmup = fixture.prefixes->lookup_longest(kBenchmarkNamespace, fixture.hit_query);
+  if (!warmup.has_value()) {
+    state.SkipWithError("linear prefix benchmark warmup unexpectedly missed");
+    return;
+  }
+  fixture.cache->release_sequence(warmup->sequence);
+
+  for ([[maybe_unused]] auto iteration : state) {
+    auto match = fixture.prefixes->lookup_longest(kBenchmarkNamespace, fixture.hit_query);
+    benchmark::DoNotOptimize(match);
+    if (!match.has_value()) {
+      state.SkipWithError("linear prefix benchmark lookup unexpectedly missed");
+      break;
+    }
+    fixture.cache->release_sequence(match->sequence);
+  }
+  benchmark::DoNotOptimize(fixture.prefixes->operation_count());
+
+  state.counters["index_entries"] = static_cast<double>(entry_count);
+  state.counters["prefix_blocks"] = 2.0;
+  state.counters["prefix_tokens"] = static_cast<double>(kIndexedPrefixTokens);
+}
+
+void BM_PagedPrefixLinearMiss(benchmark::State& state) {
+  const auto entry_count = static_cast<std::size_t>(state.range(0));
+  LinearPrefixIndexFixture fixture = make_linear_prefix_index_fixture(entry_count);
+  benchmark::DoNotOptimize(
+      fixture.prefixes->lookup_longest(kBenchmarkNamespace, fixture.miss_query));
+
+  for ([[maybe_unused]] auto iteration : state) {
+    auto match = fixture.prefixes->lookup_longest(kBenchmarkNamespace, fixture.miss_query);
+    benchmark::DoNotOptimize(match);
+  }
+  benchmark::DoNotOptimize(fixture.prefixes->operation_count());
 
   state.counters["index_entries"] = static_cast<double>(entry_count);
   state.counters["prefix_blocks"] = 2.0;
@@ -473,6 +614,22 @@ BENCHMARK(BM_PagedPrefixCacheHotHitLifecycle)
     ->ArgName("entries");
 
 BENCHMARK(BM_PagedPrefixCacheMiss)
+    ->Arg(1)
+    ->Arg(16)
+    ->Arg(64)
+    ->Arg(256)
+    ->Arg(1'024)
+    ->ArgName("entries");
+
+BENCHMARK(BM_PagedPrefixLinearHotHitLifecycle)
+    ->Arg(1)
+    ->Arg(16)
+    ->Arg(64)
+    ->Arg(256)
+    ->Arg(1'024)
+    ->ArgName("entries");
+
+BENCHMARK(BM_PagedPrefixLinearMiss)
     ->Arg(1)
     ->Arg(16)
     ->Arg(64)
