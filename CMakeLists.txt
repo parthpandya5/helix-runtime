@@ -231,7 +231,7 @@ helix_configure_target(helix_model)
 add_library(helix_runtime src/runtime/cpu_engine.cpp)
 add_library(helix::runtime ALIAS helix_runtime)
 target_compile_features(helix_runtime PUBLIC cxx_std_20)
-target_link_libraries(helix_runtime PUBLIC helix::model helix::scheduler)
+target_link_libraries(helix_runtime PUBLIC helix::kv_cache helix::model helix::scheduler)
 target_include_directories(
   helix_runtime
   PUBLIC

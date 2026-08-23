@@ -1,12 +1,14 @@
 #include "helix/runtime/cpu_engine.hpp"
 
 #include "helix/core/error.hpp"
+#include "helix/core/logging.hpp"
 #include "helix/model/generation.hpp"
 
 #include <algorithm>
 #include <exception>
 #include <limits>
 #include <map>
+#include <span>
 #include <sstream>
 #include <string>
 #include <string_view>
@@ -15,12 +17,28 @@
 namespace helix::runtime {
 namespace {
 
+const kv_cache::PrefixNamespaceId kRuntimePrefixNamespace(1);
+
 std::string engine_context(std::string_view operation) {
   return "runtime::CpuRuntimeEngine::" + std::string(operation);
 }
 
 std::size_t blocks_for_tokens(std::size_t tokens, std::size_t block_tokens) noexcept {
   return tokens / block_tokens + static_cast<std::size_t>(tokens % block_tokens != 0);
+}
+
+std::size_t reusable_prefix_tokens(std::size_t prompt_tokens, std::size_t block_tokens) noexcept {
+  if (prompt_tokens <= 1) {
+    return 0;
+  }
+  const std::size_t maximum_without_logits = prompt_tokens - 1;
+  return maximum_without_logits - maximum_without_logits % block_tokens;
+}
+
+void increment_saturating(std::uint64_t& counter) noexcept {
+  if (counter != std::numeric_limits<std::uint64_t>::max()) {
+    ++counter;
+  }
 }
 
 kv_cache::PagedKvCacheConfig cache_config(const model::CpuLlamaModel& model,
@@ -44,11 +62,13 @@ struct CpuRuntimeEngine::Impl {
     kv_cache::PagedSequenceHandle sequence;
     std::optional<scheduler::TokenId> end_of_sequence;
     std::optional<Tensor> next_logits;
+    std::vector<std::uint32_t> prompt_token_values;
   };
 
   Impl(model::CpuLlamaModel owned_model, CpuRuntimeConfig runtime_config)
       : config(std::move(runtime_config)), model(std::move(owned_model)),
-        cache(cache_config(model, config)), scheduler(config.scheduler) {
+        cache(std::make_shared<kv_cache::PagedKvCache>(cache_config(model, config))),
+        scheduler(config.scheduler) {
     HELIX_CHECK(config.prefill_mode == CpuPrefillMode::kSequentialDecode ||
                     config.prefill_mode == CpuPrefillMode::kFullPrompt,
                 ErrorCode::kInvalidArgument,
@@ -57,6 +77,9 @@ struct CpuRuntimeEngine::Impl {
                     config.paged_decode_mode == model::PagedDecodeMode::kDirectBlockTable,
                 ErrorCode::kInvalidArgument,
                 engine_context("constructor") + ": unknown paged decode mode");
+    if (config.prefix_cache.has_value()) {
+      prefix_cache = std::make_unique<kv_cache::PagedPrefixCache>(cache, *config.prefix_cache);
+    }
   }
 
   void validate_submission(const scheduler::Request& request,
@@ -106,14 +129,40 @@ struct CpuRuntimeEngine::Impl {
     const auto position = sessions.find(request_id);
     HELIX_CHECK(position != sessions.end(), ErrorCode::kInternal,
                 engine_context("release_session") + ": request has no model session");
-    cache.release_sequence(position->second.sequence);
+    cache->release_sequence(position->second.sequence);
     sessions.erase(position);
+  }
+
+  void publish_prefix(Session& active, const scheduler::Request& request) {
+    if (prefix_cache == nullptr) {
+      return;
+    }
+    const std::size_t reusable =
+        reusable_prefix_tokens(request.prompt_tokens().size(), config.scheduler.kv_block_tokens);
+    if (reusable == 0) {
+      return;
+    }
+    HELIX_ASSERT(active.prompt_token_values.size() == request.prompt_tokens().size(),
+                 "prefix-enabled runtime session lost its prompt content key");
+    try {
+      static_cast<void>(prefix_cache->insert(
+          kRuntimePrefixNamespace,
+          std::span<const std::uint32_t>(active.prompt_token_values).first(reusable),
+          active.sequence));
+    } catch (const Error& error) {
+      if (error.code() != ErrorCode::kResourceExhausted) {
+        throw;
+      }
+      increment_saturating(prefix_publication_failure_count);
+      HELIX_LOG_WARNING(
+          "CPU runtime skipped optional prefix publication after metadata exhaustion");
+    }
   }
 
   [[nodiscard]] scheduler::WorkCompletion execute_prefill(const scheduler::ScheduledWork& work) {
     Session& active = session(work.request_id);
     const scheduler::Request& request = scheduler.request(work.request_id);
-    HELIX_CHECK(cache.length(active.sequence) == work.token_offset, ErrorCode::kInternal,
+    HELIX_CHECK(cache->length(active.sequence) == work.token_offset, ErrorCode::kInternal,
                 engine_context("execute_prefill") +
                     ": physical KV length does not match scheduled prompt offset");
     HELIX_CHECK(work.token_offset <= request.prompt_tokens().size() &&
@@ -139,9 +188,10 @@ struct CpuRuntimeEngine::Impl {
       std::copy_n(prefill.logits.data_as<float>() +
                       (request.prompt_tokens().size() - 1) * vocabulary,
                   vocabulary, next_logits.data_as<float>());
-      cache.append_layer_major(active.sequence, prefill.layer_keys, prefill.layer_values);
+      cache->append_layer_major(active.sequence, prefill.layer_keys, prefill.layer_values);
       active.next_logits = std::move(next_logits);
       ++full_prompt_prefill_count;
+      publish_prefix(active, request);
       return scheduler::WorkCompletion{
           work.request_id, scheduler::WorkStatus::kSucceeded, std::nullopt, false, {}};
     }
@@ -152,11 +202,14 @@ struct CpuRuntimeEngine::Impl {
                   engine_context("execute_prefill") + ": sequential-prefill counter exhausted");
       const scheduler::TokenId token = request.prompt_tokens()[work.token_offset + index];
       model::CpuLlamaDecodeResult decoded =
-          model.decode_one(token.value(), cache.length(active.sequence), cache, active.sequence,
+          model.decode_one(token.value(), cache->length(active.sequence), *cache, active.sequence,
                            config.paged_decode_mode);
-      cache.append(active.sequence, decoded.token_keys, decoded.token_values);
+      cache->append(active.sequence, decoded.token_keys, decoded.token_values);
       active.next_logits = std::move(decoded.logits);
       ++sequential_prefill_token_count;
+    }
+    if (work.token_offset + work.token_count == request.prompt_tokens().size()) {
+      publish_prefix(active, request);
     }
     return scheduler::WorkCompletion{
         work.request_id, scheduler::WorkStatus::kSucceeded, std::nullopt, false, {}};
@@ -167,7 +220,7 @@ struct CpuRuntimeEngine::Impl {
     const scheduler::Request& request = scheduler.request(work.request_id);
     HELIX_CHECK(active.next_logits.has_value(), ErrorCode::kInternal,
                 engine_context("execute_decode") + ": request has no logits to sample");
-    HELIX_CHECK(cache.length(active.sequence) == work.token_offset, ErrorCode::kInternal,
+    HELIX_CHECK(cache->length(active.sequence) == work.token_offset, ErrorCode::kInternal,
                 engine_context("execute_decode") +
                     ": physical KV length does not match scheduled decode offset");
 
@@ -177,9 +230,9 @@ struct CpuRuntimeEngine::Impl {
     const bool terminal = end_of_sequence || request.remaining_generation_tokens() == 1;
     if (!terminal) {
       model::CpuLlamaDecodeResult decoded =
-          model.decode_one(generated.value(), cache.length(active.sequence), cache, active.sequence,
-                           config.paged_decode_mode);
-      cache.append(active.sequence, decoded.token_keys, decoded.token_values);
+          model.decode_one(generated.value(), cache->length(active.sequence), *cache,
+                           active.sequence, config.paged_decode_mode);
+      cache->append(active.sequence, decoded.token_keys, decoded.token_values);
       active.next_logits = std::move(decoded.logits);
     }
     return scheduler::WorkCompletion{
@@ -193,13 +246,15 @@ struct CpuRuntimeEngine::Impl {
 
   CpuRuntimeConfig config;
   model::CpuLlamaModel model;
-  kv_cache::PagedKvCache cache;
+  std::shared_ptr<kv_cache::PagedKvCache> cache;
   scheduler::FifoScheduler scheduler;
+  std::unique_ptr<kv_cache::PagedPrefixCache> prefix_cache;
   std::map<scheduler::RequestId, Session> sessions;
   std::uint64_t executed_iteration_count = 0;
   std::uint64_t failed_work_item_count = 0;
   std::uint64_t full_prompt_prefill_count = 0;
   std::uint64_t sequential_prefill_token_count = 0;
+  std::uint64_t prefix_publication_failure_count = 0;
 };
 
 CpuRuntimeEngine::CpuRuntimeEngine(model::CpuLlamaModel model, CpuRuntimeConfig config)
@@ -211,21 +266,47 @@ void CpuRuntimeEngine::submit(scheduler::Request request,
                               std::optional<scheduler::TokenId> end_of_sequence) {
   impl_->validate_submission(request, end_of_sequence);
   const scheduler::RequestId request_id = request.id();
-  const kv_cache::PagedSequenceHandle sequence = impl_->cache.create_sequence();
+  std::vector<std::uint32_t> prompt_token_values;
+  std::size_t reused_prompt_tokens = 0;
+  kv_cache::PagedSequenceHandle sequence;
+  if (impl_->prefix_cache != nullptr) {
+    prompt_token_values.reserve(request.prompt_tokens().size());
+    for (const scheduler::TokenId token : request.prompt_tokens()) {
+      prompt_token_values.push_back(token.value());
+    }
+    const std::size_t maximum_reuse =
+        reusable_prefix_tokens(prompt_token_values.size(), impl_->config.scheduler.kv_block_tokens);
+    if (maximum_reuse != 0) {
+      const auto match = impl_->prefix_cache->lookup_longest(kRuntimePrefixNamespace,
+                                                             prompt_token_values, maximum_reuse);
+      if (match.has_value()) {
+        sequence = match->sequence;
+        reused_prompt_tokens = match->matched_tokens;
+      }
+    }
+  }
+  if (!sequence) {
+    sequence = impl_->cache->create_sequence();
+  }
   try {
     const auto [position, inserted] =
-        impl_->sessions.emplace(request_id, Impl::Session{sequence, end_of_sequence, std::nullopt});
+        impl_->sessions.emplace(request_id, Impl::Session{sequence, end_of_sequence, std::nullopt,
+                                                          std::move(prompt_token_values)});
     static_cast<void>(position);
     HELIX_ASSERT(inserted, "runtime duplicate session passed prevalidation");
   } catch (...) {
-    impl_->cache.release_sequence(sequence);
+    impl_->cache->release_sequence(sequence);
     throw;
   }
 
   try {
-    impl_->scheduler.submit(std::move(request));
+    if (reused_prompt_tokens == 0) {
+      impl_->scheduler.submit(std::move(request));
+    } else {
+      impl_->scheduler.submit_prefilled(std::move(request), reused_prompt_tokens);
+    }
   } catch (...) {
-    impl_->cache.release_sequence(sequence);
+    impl_->cache->release_sequence(sequence);
     impl_->sessions.erase(request_id);
     throw;
   }
@@ -233,17 +314,24 @@ void CpuRuntimeEngine::submit(scheduler::Request request,
 
 CpuRuntimeIterationResult CpuRuntimeEngine::run_iteration(scheduler::RequestTimePoint now) {
   CpuRuntimeIterationResult result;
-  result.free_kv_blocks_before = impl_->cache.stats().free_blocks;
+  result.free_kv_blocks_before = impl_->cache->stats().free_blocks;
   // Reserve before scheduling because schedule_iteration opens a transactional
   // in-flight batch. Subsequent completion pushes cannot then strand that batch
   // merely because this public result vector needs to grow.
   result.completions.reserve(impl_->config.scheduler.max_running_requests);
-  scheduler::ScheduleResult schedule =
-      impl_->scheduler.schedule_iteration(result.free_kv_blocks_before, now);
+  scheduler::ScheduleResult schedule;
+  while (true) {
+    schedule = impl_->scheduler.schedule_iteration(impl_->cache->stats().free_blocks, now);
+    result.kv_capacity_limited = result.kv_capacity_limited || schedule.kv_capacity_limited;
+    if (schedule.batch.has_value() || !schedule.kv_capacity_limited ||
+        impl_->prefix_cache == nullptr || !impl_->prefix_cache->evict_lru()) {
+      break;
+    }
+    ++result.prefix_entries_evicted;
+  }
   result.token_budget_exhausted = schedule.token_budget_exhausted;
-  result.kv_capacity_limited = schedule.kv_capacity_limited;
   if (!schedule.batch.has_value()) {
-    result.free_kv_blocks_after = impl_->cache.stats().free_blocks;
+    result.free_kv_blocks_after = impl_->cache->stats().free_blocks;
     return result;
   }
 
@@ -279,7 +367,7 @@ CpuRuntimeIterationResult CpuRuntimeEngine::run_iteration(scheduler::RequestTime
   }
   result.retired_requests = std::move(completion.retired_requests);
   ++impl_->executed_iteration_count;
-  result.free_kv_blocks_after = impl_->cache.stats().free_blocks;
+  result.free_kv_blocks_after = impl_->cache->stats().free_blocks;
   return result;
 }
 
@@ -309,13 +397,19 @@ CpuRuntimeEngine::metrics(scheduler::RequestTimePoint observed_at) const {
 }
 
 CpuRuntimeStats CpuRuntimeEngine::stats() const {
-  return CpuRuntimeStats{impl_->scheduler.stats(),
-                         impl_->cache.stats(),
-                         impl_->sessions.size(),
-                         impl_->executed_iteration_count,
-                         impl_->failed_work_item_count,
-                         impl_->full_prompt_prefill_count,
-                         impl_->sequential_prefill_token_count};
+  CpuRuntimeStats result;
+  result.scheduler = impl_->scheduler.stats();
+  result.kv_cache = impl_->cache->stats();
+  result.active_session_count = impl_->sessions.size();
+  result.executed_iteration_count = impl_->executed_iteration_count;
+  result.failed_work_item_count = impl_->failed_work_item_count;
+  result.full_prompt_prefill_count = impl_->full_prompt_prefill_count;
+  result.sequential_prefill_token_count = impl_->sequential_prefill_token_count;
+  if (impl_->prefix_cache != nullptr) {
+    result.prefix_cache = impl_->prefix_cache->stats();
+  }
+  result.prefix_publication_failure_count = impl_->prefix_publication_failure_count;
+  return result;
 }
 
 const CpuRuntimeConfig& CpuRuntimeEngine::config() const noexcept {

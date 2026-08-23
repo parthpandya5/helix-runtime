@@ -2,6 +2,7 @@
 #include "helix/model/generation.hpp"
 #include "helix/runtime/cpu_engine.hpp"
 
+#include <array>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -168,6 +169,128 @@ TEST(CpuRuntimeEngineTest, FullPromptPrefillMatchesReferenceAndUsesBulkPagedAppe
   stats = engine.stats();
   EXPECT_EQ(stats.kv_cache.used_blocks, 0U);
   EXPECT_EQ(stats.active_session_count, 0U);
+}
+
+TEST(CpuRuntimeEngineTest, ReusesAlignedPromptPrefixAndExecutesSuffixForFreshLogits) {
+  const model::LlamaConfig model_config = runtime_model_config(10);
+  const std::vector<std::uint32_t> first_prompt{2, 5, 1, 7, 3};
+  const std::vector<std::uint32_t> second_prompt{2, 5, 1, 7, 4};
+  model::CpuLlamaModel reference = make_model(model_config);
+  const std::vector<std::uint32_t> first_expected =
+      full_recompute_greedy(reference, first_prompt, 1);
+  const std::vector<std::uint32_t> second_expected =
+      full_recompute_greedy(reference, second_prompt, 1);
+  CpuRuntimeConfig config{scheduler::SchedulerConfig{8, 1, 2}, 6};
+  config.prefix_cache = kv_cache::PagedPrefixCacheConfig{4, 8};
+  CpuRuntimeEngine engine(make_model(model_config), config);
+
+  engine.submit(make_request(60, first_prompt, 1));
+  run_to_completion(engine, kStart);
+  EXPECT_EQ(generated_values(engine.request(scheduler::RequestId{60})), first_expected);
+  CpuRuntimeStats stats = engine.stats();
+  ASSERT_TRUE(stats.prefix_cache.has_value());
+  EXPECT_EQ(stats.prefix_cache->entry_count, 1U);
+  EXPECT_EQ(stats.prefix_cache->lookup_count, 1U);
+  EXPECT_EQ(stats.prefix_cache->miss_count, 1U);
+  EXPECT_EQ(stats.kv_cache.active_sequence_count, 1U);
+  EXPECT_EQ(stats.kv_cache.used_blocks, 2U);
+
+  engine.submit(make_request(61, second_prompt, 1, kStart + 2ms));
+  const scheduler::Request& waiting = engine.request(scheduler::RequestId{61});
+  EXPECT_EQ(waiting.state(), scheduler::RequestState::kWaiting);
+  EXPECT_EQ(waiting.reused_prompt_tokens(), 4U);
+  EXPECT_EQ(waiting.prompt_tokens_processed(), 0U);
+  stats = engine.stats();
+  EXPECT_EQ(stats.kv_cache.active_sequence_count, 2U);
+  EXPECT_EQ(stats.kv_cache.shared_blocks, 2U);
+
+  const CpuRuntimeIterationResult suffix = engine.run_iteration(kStart + 2ms);
+  ASSERT_EQ(suffix.work.size(), 1U);
+  EXPECT_EQ(suffix.work[0].kind, scheduler::WorkKind::kPrefill);
+  EXPECT_EQ(suffix.work[0].token_offset, 4U);
+  EXPECT_EQ(suffix.work[0].token_count, 1U);
+  EXPECT_EQ(suffix.work[0].kv_blocks_before, 2U);
+  EXPECT_EQ(suffix.work[0].new_kv_blocks, 1U);
+  EXPECT_EQ(suffix.scheduled_prefill_tokens, 1U);
+  EXPECT_EQ(engine.request(scheduler::RequestId{61}).prompt_tokens_processed(), 5U);
+  const CpuRuntimeIterationResult decode = engine.run_iteration(kStart + 3ms);
+  ASSERT_EQ(decode.retired_requests.size(), 1U);
+  EXPECT_EQ(generated_values(engine.request(scheduler::RequestId{61})), second_expected);
+
+  stats = engine.stats();
+  ASSERT_TRUE(stats.prefix_cache.has_value());
+  EXPECT_EQ(stats.scheduler.reused_prefill_tokens, 4U);
+  EXPECT_EQ(stats.scheduler.scheduled_prefill_tokens, 6U);
+  EXPECT_EQ(stats.full_prompt_prefill_count, 1U);
+  EXPECT_EQ(stats.sequential_prefill_token_count, 1U);
+  EXPECT_EQ(stats.prefix_cache->lookup_count, 2U);
+  EXPECT_EQ(stats.prefix_cache->hit_count, 1U);
+  EXPECT_EQ(stats.prefix_cache->miss_count, 1U);
+  EXPECT_EQ(stats.prefix_cache->insertion_count, 1U);
+  EXPECT_EQ(stats.prefix_cache->duplicate_insertion_count, 1U);
+  EXPECT_EQ(stats.prefix_cache->entry_count, 1U);
+  EXPECT_EQ(stats.prefix_publication_failure_count, 0U);
+  EXPECT_EQ(stats.active_session_count, 0U);
+  EXPECT_EQ(stats.kv_cache.active_sequence_count, 1U);
+  EXPECT_EQ(stats.kv_cache.used_blocks, 2U);
+
+  engine.submit(make_request(62, {2, 5, 1, 7, 6}, 1, kStart + 4ms));
+  EXPECT_EQ(engine.request(scheduler::RequestId{62}).reused_prompt_tokens(), 4U);
+  EXPECT_EQ(engine.stats().kv_cache.active_sequence_count, 2U);
+  const scheduler::RetiredRequest cancelled =
+      engine.cancel(scheduler::RequestId{62}, kStart + 4ms, "cancelled while prefix-backed");
+  EXPECT_EQ(cancelled.released_kv_blocks, 2U);
+  stats = engine.stats();
+  ASSERT_TRUE(stats.prefix_cache.has_value());
+  EXPECT_EQ(stats.scheduler.reused_prefill_tokens, 8U);
+  EXPECT_EQ(stats.prefix_cache->lookup_count, 3U);
+  EXPECT_EQ(stats.prefix_cache->hit_count, 2U);
+  EXPECT_EQ(stats.kv_cache.active_sequence_count, 1U);
+  EXPECT_EQ(stats.kv_cache.block_reference_count, 2U);
+  EXPECT_EQ(stats.kv_cache.shared_blocks, 0U);
+}
+
+TEST(CpuRuntimeEngineTest, EvictsRetainedPrefixesToGuaranteeForwardProgress) {
+  const model::LlamaConfig model_config = runtime_model_config(6);
+  model::CpuLlamaModel reference = make_model(model_config);
+  CpuRuntimeConfig config{scheduler::SchedulerConfig{4, 1, 2}, 3};
+  config.prefix_cache = kv_cache::PagedPrefixCacheConfig{3, 3};
+  CpuRuntimeEngine engine(make_model(model_config), config);
+  const std::array<std::array<std::uint32_t, 3>, 4> prompts{
+      std::array<std::uint32_t, 3>{0, 1, 2}, std::array<std::uint32_t, 3>{3, 4, 5},
+      std::array<std::uint32_t, 3>{6, 7, 8}, std::array<std::uint32_t, 3>{9, 10, 0}};
+
+  bool observed_pressure_eviction = false;
+  std::size_t tick = 0;
+  for (std::size_t index = 0; index < prompts.size(); ++index) {
+    const std::vector<std::uint32_t> prompt_tokens(prompts[index].begin(), prompts[index].end());
+    const std::vector<std::uint32_t> expected = full_recompute_greedy(reference, prompt_tokens, 1);
+    engine.submit(
+        make_request(70 + index, prompt_tokens, 1, kStart + std::chrono::milliseconds(tick)));
+    while (engine.has_live_requests()) {
+      const CpuRuntimeIterationResult iteration =
+          engine.run_iteration(kStart + std::chrono::milliseconds(tick));
+      ++tick;
+      ASSERT_TRUE(iteration.iteration_id.has_value());
+      observed_pressure_eviction =
+          observed_pressure_eviction || iteration.prefix_entries_evicted != 0;
+    }
+    EXPECT_EQ(generated_values(engine.request(scheduler::RequestId{70 + index})), expected);
+  }
+
+  const CpuRuntimeStats stats = engine.stats();
+  ASSERT_TRUE(stats.prefix_cache.has_value());
+  EXPECT_TRUE(observed_pressure_eviction);
+  EXPECT_GT(stats.prefix_cache->eviction_count, 0U);
+  EXPECT_EQ(stats.prefix_cache->lookup_count, prompts.size());
+  EXPECT_EQ(stats.prefix_cache->hit_count, 0U);
+  EXPECT_EQ(stats.prefix_cache->miss_count, prompts.size());
+  EXPECT_LE(stats.prefix_cache->entry_count, 3U);
+  EXPECT_EQ(stats.scheduler.reused_prefill_tokens, 0U);
+  EXPECT_EQ(stats.active_session_count, 0U);
+  EXPECT_EQ(stats.kv_cache.active_sequence_count, stats.prefix_cache->entry_count);
+  EXPECT_EQ(stats.kv_cache.used_blocks, stats.prefix_cache->entry_count);
+  EXPECT_EQ(stats.kv_cache.free_blocks + stats.kv_cache.used_blocks, stats.kv_cache.total_blocks);
 }
 
 TEST(CpuRuntimeEngineTest, DirectAndCompactedPagedDecodeModesProduceIdenticalRequests) {
@@ -350,6 +473,10 @@ TEST(CpuRuntimeEngineTest, RejectsInvalidSubmissionsWithoutLeakingSessions) {
           CpuRuntimeConfig{scheduler::SchedulerConfig{4, 2, 2}, 2, CpuPrefillMode::kFullPrompt,
                            static_cast<model::PagedDecodeMode>(255)})),
       Error);
+  CpuRuntimeConfig invalid_prefix_config{scheduler::SchedulerConfig{4, 2, 2}, 2};
+  invalid_prefix_config.prefix_cache = kv_cache::PagedPrefixCacheConfig{0, 1};
+  EXPECT_THROW(static_cast<void>(CpuRuntimeEngine(make_model(model_config), invalid_prefix_config)),
+               Error);
   CpuRuntimeEngine engine(make_model(model_config),
                           CpuRuntimeConfig{scheduler::SchedulerConfig{4, 2, 2}, 2});
 

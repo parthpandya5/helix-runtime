@@ -1,6 +1,6 @@
 #pragma once
 
-#include "helix/kv_cache/paged.hpp"
+#include "helix/kv_cache/prefix.hpp"
 #include "helix/model/llama.hpp"
 #include "helix/scheduler/fifo_scheduler.hpp"
 
@@ -19,10 +19,21 @@ enum class CpuPrefillMode : std::uint8_t {
 };
 
 struct CpuRuntimeConfig {
+  CpuRuntimeConfig() = default;
+  CpuRuntimeConfig(
+      scheduler::SchedulerConfig scheduler_config, std::size_t kv_blocks,
+      CpuPrefillMode selected_prefill_mode = CpuPrefillMode::kFullPrompt,
+      model::PagedDecodeMode selected_decode_mode = model::PagedDecodeMode::kDirectBlockTable,
+      std::optional<kv_cache::PagedPrefixCacheConfig> selected_prefix_cache = std::nullopt)
+      : scheduler(scheduler_config), physical_kv_blocks(kv_blocks),
+        prefill_mode(selected_prefill_mode), paged_decode_mode(selected_decode_mode),
+        prefix_cache(selected_prefix_cache) {}
+
   scheduler::SchedulerConfig scheduler;
   std::size_t physical_kv_blocks = 0;
   CpuPrefillMode prefill_mode = CpuPrefillMode::kFullPrompt;
   model::PagedDecodeMode paged_decode_mode = model::PagedDecodeMode::kDirectBlockTable;
+  std::optional<kv_cache::PagedPrefixCacheConfig> prefix_cache;
 };
 
 struct CpuRuntimeIterationResult {
@@ -36,6 +47,7 @@ struct CpuRuntimeIterationResult {
   std::size_t scheduled_decode_tokens = 0;
   bool token_budget_exhausted = false;
   bool kv_capacity_limited = false;
+  std::size_t prefix_entries_evicted = 0;
 };
 
 struct CpuRuntimeStats {
@@ -46,6 +58,8 @@ struct CpuRuntimeStats {
   std::uint64_t failed_work_item_count = 0;
   std::uint64_t full_prompt_prefill_count = 0;
   std::uint64_t sequential_prefill_token_count = 0;
+  std::optional<kv_cache::PagedPrefixCacheStats> prefix_cache;
+  std::uint64_t prefix_publication_failure_count = 0;
 };
 
 // Synchronous CPU correctness engine. One thread owns the scheduler, model, and
