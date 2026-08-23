@@ -8,7 +8,7 @@ that into a GPU performance claim.
 
 - Engineered a CPU-first C++20/CUDA inference runtime with checked Tensor/storage
   ownership, deterministic reference kernels, causal attention, contiguous and
-  paged KV caches, request scheduling, and continuous batching; maintained 129
+  paged KV caches, request scheduling, and continuous batching; maintained 136
   passing normal, Release, and ASan/UBSan CPU tests.
 - Implemented manual CUDA elementwise, reduction, stable-softmax, naive/tiled
   SGEMM, RMSNorm, RoPE, SwiGLU, and attention paths with RAII streams/events and
@@ -31,6 +31,10 @@ that into a GPU performance claim.
   model and created a deterministic versioned weight container with checked
   tensor roles/shapes/offsets, 64-byte payload alignment, corruption checksums,
   finite-value validation, and transactional RAII loading.
+- Built transactional single-sequence prefill/decode and greedy generation over a
+  contiguous KV cache; matched cached logits/tokens against full-prefix
+  recomputation and measured 3.69x–56.79x next-position CPU speedups across
+  disclosed 8–64-token synthetic fixtures.
 
 ## Short project description
 

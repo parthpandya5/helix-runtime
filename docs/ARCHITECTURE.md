@@ -466,9 +466,10 @@ the per-iteration scheduling hot path.
 
 ## Model executor
 
-The implemented M17 baseline is a narrowly specified CPU Float32 Llama-style
-decoder. It uses equal Q/K/V head counts, full adjacent-pair RoPE over an even head
-dimension, pre-attention and pre-MLP RMSNorm, bias-free projections, causal
+The implemented M17 model and M18 generation baseline form a narrowly specified
+CPU Float32 Llama-style decoder. It uses equal Q/K/V head counts, full
+adjacent-pair RoPE over an even head dimension, pre-attention and pre-MLP RMSNorm,
+bias-free projections, causal
 attention, residuals, SwiGLU, final normalization, and an explicit untied LM head.
 All projection weights use row-major `[input_features,output_features]` layout.
 GQA/MQA, partial rotary dimensions, biases, tied embeddings, quantization, and
@@ -498,6 +499,37 @@ that a caller not mutate a shallow weight alias retained before construction. Th
 optional diagnostic path preserves post-layer Tensor handles and the final
 normalized state; ordinary execution does not retain those intermediates.
 
+`CpuLlamaGenerator` is the single-sequence session owner. It contains the model,
+one `ContiguousKvCache`, and one sequence handle and is deliberately noncopyable,
+nonmovable, and not thread-safe. The cache owns fixed-capacity
+`[layer,head,capacity,dimension]` K/V storage; temporary attention tensors remain
+ordinary CPU Tensor allocations. A caller cannot outlive or accidentally pair the
+session's handle with another cache.
+
+```mermaid
+flowchart LR
+    Prompt[Prompt token IDs] --> Prefill[Full causal prefill]
+    Prefill --> PromptKV[Capture rotated K / V per layer]
+    PromptKV --> Cache[(Contiguous KV cache)]
+    Prefill --> Select[Greedy last-row selection]
+    Select --> Token[Generated token]
+    Token --> Decode[One-token decode at cache length]
+    Cache --> Prefix[Copy history into attention prefix]
+    Prefix --> Decode
+    Decode --> NewKV[Transactional new-token K / V]
+    NewKV --> Cache
+    Decode --> Select
+```
+
+Prefill performs all model math before populating cache storage. Decode validates
+that the supplied position equals the current cache length, copies each cached
+layer prefix directly into a caller-owned buffer with one reserved tail row,
+writes the current token's K/V into that tail, and computes attention. The model
+returns the new K/V separately; the session appends it only after the entire token
+step and final logits projection succeed. This keeps model failures from advancing
+logical cache length. Multi-call execution assumes the caller does not mutate the
+same sequence concurrently.
+
 The `HELIXLM1` container is a deterministic little-endian format with a fixed
 128-byte versioned header, fixed-size tensor directory, exact role/layer/shape
 records, and 64-byte-aligned Float32 payloads. Loading validates file size,
@@ -506,13 +538,18 @@ values, an FNV-1a metadata checksum, and one checksum per payload before returni
 a model. FNV provides accidental-corruption detection, not authenticity. Details
 and the exact byte layout are in `docs/MODEL_SUPPORT.md`.
 
-The current executor performs full causal prefill only and repacks token-major
-Q/K/V tensors around the existing head-major attention API. KV-cached decode,
-token selection, tokenizer integration, scheduler/KV ownership, and CUDA model
-dispatch remain M18–M19 work. No public checkpoint compatibility is claimed yet,
-so a model-specific conversion utility has intentionally not been guessed.
+The current CPU path performs full causal prefill and single-token contiguous-KV
+decode and repacks token-major Q/K/V tensors around the existing head-major
+attention API. Greedy selection, EOS/length/context stops, and a token-ID CLI are
+implemented. Scheduler integration, batched/paged model decode, tokenizer
+integration, public-checkpoint conversion, and CUDA model dispatch remain M19 or
+later work. A model-specific conversion utility has intentionally not been guessed
+because no public checkpoint compatibility is claimed yet.
 
 ## Runtime execution and asynchronous work
+
+The following sequence is the M19 multi-request target, not a claim that the M18
+single-sequence generator already drives the scheduler:
 
 ```mermaid
 sequenceDiagram

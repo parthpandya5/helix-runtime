@@ -43,7 +43,12 @@ current logical position and advances length only after every copy completes.
 Retrieval returns an owning, compact layer snapshot shaped
 `[kv_heads, current_length, head_dimension]`, which can be passed directly to the
 M10 attention API. `copy_layer_out` uses caller-owned outputs to avoid allocation
-in repeated retrieval and benchmark paths.
+in repeated retrieval and benchmark paths. M18 adds `copy_layer_prefix_out` for
+decode staging: it copies the current history into caller tensors whose token axis
+may include a trailing row, leaves that suffix untouched, and checks an expected
+sequence length while holding the cache lock. This lets the model write current
+K/V directly after the prefix without first allocating and copying a compact
+snapshot.
 
 ```mermaid
 flowchart LR
@@ -68,7 +73,9 @@ sequence invalidates every copy, and subsequent use produces a contextual error.
 
 Retrieved `KvLayer` tensors own independent compact storage, so their lifetime is
 not tied to the sequence. This deliberate baseline copy is safe and makes the
-attention boundary explicit. The paged cache additionally provides an M13 read
+attention boundary explicit. Prefix-copy outputs are likewise caller-owned and
+remain valid after the cache changes; only the copied prefix represents the locked
+snapshot. The paged cache additionally provides an M13 read
 lease for direct block-table traversal; it does not change the owning semantics of
 compact retrieval.
 
@@ -128,6 +135,7 @@ Deterministic tests cover:
 - empty sequences, invalid configurations, shapes, dtypes, layers, and outputs,
 - empty, foreign, released, and cross-cache handles,
 - output alias rejection for nonempty copies,
+- larger prefix destinations, untouched tail rows, and stale-length rejection,
 - concurrent appends to independent sequences,
 - normal and ASan/UBSan execution.
 

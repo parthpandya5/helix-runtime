@@ -568,11 +568,47 @@ checkpoint converter was not added because no checkpoint is yet claimed; the
 native writer API is tested and ready for a later explicit mapping tool. See
 `docs/MODEL_SUPPORT.md`.
 
-### M18 — Autoregressive generation — Planned
+### M18 — Autoregressive generation — Implemented, CPU-validated, sanitized, and benchmarked
 
 - prefill, cached decode, greedy token selection, and stop conditions
 - supported tokenizer boundary documented without making Python a runtime dependency
-- minimal `helix generate` CLI and reproducible example
+- minimal `helix_generate` token-ID CLI and reproducible example
+
+Implementation/validation record (2026-08-23, commit `c515d6d`):
+`CpuLlamaGenerator` owns one validated CPU model, one fixed-capacity
+`ContiguousKvCache`, and one cache-tagged sequence. Full prefill captures each
+layer's rotated head-major keys and unrotated values and appends prompt positions
+only after model execution succeeds. One-token decode requires the cache length to
+equal the RoPE position, validates model/cache geometry, reads the prior prefix,
+computes the complete layer stack, and returns all layers' new K/V separately so
+the session mutates only after successful execution.
+
+Greedy selection reads the final logits row, rejects non-finite values, and uses
+the lowest token ID for equal maxima. Generation reports distinct maximum-token,
+EOS, and context-capacity stops. The last emitted token is not cached unless it is
+fed through a subsequent decode step; the returned cache count makes that
+contract visible. The minimal `helix_generate` executable reads a checked
+`HELIXLM1` file and accepts token IDs directly. No tokenizer or public-checkpoint
+compatibility is implied.
+
+Deterministic tests compare prefill and successive cached-decode logits with full
+prefix recomputation, compare complete greedy token sequences, cover position
+zero, tie-breaking, non-finite logits, EOS/zero-budget/context stops, geometry and
+state errors, and verify failures do not advance cache state. Decode history was
+first implemented with an owning compact snapshot followed by a second copy into
+the final attention buffer. A measured direct-prefix API removes two temporary
+tensors and one history copy per layer while retaining cache locking and stale-
+length validation.
+
+Normal, Release, and ASan/UBSan CPU suites pass 136/136. A CUDA 12.6.85/GCC 13.2
+warnings-as-errors build compiles every target and passes the same 136 host tests;
+all 57 registered GPU tests remain skipped without an NVIDIA driver/device. On the
+disclosed Apple M3 Pro CPU fixtures, cached next-position decode measured 3.69x,
+23.59x, and 56.79x faster than full-prefix recomputation at total sequence lengths
+8, 32, and 64. The direct-prefix staging change reduced its isolated median by
+45.7%, 45.4%, and 58.1%. Exact shapes, timing boundaries, variation, and commands
+are in `docs/PERFORMANCE.md`; these are tiny single-threaded CPU reference results,
+not production or GPU inference claims.
 
 ### M19 — Runtime execution engine — Planned
 

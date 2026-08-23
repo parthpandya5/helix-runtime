@@ -33,6 +33,8 @@ Every recorded experiment must include:
 | M15 FIFO scheduler host trace | No earlier scheduler implementation | Schedule and complete deterministic mixed prefill/decode traces under token, running-request, and logical KV-block limits | Corrected median CPU time per complete trace: 48.777 us (16 requests/256 tokens) through 1.342 ms (128 requests/6,144 tokens) | A first fixture revision accidentally polled the O(N) statistics snapshot inside timing; those values were discarded. The corrected trace measures host policy and completion-vector work, not inference. |
 | M16 continuous batching policy | Static cohorts on the same mixed-length request sequence | Refill finished slots between iterations and aggregate lifecycle metrics | Under an explicit constant-1-ms iteration model, continuous/static makespans were 48/132 ms and 92/260 ms (2.75x and 2.83x modeled rates). Median host control CPU times differed by 1.3% and 4.1%. | Modeled results demonstrate policy utilization only; they are not measured model throughput. Host differences are small relative to local variation and do not establish a CPU optimization. |
 | M17 CPU Llama-style prefill and model load | No earlier complete model path | Compose the tested CPU kernels into full causal prefill and add checked `HELIXLM1` deserialization | Prefill medians: 97.942 us, 2.099 ms, and 34.104 ms for the three disclosed tiny configurations; checked in-memory load: 183.744 us, 640.046 us, and 3.967 ms | These establish single-threaded Float32 reference baselines, including forward temporaries or loader validation/allocation as specified. They do not demonstrate an optimization, GPU performance, disk-loading speed, or production model throughput. |
+| M18 cached CPU next-position execution | Full-prefix recomputation for the identical prompt plus one input token | Reuse prefill K/V and execute only the new position | Cached/full-recompute median CPU times: 32.100/118.420 us, 89.580 us/2.113 ms, and 646.960 us/36.741 ms (3.69x, 23.59x, and 56.79x) | The growing advantage demonstrates avoided prefix model work in three tiny single-sequence CPU fixtures. It is not a production model, batched-runtime, tokenizer, or GPU result. |
+| M18 contiguous-KV decode staging | Allocate a compact owning history snapshot, then copy it into the final history-plus-tail buffers | Copy the locked cache prefix directly into the final buffers | Two-stage/direct median CPU times: 858/466 ns, 1,161/634 ns, and 3,784/1,587 ns; reductions 45.7%, 45.4%, and 58.1% | Both paths include final-buffer allocation and current-tail writes. Direct copy removes two temporary tensors and one full history pass; the paired algorithm benchmark isolates this change from model math. |
 
 ## M1 CPU tensor baseline — 2026-08-20
 
@@ -646,6 +648,101 @@ state iteration loop; its nonsensical uptime-scale real-time values were discard
 The recorded fixture enters the loop first, pauses only to initialize and warm up
 once, then resumes before its first measured operation. This correction is
 methodology repair, not a runtime speedup.
+
+## M18 CPU cached decode and staging optimization — 2026-08-23
+
+Environment:
+
+- source: implementation commit `c515d6d` plus the explicit staging warmup in the
+  benchmark fixture;
+- host: Apple M3 Pro, 12 CPU cores (6 performance, 6 efficiency), 18 GB RAM;
+- OS/compiler/build: macOS 26.0.1 arm64, Apple Clang 17.0.0, Release,
+  `HELIX_ENABLE_CUDA=OFF`, warnings as errors, Float32;
+- CMake 4.2.3 and Google Benchmark 1.9.1;
+- concurrency: one benchmark thread; model and reference kernels are
+  single-threaded;
+- timing: Google Benchmark process CPU time, with setup excluded as described
+  below; benchmark order was randomly interleaved across repetitions;
+- CPU affinity and frequency metadata were unavailable. The reported synthetic
+  24 MHz metadata is a failed `sysctl` estimate and must not be used.
+
+### Cached decode versus full-prefix recomputation
+
+Both variants compute logits for the same next input position. The cached fixture
+constructs a new deterministic model/session and performs prompt prefill while
+timing is paused for every measured operation; its timed region includes one-token
+model math, RoPE at the absolute position, locked cache-prefix copies, temporary
+Tensor allocation/destruction, final cache append, and `[1,V]` logits. It also
+executes one complete prefill/decode warmup before the first measured operation.
+
+The recomputation fixture constructs one deterministic model outside timing,
+warms up one complete forward call, and then executes `forward` over the prompt
+plus decode input in every timed operation. Token/model construction and result
+comparison are outside both timed regions. Each case uses exactly 50 timed
+operations per repetition and five repetitions; median CPU time and aggregate CV
+are reported.
+
+| H / I / L / heads / prompt / total / V | Parameters | Cached decode median | Cached CV | Full recompute median | Full CV | Recompute / cached |
+|---|---:|---:|---:|---:|---:|---:|
+| 32 / 64 / 2 / 4 / 7 / 8 / 128 | 28,832 | 32.100 us | 7.47% | 118.420 us | 5.21% | 3.69x |
+| 64 / 128 / 2 / 4 / 31 / 32 / 256 | 115,008 | 89.580 us | 2.85% | 2.113 ms | 5.75% | 23.59x |
+| 128 / 256 / 4 / 8 / 63 / 64 / 512 | 787,584 | 646.960 us | 2.47% | 36.741 ms | 1.94% | 56.79x |
+
+The comparison demonstrates the expected benefit of not recomputing prior-token
+embedding, projections, MLPs, and causal attention. It does not isolate KV traffic
+from the other saved work, and the increasing ratio combines larger prefixes with
+changing model dimensions. Prompt prefill is deliberately excluded, so these are
+steady next-position costs, not request latency or amortized tokens/s. The fixture
+uses tiny deterministic synthetic weights, one sequence, greedy-independent
+logits, and no scheduler, tokenizer, BLAS, or GPU.
+
+Command:
+
+```bash
+./build-release/benchmarks/helix_benchmarks \
+  '--benchmark_filter=BM_CpuLlamaNextPosition/(CachedKvDecode|FullPrefixRecompute)' \
+  --benchmark_min_time=50x \
+  --benchmark_repetitions=5 \
+  --benchmark_enable_random_interleaving=true \
+  --benchmark_report_aggregates_only=true
+```
+
+### Direct cache-prefix staging
+
+The original cached-decode baseline called `retrieve_layer`, allocating and
+copying compact key/value histories, then allocated the final key/value buffers
+and copied history a second time before writing the current token. The optimized
+path allocates only the final pair and uses `copy_layer_prefix_out` to copy cached
+rows directly into their prefix. Both benchmark variants include final-buffer
+allocation, current-token tail copies, cache locking, and destruction. The
+two-stage variant additionally includes its two snapshot allocations and extra
+history pass. Cache construction/fill and deterministic token construction are
+outside timing; each variant runs once as an explicit warmup.
+
+Each case uses exactly 100,000 timed operations per repetition, ten repetitions,
+and random interleaving. `History bytes` counts keys plus values for one layer.
+
+| Heads / D / history | History bytes | Two-stage median / CV | Direct median / CV | Median reduction | Speedup |
+|---|---:|---:|---:|---:|---:|
+| 4 / 8 / 7 | 1,792 B | 858 ns / 4.78% | 466 ns / 2.76% | 45.7% | 1.84x |
+| 4 / 16 / 31 | 15,872 B | 1,161 ns / 3.56% | 634 ns / 4.69% | 45.4% | 1.83x |
+| 8 / 16 / 63 | 64,512 B | 3,784 ns / 3.32% | 1,587 ns / 6.16% | 58.1% | 2.38x |
+
+This paired result supports retaining the direct-prefix API. It does not imply the
+same percentage for end-to-end decode: model math dominates there, and a separate
+before/after process comparison was too sensitive to local system load to use as
+the optimization claim.
+
+Command:
+
+```bash
+./build-release/benchmarks/helix_benchmarks \
+  '--benchmark_filter=BM_ContiguousKvDecodeStaging' \
+  --benchmark_min_time=100000x \
+  --benchmark_repetitions=10 \
+  --benchmark_enable_random_interleaving=true \
+  --benchmark_report_aggregates_only=true
+```
 
 ## Timing rules
 

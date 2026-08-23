@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <utility>
 
 namespace helix::kv_cache {
 namespace {
@@ -94,6 +95,40 @@ void copy_current_token(const Tensor& current_keys, const Tensor& current_values
   }
 }
 
+struct DecodeStagingBuffers {
+  Tensor keys;
+  Tensor values;
+};
+
+DecodeStagingBuffers stage_decode_history(const ContiguousKvCache& cache,
+                                          const SequenceHandle& sequence, const Tensor& token_keys,
+                                          const Tensor& token_values, std::size_t history_tokens,
+                                          std::size_t heads, std::size_t head_dimension,
+                                          bool direct_prefix_copy) {
+  Tensor combined_keys =
+      Tensor::empty({static_cast<Dimension>(heads), static_cast<Dimension>(history_tokens + 1),
+                     static_cast<Dimension>(head_dimension)});
+  Tensor combined_values = Tensor::empty(combined_keys.shape());
+  if (direct_prefix_copy) {
+    cache.copy_layer_prefix_out(sequence, 0, history_tokens, combined_keys, combined_values);
+  } else {
+    const KvLayer history = cache.retrieve_layer(sequence, 0);
+    const std::size_t history_head_elements = history_tokens * head_dimension;
+    const std::size_t combined_head_elements = (history_tokens + 1) * head_dimension;
+    for (std::size_t head = 0; head < heads; ++head) {
+      std::copy_n(history.keys.data_as<float>() + head * history_head_elements,
+                  history_head_elements,
+                  combined_keys.data_as<float>() + head * combined_head_elements);
+      std::copy_n(history.values.data_as<float>() + head * history_head_elements,
+                  history_head_elements,
+                  combined_values.data_as<float>() + head * combined_head_elements);
+    }
+  }
+  copy_current_token(token_keys, token_values, history_tokens, heads, head_dimension, combined_keys,
+                     combined_values);
+  return DecodeStagingBuffers{std::move(combined_keys), std::move(combined_values)};
+}
+
 void BM_ContiguousKvDecodeStaging(benchmark::State& state, bool direct_prefix_copy) {
   const auto heads = static_cast<std::size_t>(state.range(0));
   const auto head_dimension = static_cast<std::size_t>(state.range(1));
@@ -109,30 +144,18 @@ void BM_ContiguousKvDecodeStaging(benchmark::State& state, bool direct_prefix_co
     cache.append(sequence, token_keys, token_values);
   }
 
+  const DecodeStagingBuffers warmup =
+      stage_decode_history(cache, sequence, token_keys, token_values, history_tokens, heads,
+                           head_dimension, direct_prefix_copy);
+  benchmark::DoNotOptimize(warmup.keys.data());
+  benchmark::DoNotOptimize(warmup.values.data());
+
   for ([[maybe_unused]] auto iteration : state) {
-    Tensor combined_keys =
-        Tensor::empty({static_cast<Dimension>(heads), static_cast<Dimension>(history_tokens + 1),
-                       static_cast<Dimension>(head_dimension)});
-    Tensor combined_values = Tensor::empty(combined_keys.shape());
-    if (direct_prefix_copy) {
-      cache.copy_layer_prefix_out(sequence, 0, history_tokens, combined_keys, combined_values);
-    } else {
-      const KvLayer history = cache.retrieve_layer(sequence, 0);
-      const std::size_t history_head_elements = history_tokens * head_dimension;
-      const std::size_t combined_head_elements = (history_tokens + 1) * head_dimension;
-      for (std::size_t head = 0; head < heads; ++head) {
-        std::copy_n(history.keys.data_as<float>() + head * history_head_elements,
-                    history_head_elements,
-                    combined_keys.data_as<float>() + head * combined_head_elements);
-        std::copy_n(history.values.data_as<float>() + head * history_head_elements,
-                    history_head_elements,
-                    combined_values.data_as<float>() + head * combined_head_elements);
-      }
-    }
-    copy_current_token(token_keys, token_values, history_tokens, heads, head_dimension,
-                       combined_keys, combined_values);
-    benchmark::DoNotOptimize(combined_keys.data());
-    benchmark::DoNotOptimize(combined_values.data());
+    const DecodeStagingBuffers staged =
+        stage_decode_history(cache, sequence, token_keys, token_values, history_tokens, heads,
+                             head_dimension, direct_prefix_copy);
+    benchmark::DoNotOptimize(staged.keys.data());
+    benchmark::DoNotOptimize(staged.values.data());
     benchmark::ClobberMemory();
   }
 

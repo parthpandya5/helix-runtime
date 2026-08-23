@@ -2,12 +2,13 @@
 
 ## Status
 
-Milestone 17 implements one narrow, deterministic Llama-style model in the CPU
-backend. It is a Float32 correctness baseline for full causal prefill, not a claim
+Milestones 17–18 implement one narrow, deterministic Llama-style model and
+single-sequence generation session in the CPU backend. They are Float32
+correctness baselines for full causal prefill and contiguous-KV decode, not a claim
 of compatibility with every model whose configuration contains the word “Llama.”
 The implementation, native weight container, unit tests, sanitizer suite, and CPU
-benchmarks are complete. CUDA model execution, KV-cached decode, tokenizer
-integration, and real checkpoint conversion remain later gates.
+benchmarks are complete. CUDA model execution, tokenizer integration, batched
+runtime execution, and real checkpoint conversion remain later gates.
 
 ## Exact architecture contract
 
@@ -53,6 +54,50 @@ That copying is intentionally visible in this first baseline.
 `forward_with_trace` additionally retains each post-layer hidden state and the
 final normalized state. Tests compare all of those stages with an independent
 `std::vector<float>` oracle; the ordinary forward path does not retain them.
+
+## Prefill, cached decode, and generation
+
+`CpuLlamaModel::prefill_with_kv` runs the same full causal path as `forward` and
+additionally returns one rotated key tensor and one value tensor per layer, each
+head-major `[A,T,D]`. `CpuLlamaModel::decode_one` consumes one token at absolute
+position `P`, requires an existing cache length of exactly `P`, applies RoPE at
+that absolute position, and attends the single query over `P` cached tokens plus
+its current K/V. It returns `[1,V]` logits and the new token's all-layer K/V shaped
+`[L,A,D]` without changing the cache.
+
+`CpuLlamaGenerator` owns the model, a `ContiguousKvCache` sized to the model's
+maximum sequence length, and one sequence handle. It is noncopyable, nonmovable,
+single-sequence, and not thread-safe. Prefill computes every model artifact before
+appending prompt tokens. Decode computes the complete token result before append.
+Therefore ordinary validation/model failures leave cache length unchanged. Cache
+append itself is a prevalidated, fixed-capacity copy with no allocation after the
+model step.
+
+The first decode baseline retrieved an owning compact K/V snapshot per layer and
+then copied that snapshot into a second buffer with a current-token tail.
+`copy_layer_prefix_out` now copies the locked history directly into that final
+`[A,P+1,D]` buffer, validates the caller's expected length under the cache mutex,
+and leaves the tail untouched for the current K/V. This preserves cache ownership
+while removing two Tensor temporaries and one history-copy pass per layer.
+
+`select_greedy_token` examines the last logits row, requires finite Float32 CPU
+values, and selects the lowest token ID among equal maxima. `generate` emits until
+the requested count, optional EOS token, or context capacity prevents another
+decode. A selected token is appended to K/V only when it becomes the input to a
+later decode step, so a final emitted token may not be cached. `GenerationResult`
+reports the actual cache count instead of implying otherwise.
+
+The `helix_generate` example loads `HELIXLM1` and accepts prompt token IDs:
+
+```bash
+./build/examples/helix_generate \
+  --model ./models/example.helix \
+  --max-new-tokens 16 \
+  1 42 17
+```
+
+This explicit token-ID boundary avoids making a tokenizer or Python a runtime
+dependency. It is not text-in/text-out model support.
 
 ## Weight tensors
 
@@ -141,22 +186,31 @@ overlength, maximum-length, and out-of-vocabulary token sequences, invalid head
 geometry, non-finite configuration values, wrong layer counts, dtype errors, and
 bad weight shapes.
 
+Generation tests compare prompt logits and two successive cached decode positions
+with full-prefix recomputation, then compare a complete four-token greedy sequence
+with repeated full recomputation. They cover decode at position zero, deterministic
+tie-breaking, non-finite logits, invalid EOS/token/cache geometry, zero budget,
+EOS, context exhaustion, repeated-prefill misuse, and transactional cache length
+on failures. The direct prefix-copy test verifies multi-head layout, untouched tail
+rows, stale expected-length rejection, insufficient output capacity, and alias
+rejection.
+
 Model-file tests cover bit-exact deterministic round trips, executable loaded
 weights, filesystem APIs, truncation, trailing bytes, wrong magic/version/endian
 markers, metadata and payload corruption, nonzero padding, structurally invalid
 but checksum-consistent ranks/offsets, invalid weights, non-finite weights, and
 nonzero stream origins.
 
-Validation on 2026-08-23 for implementation commit `987c3b2`:
+Validation on 2026-08-23 through M18 implementation commit `c515d6d`:
 
-- normal and Release CPU suites: 129/129 tests passed;
-- Apple Clang ASan/UBSan suite: 129/129 tests passed;
+- normal and Release CPU suites: 136/136 tests passed;
+- Apple Clang ASan/UBSan suite: 136/136 tests passed;
 - CUDA 12.6.85/GCC 13.2 warnings-as-errors build: all targets compiled and all
-  129 hardware-independent tests passed;
+  136 hardware-independent tests passed;
 - 57 GPU runtime tests remained explicitly skipped because the compile container
   has no NVIDIA driver or device.
 
-## Measured CPU baseline
+## Measured CPU baselines
 
 Release-mode full-prefill and checked in-memory-load measurements are recorded in
 [`PERFORMANCE.md`](PERFORMANCE.md). `forward` includes its temporary tensor
@@ -169,12 +223,22 @@ These measurements establish the first implementation. They do not show an
 optimization, GPU behavior, production inference throughput, or comparison with
 BLAS/framework runtimes.
 
+The M18 next-position fixture compares one cached decode against recomputing the
+same complete prefix. Model/cache setup and prompt prefill are excluded; the cached
+timed region includes one-token math, cache history reads, final cache append, and
+temporary allocations. The paired cache-staging fixture retains the original
+two-stage snapshot algorithm beside the direct-prefix path and includes output
+allocation and current-tail copies for both. Exact medians, variation, model
+shapes, repetitions, and commands are in `PERFORMANCE.md`.
+
 ## Deliberate limitations
 
 - CPU Float32 only for complete model execution.
-- Full prompt prefill recomputes the whole causal history on every call.
-- No KV-cached decode, token selection, generation loop, batching, or runtime
-  scheduler integration yet.
+- Prefill is one complete prompt operation; chunked model prefill is not connected.
+- Cached decode uses a fixed-capacity contiguous CPU cache and materializes one
+  `[A,P+1,D]` K/V pair per layer for the current attention call.
+- Generation supports one sequence and greedy selection only; no sampling,
+  batching, paged model decode, or runtime scheduler integration yet.
 - No tokenizer and no supported public checkpoint conversion tool yet.
 - No GQA/MQA, tied-embedding option, biases, partial rotary dimensions, sliding
   windows, mixture-of-experts blocks, quantization, or arbitrary model graphs.

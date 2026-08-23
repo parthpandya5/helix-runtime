@@ -15,8 +15,9 @@ reproducible benchmark evidence.
 
 Milestones 0–2, the host-testable portions of Milestones 7–8, the CPU paths of
 Milestones 9–10, the M11–M12 KV caches, the M13 direct paged-attention CPU path,
-the M14–M16 request and continuous-batching scheduler, and the M17 narrow
-Llama-style CPU prefill runtime are implemented and CPU-validated. The repository
+the M14–M16 request and continuous-batching scheduler, the M17 narrow Llama-style
+CPU prefill runtime, and the M18 single-sequence cached generation path are
+implemented and CPU-validated. The repository
 contains the CPU-first build foundation, a checked contiguous tensor core,
 Float32 reference kernels for elementwise math, reductions, stable softmax,
 matrix multiplication, RMSNorm, SwiGLU, adjacent-pair RoPE, linear projection, and
@@ -24,10 +25,10 @@ causal scaled dot-product attention, plus a caching allocator, completion-aware 
 reclamation, and layer-aware contiguous/paged KV histories with checked capacity
 accounting and copy-free block-table attention traversal. The model composes those
 primitives into embedding, pre-norm attention/MLP blocks, RoPE, SwiGLU, residuals,
-final normalization, and an untied LM head, and loads a checksummed versioned
-native weight format. On 2026-08-23, Apple Clang 17 built the project on macOS
-arm64 with warnings as errors; 129/129 CPU tests passed in normal, Release, and
-ASan/UBSan configurations.
+final normalization, and an untied LM head, loads a checksummed versioned native
+weight format, and performs greedy generation through a contiguous KV cache. On
+2026-08-23, Apple Clang 17 built the project on macOS arm64 with warnings as
+errors; 136/136 CPU tests passed in normal, Release, and ASan/UBSan configurations.
 
 CUDA is optional at configure time. The current Apple Silicon development host has
 no NVIDIA GPU or native CUDA toolkit, so no CUDA execution or performance claim is
@@ -37,7 +38,7 @@ compile-validated in an ARM64 CUDA 12.6 development container without a
 driver/device. The M8 stream-ordered allocator and M9 block-reduced RMSNorm,
 grid-stride SwiGLU, adjacent-pair RoPE, and projection adapter are also
 compile-validated, as is the M10 three-stage contiguous attention baseline. None is
-runtime-validated on a GPU. The CUDA-on build passes the same 129 hardware-
+runtime-validated on a GPU. The CUDA-on build passes the same 136 hardware-
 independent tests and registers 57 GPU tests that cannot run without a driver and
 device.
 
@@ -128,9 +129,11 @@ odd-width softmax, odd-dimension/standard-square matmul, SwiGLU, and decode/pref
 shaped RoPE. Attention fixtures retain dimension-major baselines, measure a common
 32-coordinate value tile, and compare direct block traversal against contiguous
 storage. Contiguous-versus-paged KV lifecycle/layer-copy fixtures keep their actual
-CPU costs and unfavorable results. Scheduler traces separate measured host-policy
-cost from a declared synthetic static-versus-continuous model; neither is labeled
-as inference throughput. Complete CPU model prefill and checked in-memory weight
+CPU costs and unfavorable results. A paired decode-staging fixture measures the
+removal of an intermediate K/V snapshot, while complete next-position fixtures
+compare cached decode with full-prefix recomputation. Scheduler traces separate
+measured host-policy cost from a declared synthetic static-versus-continuous model;
+neither is labeled as inference throughput. Complete CPU model prefill and checked in-memory weight
 loading have three disclosed synthetic-model baselines; they are reference-path
 measurements, not production inference claims. Methodology and measurements live in
 [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md).
@@ -200,11 +203,13 @@ See [`docs/ATTENTION.md`](docs/ATTENTION.md).
 
 The M11 CPU baseline owns per-sequence Float32 key/value tensors with explicit
 layer, KV-head, capacity, and head-dimension axes. It appends one complete token,
-retrieves compact layer histories compatible with contiguous attention, rejects
-capacity exhaustion transactionally, and reports exact active/peak bytes and token
-counts. Cache-tagged sequence handles prevent foreign or released handles from
-freeing storage. Five focused tests include cached-decode equivalence and
-concurrent callers; lifecycle and preallocated layer-copy baselines are measured.
+retrieves compact layer histories compatible with contiguous attention, copies a
+validated history prefix directly into larger decode buffers, rejects capacity
+exhaustion transactionally, and reports exact active/peak bytes and token counts.
+Cache-tagged sequence handles prevent foreign or released handles from freeing
+storage. Six focused tests include cached-decode equivalence, direct-prefix-copy
+bounds, and concurrent callers; lifecycle and preallocated layer-copy baselines
+are measured.
 
 The M12 paged path replaces per-sequence maximum-capacity allocations with a
 fixed-token physical pool and logical block tables. A deterministic allocation-
@@ -256,6 +261,34 @@ returning a model. Exact layouts, ownership, validation, measured CPU baselines,
 and compatibility boundaries are in
 [`docs/MODEL_SUPPORT.md`](docs/MODEL_SUPPORT.md).
 
+## Autoregressive generation
+
+`helix::model::CpuLlamaGenerator` owns one `CpuLlamaModel`, one fixed-capacity
+contiguous KV cache, and one sequence handle. Prefill captures each layer's
+RoPE-transformed keys and values, then populates the cache only after model
+execution succeeds. Each decode step validates the expected cache position,
+computes one token, reads prior K/V directly into the final attention buffers,
+and appends the new K/V only after the complete step succeeds. Greedy selection
+uses the last logits row, rejects non-finite values, and chooses the lowest token
+ID on a tie. Maximum-new-token, optional EOS, and context-capacity stops are
+explicitly reported.
+
+The minimal CLI deliberately accepts token IDs because Helix does not yet ship a
+tokenizer or claim a public-checkpoint mapping:
+
+```bash
+cmake --build build --target helix_generate
+./build/examples/helix_generate \
+  --model ./models/example.helix \
+  --max-new-tokens 16 \
+  1 42 17
+```
+
+The path is single-sequence, CPU Float32, and separate from the M15 scheduler; it
+is not yet a serving engine. Correctness and measured CPU decode baselines are in
+[`docs/MODEL_SUPPORT.md`](docs/MODEL_SUPPORT.md) and
+[`docs/PERFORMANCE.md`](docs/PERFORMANCE.md).
+
 ## Supported hardware
 
 - CPU foundation: validated with Apple Clang 17 on macOS arm64; Linux GCC/Clang
@@ -270,11 +303,11 @@ The CUDA runtime, M4–M6/M9–M10 kernels, and M7–M8 CUDA allocator adapters 
 compile-validated only; physical GPU correctness, timing, and resource validation
 remain pending. KV caches, paged attention, and continuous batching are host-only;
 the scheduler is not yet integrated with physical KV reservation or model
-execution. Transformer execution currently supports CPU Float32 full prefill only;
-KV-cached decode, tokenization, token selection, generation, public checkpoint
-conversion, and CUDA model dispatch remain roadmap work. Tensor
-allocator integration is also pending. Float16 has no arithmetic path yet. Tensor execution is contiguous-
-only; broadcasting, slicing, and general strided kernels are intentionally
+execution. Transformer execution currently supports CPU Float32 prefill and
+single-sequence contiguous-KV greedy decode; tokenization, batched generation,
+public checkpoint conversion, and CUDA model dispatch remain roadmap work. Tensor
+allocator integration is also pending. Float16 has no arithmetic path yet. Tensor
+execution is contiguous-only; broadcasting, slicing, and general strided kernels are intentionally
 deferred. CPU kernels are reference implementations, not optimized BLAS
 replacements.
 

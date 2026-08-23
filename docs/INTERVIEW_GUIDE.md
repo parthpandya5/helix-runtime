@@ -12,9 +12,10 @@ single-threaded CPU correctness kernels, manually written CUDA elementwise,
 reduction, softmax, GEMM, transformer, and attention kernels, a caching allocator
 with fragmentation metrics and deferred stream-ordered reuse, contiguous and paged
 KV caches, direct block-table attention, and a deterministic continuous-batching
-scheduler. The current end-to-end math path runs a narrowly defined Float32
-Llama-style full prefill on CPU and loads a checksummed native model format. CPU
-paths pass normal and sanitizer suites and have reproducible benchmarks. CUDA
+scheduler. The current end-to-end path loads a checksummed native model format,
+runs a narrowly defined Float32 Llama-style model on CPU, and performs
+single-sequence greedy generation with transactional contiguous-KV prefill/decode.
+CPU paths pass normal and sanitizer suites and have reproducible benchmarks. CUDA
 paths compile under CUDA 12.6, but I do not claim GPU correctness or performance
 because this development environment has no NVIDIA device.
 
@@ -209,17 +210,19 @@ throughput.
 Prefill processes prompt tokens, usually with many query positions and quadratic
 causal attention within the prompt. Decode produces one new position per request
 and reads a growing cached K/V history, so matrix shapes are much narrower and
-often memory/launch-latency sensitive. Helix currently has full CPU model prefill,
-cache/attention decode primitives, and scheduler work kinds, but has not connected
-them into M18 generation yet.
+often memory/launch-latency sensitive. Helix's CPU generator runs full prompt
+prefill once, stores each layer's rotated keys and values, then computes only the
+new token position on decode. Deterministic tests compare successive cached logits
+and greedy tokens with full-prefix recomputation. The single-sequence generator is
+not yet connected to the scheduler's batched work descriptions.
 
 ## What limits inference throughput?
 
 It depends on phase, batch, precision, and hardware: projection/MLP GEMMs,
 attention bandwidth and workspace, KV traffic/capacity, launch overhead, allocator
-or scheduling bubbles, and CPU orchestration can all dominate. Helix's current CPU
-full-prefill benchmark composes the path but does not isolate a bottleneck; CUDA
-profiling is required before naming the GPU limiter.
+or scheduling bubbles, and CPU orchestration can all dominate. Helix's CPU
+prefill/decode fixtures show the complete reference-path cost but do not isolate a
+production bottleneck; CUDA profiling is required before naming the GPU limiter.
 
 ## What limits decode latency?
 
@@ -228,6 +231,9 @@ launch/synchronization overhead, KV memory bandwidth, and batching delay. Increa
 batch can improve throughput while hurting an individual request's queueing or
 inter-token latency. Helix's scheduler metrics separate wait, TTFT, request
 latency, and adjacent-token intervals so that tradeoff can eventually be measured.
+On the current CPU baseline, removing an intermediate K/V snapshot cut isolated
+decode staging by 45.4%–58.1% for the measured multi-token histories, but complete
+decode remains dominated by model math as dimensions grow.
 
 ## What happens when KV memory is exhausted?
 
@@ -240,9 +246,10 @@ implemented.
 
 ## What would break first at 10x workload?
 
-On the current CPU model, single-threaded reference GEMM and full-history prefill
-would dominate quickly, followed by temporary allocations and attention's
-`O(T^2)` score workspace. In serving metadata, the scheduler retains terminal
+On the current CPU model, single-threaded reference GEMM would dominate quickly;
+prefill also carries an `O(T^2)` score workspace, while one-token decode still
+materializes a contiguous history-plus-tail pair per layer. In serving metadata,
+the scheduler retains terminal
 request history and several operations are linear scans. For KV, fixed pool
 capacity becomes the admission boundary. On GPU, the answer requires profiling;
 likely constraints include KV capacity/bandwidth, GEMM efficiency, allocator/Tensor
@@ -269,8 +276,9 @@ enable NCCL or claim multi-GPU support.
 Helix implements Tensor/storage metadata, CPU kernels, CUDA elementwise/reduction/
 softmax/GEMM/transformer/attention kernels, allocator metadata and deferred reuse,
 KV layouts, paged attention, requests, scheduling/metrics, the CPU transformer,
-and the native file parser. It delegates CUDA driver/runtime operations to the
-CUDA Runtime API and testing/benchmark harnesses to GoogleTest/Google Benchmark.
+cached generation session, greedy selection, and native file parser. It delegates
+CUDA driver/runtime operations to the CUDA Runtime API and testing/benchmark
+harnesses to GoogleTest/Google Benchmark.
 No PyTorch runtime, BLAS, cuBLAS, NCCL, or external model graph executes Helix
 inference today. cuBLAS and NCCL remain explicitly labeled future library paths.
 
@@ -283,3 +291,10 @@ the comparison was confounded: the paged value loop used a better traversal. A
 fair optimized comparison showed paging 2.1%–6.7% slower across the measured
 cases. The useful result was not “paging is faster,” but that paired baselines are
 necessary to separate a general locality improvement from the cost of paging.
+
+The same discipline helped decode: the first path copied cache history into an
+owning snapshot and then copied it again into the attention buffer. A paired
+fixture kept that baseline and showed direct prefix copy reducing staging medians
+by 45.4%–58.1% on the multi-token cases while preserving locking and stale-length
+checks. I do not quote those percentages as an end-to-end model speedup because
+the model benchmark contains much more work.
