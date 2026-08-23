@@ -74,23 +74,35 @@ struct PagedKvCacheStats {
   std::size_t used_blocks = 0;
   std::size_t free_blocks = 0;
   std::size_t active_sequence_count = 0;
+  // Logical tokens visible across every live sequence. Shared prefixes are
+  // counted once per sequence.
   std::size_t active_tokens = 0;
+  // Unique written token slots in physical blocks. Shared prefixes are counted
+  // once regardless of their block reference count.
+  std::size_t resident_tokens = 0;
   std::size_t allocated_token_slots = 0;
+  std::size_t block_reference_count = 0;
+  std::size_t shared_blocks = 0;
   std::uint64_t sequence_create_count = 0;
+  std::uint64_t sequence_fork_count = 0;
   std::uint64_t append_count = 0;
   std::uint64_t release_count = 0;
   std::uint64_t block_allocation_count = 0;
   std::uint64_t block_reuse_count = 0;
 
   [[nodiscard]] std::size_t unused_token_slots() const noexcept {
-    return allocated_token_slots - active_tokens;
+    return allocated_token_slots - resident_tokens;
+  }
+
+  [[nodiscard]] std::size_t shared_token_references() const noexcept {
+    return active_tokens - resident_tokens;
   }
 
   [[nodiscard]] double token_slot_utilization() const noexcept {
     if (allocated_token_slots == 0) {
       return 0.0;
     }
-    return static_cast<double>(active_tokens) / static_cast<double>(allocated_token_slots);
+    return static_cast<double>(resident_tokens) / static_cast<double>(allocated_token_slots);
   }
 };
 
@@ -144,6 +156,12 @@ public:
   PagedKvCache& operator=(PagedKvCache&&) = delete;
 
   [[nodiscard]] PagedSequenceHandle create_sequence();
+  // Creates a new sequence whose positive, block-aligned prefix aliases the
+  // source's physical blocks. Shared blocks are immutable: both sequences must
+  // begin subsequent appends on a new block, so partial-block copy-on-write is
+  // deliberately outside this API's contract.
+  [[nodiscard]] PagedSequenceHandle fork_sequence(const PagedSequenceHandle& source,
+                                                  std::size_t prefix_tokens);
   void append(const PagedSequenceHandle& sequence, const Tensor& token_keys,
               const Tensor& token_values);
   // Appends a nonempty token range from one [kv_heads, tokens,

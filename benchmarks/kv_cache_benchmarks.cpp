@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <limits>
 #include <utility>
+#include <vector>
 
 namespace helix::kv_cache {
 namespace {
@@ -239,6 +240,63 @@ void BM_PagedKvLayerCopy(benchmark::State& state) {
                           static_cast<benchmark::IterationCount>(copied_bytes));
 }
 
+void BM_PagedKvPrefixForkLifecycle(benchmark::State& state, bool share_blocks) {
+  const auto layers = static_cast<std::size_t>(state.range(0));
+  const auto heads = static_cast<std::size_t>(state.range(1));
+  const auto head_dimension = static_cast<std::size_t>(state.range(2));
+  const auto block_tokens = static_cast<std::size_t>(state.range(3));
+  const auto prefix_tokens = static_cast<std::size_t>(state.range(4));
+  if (block_tokens == 0 || prefix_tokens == 0 || prefix_tokens % block_tokens != 0) {
+    state.SkipWithError("prefix benchmark requires a positive, block-aligned prefix");
+    return;
+  }
+  const std::size_t prefix_blocks = prefix_tokens / block_tokens;
+  PagedKvCache cache(
+      PagedKvCacheConfig{layers, heads, head_dimension, block_tokens, 2 * prefix_blocks});
+
+  const Shape prefix_shape{static_cast<Dimension>(heads), static_cast<Dimension>(prefix_tokens),
+                           static_cast<Dimension>(head_dimension)};
+  std::vector<Tensor> layer_keys;
+  std::vector<Tensor> layer_values;
+  layer_keys.reserve(layers);
+  layer_values.reserve(layers);
+  for (std::size_t layer = 0; layer < layers; ++layer) {
+    layer_keys.push_back(Tensor::random_uniform(prefix_shape, 85'001 + layer, -1.0F, 1.0F));
+    layer_values.push_back(Tensor::random_uniform(prefix_shape, 86'001 + layer, -1.0F, 1.0F));
+  }
+  const PagedSequenceHandle source = cache.create_sequence();
+  cache.append_layer_major(source, layer_keys, layer_values);
+
+  const auto create_child = [&cache, &layer_keys, &layer_values, source, prefix_tokens,
+                             share_blocks] {
+    if (share_blocks) {
+      return cache.fork_sequence(source, prefix_tokens);
+    }
+    const PagedSequenceHandle child = cache.create_sequence();
+    cache.append_layer_major(child, layer_keys, layer_values);
+    return child;
+  };
+
+  const PagedSequenceHandle warmup = create_child();
+  benchmark::DoNotOptimize(cache.length(warmup));
+  cache.release_sequence(warmup);
+  for ([[maybe_unused]] auto iteration : state) {
+    const PagedSequenceHandle child = create_child();
+    benchmark::DoNotOptimize(cache.length(child));
+    cache.release_sequence(child);
+  }
+
+  const std::size_t logical_payload_bytes = prefix_tokens * cache.bytes_per_token();
+  state.counters["additional_assigned_bytes"] =
+      static_cast<double>(share_blocks ? 0 : logical_payload_bytes);
+  state.counters["block_table_entries"] = static_cast<double>(prefix_blocks);
+  state.counters["logical_payload_bytes"] = static_cast<double>(logical_payload_bytes);
+  state.counters["payload_copy_bytes"] =
+      static_cast<double>(share_blocks ? 0 : logical_payload_bytes);
+  state.SetItemsProcessed(state.iterations() *
+                          static_cast<benchmark::IterationCount>(prefix_tokens));
+}
+
 BENCHMARK(BM_ContiguousKvLifecycle)
     ->Args({2, 2, 64, 128, 128})
     ->Args({4, 8, 64, 512, 32})
@@ -270,6 +328,18 @@ BENCHMARK(BM_PagedKvLayerCopy)
     ->Args({2, 2, 64, 16, 128})
     ->Args({4, 8, 64, 16, 512})
     ->Args({3, 3, 37, 7, 29});
+
+BENCHMARK_CAPTURE(BM_PagedKvPrefixForkLifecycle, DuplicatePayload, false)
+    ->Args({2, 2, 32, 8, 32})
+    ->Args({3, 3, 37, 7, 35})
+    ->Args({4, 4, 64, 16, 128})
+    ->ArgNames({"layers", "heads", "head_dimension", "block_tokens", "prefix_tokens"});
+
+BENCHMARK_CAPTURE(BM_PagedKvPrefixForkLifecycle, SharedBlocks, true)
+    ->Args({2, 2, 32, 8, 32})
+    ->Args({3, 3, 37, 7, 35})
+    ->Args({4, 4, 64, 16, 128})
+    ->ArgNames({"layers", "heads", "head_dimension", "block_tokens", "prefix_tokens"});
 
 } // namespace
 } // namespace helix::kv_cache

@@ -201,7 +201,9 @@ struct PagedKvCache::Impl {
         block_elements(layout.block_elements), layer_elements(layout.layer_elements),
         head_elements(layout.head_elements), keys(Tensor::empty(layout.pool_shape)),
         values(Tensor::empty(layout.pool_shape)), free_blocks(config.physical_blocks),
-        block_owners(config.physical_blocks, 0), block_was_allocated(config.physical_blocks, 0) {
+        block_reference_counts(config.physical_blocks, 0),
+        block_token_counts(config.physical_blocks, 0),
+        block_was_allocated(config.physical_blocks, 0) {
     HELIX_ASSERT(keys.nbytes() + values.nbytes() == layout.pool_bytes,
                  "paged KV pool tensors do not match computed reserved bytes");
     stats.bytes_reserved = layout.pool_bytes;
@@ -279,63 +281,109 @@ struct PagedKvCache::Impl {
 
   void validate_invariants() const {
 #ifndef NDEBUG
-    std::size_t mapped_blocks = 0;
-    std::size_t active_tokens = 0;
+    std::size_t mapped_references = 0;
+    std::size_t logical_tokens = 0;
     for (const auto& [sequence_id, sequence] : sequences) {
       HELIX_ASSERT(sequence_id != 0, "paged KV sequence uses reserved zero identity");
       HELIX_ASSERT(sequence.blocks.size() ==
                        blocks_for_tokens(sequence.length, config.block_tokens),
                    "paged KV block-table length disagrees with token length");
-      active_tokens += sequence.length;
-      mapped_blocks += sequence.blocks.size();
-      for (const PhysicalBlockId block : sequence.blocks) {
+      HELIX_ASSERT(sequence.length <= std::numeric_limits<std::size_t>::max() - logical_tokens,
+                   "paged KV logical-token invariant sum would overflow");
+      logical_tokens += sequence.length;
+      HELIX_ASSERT(sequence.blocks.size() <=
+                       std::numeric_limits<std::size_t>::max() - mapped_references,
+                   "paged KV block-reference invariant sum would overflow");
+      mapped_references += sequence.blocks.size();
+      for (std::size_t logical_block = 0; logical_block < sequence.blocks.size(); ++logical_block) {
+        const PhysicalBlockId block = sequence.blocks[logical_block];
         HELIX_ASSERT(block.valid() && block.value() < config.physical_blocks,
                      "paged KV block table contains an invalid physical block");
-        HELIX_ASSERT(block_owners[block.value()] == sequence_id,
-                     "paged KV block owner disagrees with sequence table");
+        HELIX_ASSERT(block_reference_counts[block.value()] != 0,
+                     "paged KV block table references an unowned physical block");
+        const std::size_t logical_start = logical_block * config.block_tokens;
+        const std::size_t visible_tokens =
+            std::min(config.block_tokens, sequence.length - logical_start);
+        HELIX_ASSERT(block_token_counts[block.value()] == visible_tokens,
+                     "paged KV block payload length disagrees with sequence table");
+        for (std::size_t prior = 0; prior < logical_block; ++prior) {
+          HELIX_ASSERT(sequence.blocks[prior] != block,
+                       "paged KV sequence maps one physical block more than once");
+        }
       }
     }
 
-    std::size_t owned_blocks = 0;
+    std::size_t referenced_blocks = 0;
+    std::size_t resident_tokens = 0;
+    std::size_t shared_blocks = 0;
+    std::size_t derived_references = 0;
     std::size_t free_members = 0;
     for (std::size_t block = 0; block < config.physical_blocks; ++block) {
-      if (block_owners[block] == 0) {
+      std::size_t expected_references = 0;
+      for (const auto& [sequence_id, sequence] : sequences) {
+        static_cast<void>(sequence_id);
+        expected_references += static_cast<std::size_t>(
+            std::find(sequence.blocks.begin(), sequence.blocks.end(),
+                      PhysicalBlockId(static_cast<std::uint32_t>(block))) != sequence.blocks.end());
+      }
+      HELIX_ASSERT(block_reference_counts[block] == expected_references,
+                   "paged KV physical-block reference count disagrees with block tables");
+      if (expected_references == 0) {
         ++free_members;
         HELIX_ASSERT(block_is_free[block] != 0,
                      "free paged KV block is absent from free membership");
+        HELIX_ASSERT(block_token_counts[block] == 0,
+                     "free paged KV block retains a written-token count");
       } else {
-        ++owned_blocks;
-        HELIX_ASSERT(block_is_free[block] == 0, "owned paged KV block is marked as free");
+        ++referenced_blocks;
+        resident_tokens += block_token_counts[block];
+        derived_references += expected_references;
+        shared_blocks += static_cast<std::size_t>(expected_references > 1);
+        HELIX_ASSERT(block_is_free[block] == 0, "referenced paged KV block is marked as free");
         HELIX_ASSERT(block_was_allocated[block] != 0,
-                     "owned paged KV block lacks allocation history");
-        HELIX_ASSERT(sequences.contains(block_owners[block]),
-                     "paged KV block is owned by an unknown sequence");
+                     "referenced paged KV block lacks allocation history");
+        HELIX_ASSERT(block_token_counts[block] != 0 &&
+                         block_token_counts[block] <= config.block_tokens,
+                     "referenced paged KV block has an invalid written-token count");
+        HELIX_ASSERT(expected_references == 1 || block_token_counts[block] == config.block_tokens,
+                     "a partially written paged KV block is shared");
       }
     }
     for (std::size_t offset = 0; offset < free_blocks.size(); ++offset) {
       const PhysicalBlockId block = free_blocks.at(offset);
       HELIX_ASSERT(block.valid() && block.value() < config.physical_blocks,
                    "paged KV free queue contains an invalid block");
-      HELIX_ASSERT(block_is_free[block.value()] != 0 && block_owners[block.value()] == 0,
-                   "paged KV free queue contains an owned block");
+      HELIX_ASSERT(block_is_free[block.value()] != 0 && block_reference_counts[block.value()] == 0,
+                   "paged KV free queue contains a referenced block");
+      for (std::size_t prior = 0; prior < offset; ++prior) {
+        HELIX_ASSERT(free_blocks.at(prior) != block,
+                     "paged KV free queue contains a duplicate block");
+      }
     }
 
-    HELIX_ASSERT(mapped_blocks == owned_blocks, "paged KV mapped and owned block counts disagree");
+    HELIX_ASSERT(mapped_references == derived_references,
+                 "paged KV mapped and physical reference counts disagree");
     HELIX_ASSERT(free_members == free_blocks.size(),
                  "paged KV free membership and queue counts disagree");
-    HELIX_ASSERT(owned_blocks + free_blocks.size() == config.physical_blocks,
+    HELIX_ASSERT(referenced_blocks + free_blocks.size() == config.physical_blocks,
                  "paged KV block accounting does not cover the pool");
     HELIX_ASSERT(stats.total_blocks == config.physical_blocks,
                  "paged KV total-block statistic is inconsistent");
-    HELIX_ASSERT(stats.used_blocks == owned_blocks && stats.free_blocks == free_blocks.size(),
+    HELIX_ASSERT(stats.used_blocks == referenced_blocks && stats.free_blocks == free_blocks.size(),
                  "paged KV used/free block statistics are inconsistent");
     HELIX_ASSERT(stats.active_sequence_count == sequences.size(),
                  "paged KV sequence statistic is inconsistent");
-    HELIX_ASSERT(stats.active_tokens == active_tokens,
+    HELIX_ASSERT(stats.active_tokens == logical_tokens,
                  "paged KV active-token statistic is inconsistent");
-    HELIX_ASSERT(stats.allocated_token_slots == owned_blocks * config.block_tokens,
+    HELIX_ASSERT(stats.resident_tokens == resident_tokens,
+                 "paged KV resident-token statistic is inconsistent");
+    HELIX_ASSERT(stats.block_reference_count == mapped_references,
+                 "paged KV block-reference statistic is inconsistent");
+    HELIX_ASSERT(stats.shared_blocks == shared_blocks,
+                 "paged KV shared-block statistic is inconsistent");
+    HELIX_ASSERT(stats.allocated_token_slots == referenced_blocks * config.block_tokens,
                  "paged KV token-slot statistic is inconsistent");
-    HELIX_ASSERT(stats.bytes_used == owned_blocks * per_block_bytes,
+    HELIX_ASSERT(stats.bytes_used == referenced_blocks * per_block_bytes,
                  "paged KV used-byte statistic is inconsistent");
     HELIX_ASSERT(stats.bytes_free == free_blocks.size() * per_block_bytes,
                  "paged KV free-byte statistic is inconsistent");
@@ -355,7 +403,8 @@ struct PagedKvCache::Impl {
   Tensor values;
   mutable std::mutex mutex;
   FreeBlockQueue free_blocks;
-  std::vector<std::uint64_t> block_owners;
+  std::vector<std::size_t> block_reference_counts;
+  std::vector<std::size_t> block_token_counts;
   std::vector<std::uint8_t> block_was_allocated;
   std::vector<std::uint8_t> block_is_free = std::vector<std::uint8_t>(config.physical_blocks, 1);
   std::unordered_map<std::uint64_t, SequenceState> sequences;
@@ -461,6 +510,12 @@ PagedSequenceHandle PagedKvCache::create_sequence() {
   std::scoped_lock lock(impl_->mutex);
   HELIX_CHECK(impl_->next_sequence_id != std::numeric_limits<std::uint64_t>::max(),
               ErrorCode::kResourceExhausted, "paged KV sequence id space exhausted");
+  HELIX_CHECK(impl_->stats.active_sequence_count != std::numeric_limits<std::size_t>::max(),
+              ErrorCode::kResourceExhausted,
+              "PagedKvCache::create_sequence active sequence count would overflow");
+  HELIX_CHECK(impl_->stats.sequence_create_count != std::numeric_limits<std::uint64_t>::max(),
+              ErrorCode::kResourceExhausted,
+              "PagedKvCache::create_sequence creation counter would overflow");
   const std::uint64_t sequence_id = impl_->next_sequence_id;
   try {
     const auto [iterator, inserted] = impl_->sequences.try_emplace(sequence_id);
@@ -477,6 +532,93 @@ PagedSequenceHandle PagedKvCache::create_sequence() {
   return PagedSequenceHandle(sequence_id, impl_->cache_id);
 }
 
+PagedSequenceHandle PagedKvCache::fork_sequence(const PagedSequenceHandle& source,
+                                                std::size_t prefix_tokens) {
+  constexpr std::string_view kOperation = "PagedKvCache::fork_sequence";
+  std::scoped_lock lock(impl_->mutex);
+  const SequenceState& source_state = impl_->require_sequence(source, kOperation);
+  HELIX_CHECK(prefix_tokens != 0, ErrorCode::kInvalidArgument,
+              "PagedKvCache::fork_sequence prefix must contain at least one token");
+  HELIX_CHECK(prefix_tokens <= source_state.length, ErrorCode::kOutOfRange,
+              "PagedKvCache::fork_sequence prefix exceeds the source sequence length");
+  HELIX_CHECK(prefix_tokens % impl_->config.block_tokens == 0, ErrorCode::kInvalidArgument,
+              "PagedKvCache::fork_sequence prefix must end on a KV block boundary");
+  HELIX_CHECK(impl_->next_sequence_id != std::numeric_limits<std::uint64_t>::max(),
+              ErrorCode::kResourceExhausted, "paged KV sequence id space exhausted");
+  HELIX_CHECK(impl_->stats.active_sequence_count != std::numeric_limits<std::size_t>::max(),
+              ErrorCode::kResourceExhausted,
+              "PagedKvCache::fork_sequence active sequence count would overflow");
+  HELIX_CHECK(impl_->stats.sequence_create_count != std::numeric_limits<std::uint64_t>::max(),
+              ErrorCode::kResourceExhausted,
+              "PagedKvCache::fork_sequence creation counter would overflow");
+  HELIX_CHECK(impl_->stats.sequence_fork_count != std::numeric_limits<std::uint64_t>::max(),
+              ErrorCode::kResourceExhausted,
+              "PagedKvCache::fork_sequence fork counter would overflow");
+  HELIX_CHECK(prefix_tokens <= std::numeric_limits<std::size_t>::max() - impl_->stats.active_tokens,
+              ErrorCode::kResourceExhausted,
+              "PagedKvCache::fork_sequence logical token count would overflow");
+
+  const std::size_t shared_block_count = prefix_tokens / impl_->config.block_tokens;
+  HELIX_ASSERT(shared_block_count <= source_state.blocks.size(),
+               "paged KV fork prefix exceeds the source block table");
+  HELIX_CHECK(shared_block_count <=
+                  std::numeric_limits<std::size_t>::max() - impl_->stats.block_reference_count,
+              ErrorCode::kResourceExhausted,
+              "PagedKvCache::fork_sequence block reference count would overflow");
+  std::size_t newly_shared_blocks = 0;
+  for (std::size_t index = 0; index < shared_block_count; ++index) {
+    const PhysicalBlockId block = source_state.blocks[index];
+    HELIX_ASSERT(impl_->block_token_counts[block.value()] == impl_->config.block_tokens,
+                 "paged KV fork encountered a partial physical block");
+    HELIX_CHECK(impl_->block_reference_counts[block.value()] !=
+                    std::numeric_limits<std::size_t>::max(),
+                ErrorCode::kResourceExhausted,
+                "PagedKvCache::fork_sequence physical block reference count would overflow");
+    newly_shared_blocks +=
+        static_cast<std::size_t>(impl_->block_reference_counts[block.value()] == 1);
+  }
+  HELIX_CHECK(newly_shared_blocks <=
+                  std::numeric_limits<std::size_t>::max() - impl_->stats.shared_blocks,
+              ErrorCode::kResourceExhausted,
+              "PagedKvCache::fork_sequence shared block count would overflow");
+
+  SequenceState forked_state;
+  forked_state.length = prefix_tokens;
+  try {
+    forked_state.blocks.reserve(shared_block_count);
+    for (std::size_t index = 0; index < shared_block_count; ++index) {
+      forked_state.blocks.push_back(source_state.blocks[index]);
+    }
+  } catch (const std::bad_alloc&) {
+    throw_error(ErrorCode::kResourceExhausted,
+                "PagedKvCache::fork_sequence could not allocate the forked block table");
+  }
+
+  const std::uint64_t sequence_id = impl_->next_sequence_id;
+  try {
+    const auto [iterator, inserted] =
+        impl_->sequences.try_emplace(sequence_id, std::move(forked_state));
+    static_cast<void>(iterator);
+    HELIX_ASSERT(inserted, "paged KV fork sequence id unexpectedly collided");
+  } catch (const std::bad_alloc&) {
+    throw_error(ErrorCode::kResourceExhausted,
+                "PagedKvCache::fork_sequence could not allocate sequence metadata");
+  }
+
+  for (std::size_t index = 0; index < shared_block_count; ++index) {
+    ++impl_->block_reference_counts[source_state.blocks[index].value()];
+  }
+  ++impl_->next_sequence_id;
+  ++impl_->stats.active_sequence_count;
+  impl_->stats.active_tokens += prefix_tokens;
+  impl_->stats.block_reference_count += shared_block_count;
+  impl_->stats.shared_blocks += newly_shared_blocks;
+  ++impl_->stats.sequence_create_count;
+  ++impl_->stats.sequence_fork_count;
+  impl_->validate_invariants();
+  return PagedSequenceHandle(sequence_id, impl_->cache_id);
+}
+
 void PagedKvCache::append(const PagedSequenceHandle& sequence, const Tensor& token_keys,
                           const Tensor& token_values) {
   constexpr std::string_view kOperation = "PagedKvCache::append";
@@ -489,6 +631,16 @@ void PagedKvCache::append(const PagedSequenceHandle& sequence, const Tensor& tok
                           checked_dimension(impl_->config.head_dimension, "KV head dimension")};
   require_shape(token_keys, token_shape, "token keys", kOperation);
   require_shape(token_values, token_shape, "token values", kOperation);
+  HELIX_CHECK(state.length != std::numeric_limits<std::size_t>::max(),
+              ErrorCode::kResourceExhausted, "PagedKvCache::append sequence length would overflow");
+  HELIX_CHECK(impl_->stats.active_tokens != std::numeric_limits<std::size_t>::max(),
+              ErrorCode::kResourceExhausted,
+              "PagedKvCache::append logical token count would overflow");
+  HELIX_CHECK(impl_->stats.resident_tokens != std::numeric_limits<std::size_t>::max(),
+              ErrorCode::kResourceExhausted,
+              "PagedKvCache::append resident token count would overflow");
+  HELIX_CHECK(impl_->stats.append_count != std::numeric_limits<std::uint64_t>::max(),
+              ErrorCode::kResourceExhausted, "PagedKvCache::append append counter would overflow");
 
   const bool needs_block = state.length % impl_->config.block_tokens == 0;
   PhysicalBlockId block;
@@ -496,6 +648,17 @@ void PagedKvCache::append(const PagedSequenceHandle& sequence, const Tensor& tok
     HELIX_CHECK(!impl_->free_blocks.empty(), ErrorCode::kResourceExhausted,
                 "PagedKvCache::append has no free physical KV block");
     block = impl_->free_blocks.front();
+    HELIX_CHECK(impl_->stats.block_reference_count != std::numeric_limits<std::size_t>::max(),
+                ErrorCode::kResourceExhausted,
+                "PagedKvCache::append block reference count would overflow");
+    HELIX_CHECK(impl_->stats.block_allocation_count != std::numeric_limits<std::uint64_t>::max(),
+                ErrorCode::kResourceExhausted,
+                "PagedKvCache::append allocation counter would overflow");
+    if (impl_->block_was_allocated[block.value()] != 0) {
+      HELIX_CHECK(impl_->stats.block_reuse_count != std::numeric_limits<std::uint64_t>::max(),
+                  ErrorCode::kResourceExhausted,
+                  "PagedKvCache::append reuse counter would overflow");
+    }
     try {
       state.blocks.push_back(block);
     } catch (const std::bad_alloc&) {
@@ -504,10 +667,11 @@ void PagedKvCache::append(const PagedSequenceHandle& sequence, const Tensor& tok
     }
     impl_->free_blocks.pop();
     HELIX_ASSERT(impl_->block_is_free[block.value()] != 0 &&
-                     impl_->block_owners[block.value()] == 0,
-                 "paged KV free block has conflicting ownership");
+                     impl_->block_reference_counts[block.value()] == 0 &&
+                     impl_->block_token_counts[block.value()] == 0,
+                 "paged KV free block has conflicting reference state");
     impl_->block_is_free[block.value()] = 0;
-    impl_->block_owners[block.value()] = sequence.id();
+    impl_->block_reference_counts[block.value()] = 1;
     if (impl_->block_was_allocated[block.value()] != 0) {
       ++impl_->stats.block_reuse_count;
     }
@@ -518,13 +682,18 @@ void PagedKvCache::append(const PagedSequenceHandle& sequence, const Tensor& tok
     impl_->stats.bytes_free -= impl_->per_block_bytes;
     impl_->stats.peak_bytes_used = std::max(impl_->stats.peak_bytes_used, impl_->stats.bytes_used);
     impl_->stats.allocated_token_slots += impl_->config.block_tokens;
+    ++impl_->stats.block_reference_count;
     ++impl_->stats.block_allocation_count;
   } else {
     HELIX_ASSERT(!state.blocks.empty(), "nonempty paged KV sequence has no physical block");
     block = state.blocks.back();
+    HELIX_ASSERT(impl_->block_reference_counts[block.value()] == 1,
+                 "paged KV append would mutate a shared partial block");
   }
 
   const std::size_t token_offset = state.length % impl_->config.block_tokens;
+  HELIX_ASSERT(impl_->block_token_counts[block.value()] == token_offset,
+               "paged KV append offset disagrees with physical block payload length");
   const auto* keys_source = token_keys.data_as<float>();
   const auto* values_source = token_values.data_as<float>();
   auto* keys_destination = impl_->keys.data_as<float>();
@@ -543,6 +712,8 @@ void PagedKvCache::append(const PagedSequenceHandle& sequence, const Tensor& tok
 
   ++state.length;
   ++impl_->stats.active_tokens;
+  ++impl_->stats.resident_tokens;
+  impl_->block_token_counts[block.value()] = token_offset + 1;
   ++impl_->stats.append_count;
   impl_->validate_invariants();
 }
@@ -577,6 +748,12 @@ void PagedKvCache::append_layer_major(const PagedSequenceHandle& sequence,
   HELIX_CHECK(token_count <= std::numeric_limits<std::size_t>::max() - state.length,
               ErrorCode::kResourceExhausted,
               "PagedKvCache::append_layer_major sequence length would overflow");
+  HELIX_CHECK(token_count <= std::numeric_limits<std::size_t>::max() - impl_->stats.active_tokens,
+              ErrorCode::kResourceExhausted,
+              "PagedKvCache::append_layer_major logical token count would overflow");
+  HELIX_CHECK(token_count <= std::numeric_limits<std::size_t>::max() - impl_->stats.resident_tokens,
+              ErrorCode::kResourceExhausted,
+              "PagedKvCache::append_layer_major resident token count would overflow");
   const std::size_t resulting_length = state.length + token_count;
   const std::size_t resulting_blocks =
       blocks_for_tokens(resulting_length, impl_->config.block_tokens);
@@ -592,6 +769,19 @@ void PagedKvCache::append_layer_major(const PagedSequenceHandle& sequence,
                   std::numeric_limits<std::uint64_t>::max() - impl_->stats.block_allocation_count,
               ErrorCode::kResourceExhausted,
               "PagedKvCache::append_layer_major allocation counter would overflow");
+  HELIX_CHECK(additional_blocks <=
+                  std::numeric_limits<std::size_t>::max() - impl_->stats.block_reference_count,
+              ErrorCode::kResourceExhausted,
+              "PagedKvCache::append_layer_major block reference count would overflow");
+  if (state.length % impl_->config.block_tokens != 0) {
+    HELIX_ASSERT(!state.blocks.empty(), "partial paged KV sequence has no physical block");
+    const PhysicalBlockId tail = state.blocks.back();
+    HELIX_ASSERT(impl_->block_reference_counts[tail.value()] == 1,
+                 "paged KV bulk append would mutate a shared partial block");
+    HELIX_ASSERT(impl_->block_token_counts[tail.value()] ==
+                     state.length % impl_->config.block_tokens,
+                 "paged KV bulk append offset disagrees with physical block payload length");
+  }
 
   std::uint64_t reused_blocks = 0;
   for (std::size_t index = 0; index < additional_blocks; ++index) {
@@ -613,11 +803,12 @@ void PagedKvCache::append_layer_major(const PagedSequenceHandle& sequence,
     const PhysicalBlockId block = impl_->free_blocks.front();
     impl_->free_blocks.pop();
     HELIX_ASSERT(impl_->block_is_free[block.value()] != 0 &&
-                     impl_->block_owners[block.value()] == 0,
-                 "paged KV free block has conflicting ownership");
+                     impl_->block_reference_counts[block.value()] == 0 &&
+                     impl_->block_token_counts[block.value()] == 0,
+                 "paged KV free block has conflicting reference state");
     state.blocks.push_back(block);
     impl_->block_is_free[block.value()] = 0;
-    impl_->block_owners[block.value()] = sequence.id();
+    impl_->block_reference_counts[block.value()] = 1;
     impl_->block_was_allocated[block.value()] = 1;
   }
 
@@ -652,6 +843,17 @@ void PagedKvCache::append_layer_major(const PagedSequenceHandle& sequence,
   }
 
   state.length = resulting_length;
+  const std::size_t first_changed_block = old_length / impl_->config.block_tokens;
+  for (std::size_t logical_block = first_changed_block; logical_block < state.blocks.size();
+       ++logical_block) {
+    const std::size_t logical_start = logical_block * impl_->config.block_tokens;
+    const std::size_t visible_tokens =
+        std::min(impl_->config.block_tokens, resulting_length - logical_start);
+    const PhysicalBlockId block = state.blocks[logical_block];
+    HELIX_ASSERT(impl_->block_reference_counts[block.value()] == 1,
+                 "paged KV bulk append changed a shared physical block");
+    impl_->block_token_counts[block.value()] = visible_tokens;
+  }
   impl_->stats.used_blocks += additional_blocks;
   impl_->stats.free_blocks -= additional_blocks;
   const std::size_t allocated_bytes = additional_blocks * impl_->per_block_bytes;
@@ -660,6 +862,8 @@ void PagedKvCache::append_layer_major(const PagedSequenceHandle& sequence,
   impl_->stats.peak_bytes_used = std::max(impl_->stats.peak_bytes_used, impl_->stats.bytes_used);
   impl_->stats.allocated_token_slots += additional_blocks * impl_->config.block_tokens;
   impl_->stats.active_tokens += token_count;
+  impl_->stats.resident_tokens += token_count;
+  impl_->stats.block_reference_count += additional_blocks;
   impl_->stats.append_count += static_cast<std::uint64_t>(token_count);
   impl_->stats.block_allocation_count += static_cast<std::uint64_t>(additional_blocks);
   impl_->stats.block_reuse_count += reused_blocks;
@@ -749,20 +953,36 @@ void PagedKvCache::release_sequence(const PagedSequenceHandle& sequence) {
   constexpr std::string_view kOperation = "PagedKvCache::release_sequence";
   std::scoped_lock lock(impl_->mutex);
   const SequenceState& state = impl_->require_sequence(sequence, kOperation);
-  HELIX_ASSERT(state.blocks.size() <= impl_->config.physical_blocks - impl_->free_blocks.size(),
-               "paged KV release would overflow the free-block queue");
+  HELIX_CHECK(impl_->stats.release_count != std::numeric_limits<std::uint64_t>::max(),
+              ErrorCode::kResourceExhausted,
+              "PagedKvCache::release_sequence release counter would overflow");
+  std::size_t released_blocks = 0;
+  std::size_t released_resident_tokens = 0;
+  std::size_t no_longer_shared_blocks = 0;
   for (const PhysicalBlockId block : state.blocks) {
-    HELIX_ASSERT(impl_->block_owners[block.value()] == sequence.id() &&
-                     impl_->block_is_free[block.value()] == 0,
-                 "paged KV release found inconsistent block ownership");
+    const std::size_t references = impl_->block_reference_counts[block.value()];
+    HELIX_ASSERT(references != 0 && impl_->block_is_free[block.value()] == 0,
+                 "paged KV release found inconsistent block references");
+    if (references == 1) {
+      ++released_blocks;
+      released_resident_tokens += impl_->block_token_counts[block.value()];
+    } else if (references == 2) {
+      ++no_longer_shared_blocks;
+    }
   }
+  HELIX_ASSERT(released_blocks <= impl_->config.physical_blocks - impl_->free_blocks.size(),
+               "paged KV release would overflow the free-block queue");
 
-  const std::size_t released_blocks = state.blocks.size();
   const std::size_t released_tokens = state.length;
+  const std::size_t released_references = state.blocks.size();
   for (const PhysicalBlockId block : state.blocks) {
-    impl_->block_owners[block.value()] = 0;
-    impl_->block_is_free[block.value()] = 1;
-    impl_->free_blocks.push(block);
+    std::size_t& references = impl_->block_reference_counts[block.value()];
+    --references;
+    if (references == 0) {
+      impl_->block_token_counts[block.value()] = 0;
+      impl_->block_is_free[block.value()] = 1;
+      impl_->free_blocks.push(block);
+    }
   }
   impl_->sequences.erase(sequence.id());
   impl_->stats.used_blocks -= released_blocks;
@@ -772,7 +992,10 @@ void PagedKvCache::release_sequence(const PagedSequenceHandle& sequence) {
   impl_->stats.bytes_free += released_bytes;
   --impl_->stats.active_sequence_count;
   impl_->stats.active_tokens -= released_tokens;
+  impl_->stats.resident_tokens -= released_resident_tokens;
   impl_->stats.allocated_token_slots -= released_blocks * impl_->config.block_tokens;
+  impl_->stats.block_reference_count -= released_references;
+  impl_->stats.shared_blocks -= no_longer_shared_blocks;
   ++impl_->stats.release_count;
   impl_->validate_invariants();
 }

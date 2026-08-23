@@ -5,6 +5,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <exception>
 #include <gtest/gtest.h>
 #include <limits>
 #include <memory>
@@ -359,6 +360,245 @@ TEST(PagedKvCacheTest, SerializesConcurrentAppendsAndReclaimsAllTables) {
   EXPECT_EQ(cache.stats().free_blocks, 16U);
   EXPECT_EQ(cache.stats().active_sequence_count, 0U);
   EXPECT_EQ(cache.stats().active_tokens, 0U);
+}
+
+TEST(PagedKvCacheTest, BlockAlignedForkSharesImmutablePrefixAndBranchesDiverge) {
+  PagedKvCache cache(PagedKvCacheConfig{2, 2, 2, 2, 6});
+  const PagedSequenceHandle source = cache.create_sequence();
+  for (std::size_t token = 0; token < 5; ++token) {
+    cache.append(source, make_token(2, 2, 2, static_cast<float>(token * 100)),
+                 make_token(2, 2, 2, static_cast<float>(1'000 + token * 100)));
+  }
+
+  const PagedSequenceHandle fork = cache.fork_sequence(source, 4);
+  const std::vector<PhysicalBlockId> source_table = cache.block_table(source);
+  const std::vector<PhysicalBlockId> fork_table = cache.block_table(fork);
+  ASSERT_EQ(source_table.size(), 3U);
+  ASSERT_EQ(fork_table.size(), 2U);
+  EXPECT_EQ(fork_table[0], source_table[0]);
+  EXPECT_EQ(fork_table[1], source_table[1]);
+
+  const KvLayer source_layer = cache.retrieve_layer(source, 1);
+  const KvLayer fork_layer = cache.retrieve_layer(fork, 1);
+  for (std::size_t head = 0; head < 2; ++head) {
+    for (std::size_t token = 0; token < 4; ++token) {
+      for (std::size_t coordinate = 0; coordinate < 2; ++coordinate) {
+        const std::size_t source_offset = (head * 5 + token) * 2 + coordinate;
+        const std::size_t fork_offset = (head * 4 + token) * 2 + coordinate;
+        EXPECT_FLOAT_EQ(source_layer.keys.data_as<float>()[source_offset],
+                        fork_layer.keys.data_as<float>()[fork_offset]);
+        EXPECT_FLOAT_EQ(source_layer.values.data_as<float>()[source_offset],
+                        fork_layer.values.data_as<float>()[fork_offset]);
+      }
+    }
+  }
+
+  PagedKvCacheStats stats = cache.stats();
+  EXPECT_EQ(stats.active_sequence_count, 2U);
+  EXPECT_EQ(stats.active_tokens, 9U);
+  EXPECT_EQ(stats.resident_tokens, 5U);
+  EXPECT_EQ(stats.shared_token_references(), 4U);
+  EXPECT_EQ(stats.used_blocks, 3U);
+  EXPECT_EQ(stats.block_reference_count, 5U);
+  EXPECT_EQ(stats.shared_blocks, 2U);
+  EXPECT_EQ(stats.sequence_create_count, 2U);
+  EXPECT_EQ(stats.sequence_fork_count, 1U);
+  EXPECT_EQ(stats.block_allocation_count, 3U);
+  EXPECT_EQ(stats.unused_token_slots(), 1U);
+  EXPECT_DOUBLE_EQ(stats.token_slot_utilization(), 5.0 / 6.0);
+
+  const std::vector<Tensor> fork_tail_keys = make_layer_major(2, 2, 4, 1, 2, 9'000.0F);
+  const std::vector<Tensor> fork_tail_values = make_layer_major(2, 2, 4, 1, 2, 19'000.0F);
+  cache.append_layer_major(fork, fork_tail_keys, fork_tail_values);
+  cache.append(source, make_token(2, 2, 2, 8'000.0F), make_token(2, 2, 2, 18'000.0F));
+  const std::vector<PhysicalBlockId> diverged_source_table = cache.block_table(source);
+  const std::vector<PhysicalBlockId> diverged_fork_table = cache.block_table(fork);
+  EXPECT_EQ(diverged_source_table[0], diverged_fork_table[0]);
+  EXPECT_EQ(diverged_source_table[1], diverged_fork_table[1]);
+  EXPECT_NE(diverged_source_table[2], diverged_fork_table[2]);
+  const KvLayer diverged_source = cache.retrieve_layer(source, 1);
+  const KvLayer diverged_fork = cache.retrieve_layer(fork, 1);
+  EXPECT_FLOAT_EQ(diverged_source.keys.data_as<float>()[10], 8'004.0F);
+  EXPECT_FLOAT_EQ(diverged_source.values.data_as<float>()[10], 18'004.0F);
+  EXPECT_FLOAT_EQ(diverged_fork.keys.data_as<float>()[8], 9'404.0F);
+  EXPECT_FLOAT_EQ(diverged_fork.values.data_as<float>()[8], 19'404.0F);
+
+  stats = cache.stats();
+  EXPECT_EQ(stats.active_tokens, 11U);
+  EXPECT_EQ(stats.resident_tokens, 7U);
+  EXPECT_EQ(stats.used_blocks, 4U);
+  EXPECT_EQ(stats.block_reference_count, 6U);
+  EXPECT_EQ(stats.shared_blocks, 2U);
+
+  cache.release_sequence(source);
+  EXPECT_FALSE(cache.contains(source));
+  EXPECT_EQ(cache.length(fork), 5U);
+  const KvLayer surviving_fork = cache.retrieve_layer(fork, 1);
+  for (std::size_t head = 0; head < 2; ++head) {
+    for (std::size_t token = 0; token < 4; ++token) {
+      for (std::size_t coordinate = 0; coordinate < 2; ++coordinate) {
+        const std::size_t expected_offset = (head * 4 + token) * 2 + coordinate;
+        const std::size_t actual_offset = (head * 5 + token) * 2 + coordinate;
+        EXPECT_FLOAT_EQ(surviving_fork.keys.data_as<float>()[actual_offset],
+                        fork_layer.keys.data_as<float>()[expected_offset]);
+      }
+    }
+  }
+  stats = cache.stats();
+  EXPECT_EQ(stats.active_tokens, 5U);
+  EXPECT_EQ(stats.resident_tokens, 5U);
+  EXPECT_EQ(stats.used_blocks, 3U);
+  EXPECT_EQ(stats.block_reference_count, 3U);
+  EXPECT_EQ(stats.shared_blocks, 0U);
+
+  cache.release_sequence(fork);
+  stats = cache.stats();
+  EXPECT_EQ(stats.active_sequence_count, 0U);
+  EXPECT_EQ(stats.active_tokens, 0U);
+  EXPECT_EQ(stats.resident_tokens, 0U);
+  EXPECT_EQ(stats.used_blocks, 0U);
+  EXPECT_EQ(stats.free_blocks, 6U);
+  EXPECT_EQ(stats.block_reference_count, 0U);
+}
+
+TEST(PagedKvCacheTest, ForkValidationAndExhaustionAreTransactional) {
+  PagedKvCache cache(PagedKvCacheConfig{1, 1, 2, 2, 3});
+  PagedKvCache foreign(PagedKvCacheConfig{1, 1, 2, 2, 3});
+  const PagedSequenceHandle source = cache.create_sequence();
+  const PagedSequenceHandle foreign_source = foreign.create_sequence();
+  const Tensor token = Tensor::from_values({1, 1, 2}, std::array{1.0F, 2.0F});
+  for (std::size_t index = 0; index < 5; ++index) {
+    cache.append(source, token, token);
+  }
+  const PagedKvCacheStats before_invalid = cache.stats();
+
+  EXPECT_THROW(static_cast<void>(cache.fork_sequence(source, 0)), Error);
+  EXPECT_THROW(static_cast<void>(cache.fork_sequence(source, 3)), Error);
+  EXPECT_THROW(static_cast<void>(cache.fork_sequence(source, 6)), Error);
+  EXPECT_THROW(static_cast<void>(cache.fork_sequence(foreign_source, 2)), Error);
+  PagedKvCacheStats stats = cache.stats();
+  EXPECT_EQ(stats.active_sequence_count, before_invalid.active_sequence_count);
+  EXPECT_EQ(stats.active_tokens, before_invalid.active_tokens);
+  EXPECT_EQ(stats.resident_tokens, before_invalid.resident_tokens);
+  EXPECT_EQ(stats.used_blocks, before_invalid.used_blocks);
+  EXPECT_EQ(stats.block_reference_count, before_invalid.block_reference_count);
+  EXPECT_EQ(stats.sequence_create_count, before_invalid.sequence_create_count);
+  EXPECT_EQ(stats.sequence_fork_count, 0U);
+
+  const PagedSequenceHandle fork = cache.fork_sequence(source, 4);
+  EXPECT_EQ(cache.stats().free_blocks, 0U);
+  EXPECT_THROW(cache.append(fork, token, token), Error);
+  EXPECT_EQ(cache.length(fork), 4U);
+  EXPECT_EQ(cache.block_table(fork).size(), 2U);
+  EXPECT_EQ(cache.stats().append_count, 5U);
+
+  cache.release_sequence(source);
+  stats = cache.stats();
+  EXPECT_EQ(stats.free_blocks, 1U);
+  EXPECT_EQ(stats.used_blocks, 2U);
+  EXPECT_EQ(stats.active_tokens, 4U);
+  EXPECT_EQ(stats.resident_tokens, 4U);
+  cache.append(fork, Tensor::from_values({1, 1, 2}, std::array{9.0F, 8.0F}),
+               Tensor::from_values({1, 1, 2}, std::array{7.0F, 6.0F}));
+  EXPECT_EQ(cache.block_table(fork).back().value(), 2U);
+  EXPECT_EQ(cache.stats().block_reuse_count, 1U);
+  EXPECT_THROW(static_cast<void>(cache.fork_sequence(source, 2)), Error);
+
+  cache.release_sequence(fork);
+  stats = cache.stats();
+  EXPECT_EQ(stats.used_blocks, 0U);
+  EXPECT_EQ(stats.free_blocks, 3U);
+  EXPECT_EQ(stats.active_tokens, 0U);
+  EXPECT_EQ(stats.resident_tokens, 0U);
+}
+
+TEST(PagedKvCacheTest, SerializesConcurrentPrefixForksAppendsAndReleases) {
+  constexpr std::size_t kThreads = 4;
+  PagedKvCache cache(PagedKvCacheConfig{1, 1, 2, 4, 6});
+  const PagedSequenceHandle source = cache.create_sequence();
+  const std::vector<Tensor> source_keys = make_layer_major(1, 1, 0, 8, 2, 10.0F);
+  const std::vector<Tensor> source_values = make_layer_major(1, 1, 0, 8, 2, 1'000.0F);
+  cache.append_layer_major(source, source_keys, source_values);
+
+  std::array<PagedSequenceHandle, kThreads> forks{};
+  std::array<std::exception_ptr, kThreads> failures{};
+  std::vector<std::thread> threads;
+  for (std::size_t thread = 0; thread < kThreads; ++thread) {
+    threads.emplace_back([&cache, &forks, &failures, source, thread] {
+      try {
+        forks[thread] = cache.fork_sequence(source, 8);
+        const Tensor tail = make_token(1, 1, 2, static_cast<float>(10'000 + thread * 100));
+        cache.append(forks[thread], tail, tail);
+      } catch (...) {
+        failures[thread] = std::current_exception();
+      }
+    });
+  }
+  for (std::thread& thread : threads) {
+    thread.join();
+  }
+  for (const std::exception_ptr& failure : failures) {
+    ASSERT_EQ(failure, nullptr);
+  }
+
+  const KvLayer source_layer = cache.retrieve_layer(source, 0);
+  for (std::size_t thread = 0; thread < kThreads; ++thread) {
+    ASSERT_TRUE(forks[thread]);
+    const KvLayer fork_layer = cache.retrieve_layer(forks[thread], 0);
+    ASSERT_EQ(fork_layer.keys.shape(), (Shape{1, 9, 2}));
+    for (std::size_t index = 0; index < source_layer.keys.numel(); ++index) {
+      EXPECT_FLOAT_EQ(fork_layer.keys.data_as<float>()[index],
+                      source_layer.keys.data_as<float>()[index]);
+    }
+    EXPECT_FLOAT_EQ(fork_layer.keys.data_as<float>()[16],
+                    static_cast<float>(10'000 + thread * 100));
+    EXPECT_FLOAT_EQ(fork_layer.keys.data_as<float>()[17],
+                    static_cast<float>(10'001 + thread * 100));
+  }
+
+  PagedKvCacheStats stats = cache.stats();
+  EXPECT_EQ(stats.active_sequence_count, 5U);
+  EXPECT_EQ(stats.active_tokens, 44U);
+  EXPECT_EQ(stats.resident_tokens, 12U);
+  EXPECT_EQ(stats.shared_token_references(), 32U);
+  EXPECT_EQ(stats.used_blocks, 6U);
+  EXPECT_EQ(stats.free_blocks, 0U);
+  EXPECT_EQ(stats.block_reference_count, 14U);
+  EXPECT_EQ(stats.shared_blocks, 2U);
+  EXPECT_EQ(stats.sequence_fork_count, 4U);
+
+  threads.clear();
+  failures.fill(nullptr);
+  for (std::size_t thread = 0; thread < kThreads; ++thread) {
+    threads.emplace_back([&cache, &forks, &failures, thread] {
+      try {
+        cache.release_sequence(forks[thread]);
+      } catch (...) {
+        failures[thread] = std::current_exception();
+      }
+    });
+  }
+  for (std::thread& thread : threads) {
+    thread.join();
+  }
+  for (const std::exception_ptr& failure : failures) {
+    ASSERT_EQ(failure, nullptr);
+  }
+  stats = cache.stats();
+  EXPECT_EQ(stats.active_sequence_count, 1U);
+  EXPECT_EQ(stats.active_tokens, 8U);
+  EXPECT_EQ(stats.resident_tokens, 8U);
+  EXPECT_EQ(stats.used_blocks, 2U);
+  EXPECT_EQ(stats.free_blocks, 4U);
+  EXPECT_EQ(stats.block_reference_count, 2U);
+  EXPECT_EQ(stats.shared_blocks, 0U);
+
+  cache.release_sequence(source);
+  stats = cache.stats();
+  EXPECT_EQ(stats.active_sequence_count, 0U);
+  EXPECT_EQ(stats.used_blocks, 0U);
+  EXPECT_EQ(stats.free_blocks, 6U);
+  EXPECT_EQ(stats.block_reference_count, 0U);
 }
 
 TEST(PagedKvCacheTest, LayerReadViewPinsStorageAndExposesOnlyWrittenPrefixes) {

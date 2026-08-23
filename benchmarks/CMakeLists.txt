@@ -81,3 +81,13 @@ add_test(
 set_tests_properties(
   benchmark.runtime_paged_decode_smoke
   PROPERTIES LABELS "benchmark;runtime;smoke" TIMEOUT 30)
+
+add_test(
+  NAME benchmark.kv_prefix_smoke
+  COMMAND helix_benchmarks
+          "--benchmark_filter=BM_PagedKvPrefixForkLifecycle/SharedBlocks/layers:2/heads:2/head_dimension:32/block_tokens:8/prefix_tokens:32$"
+          --benchmark_min_time=0.001s
+          --benchmark_repetitions=1)
+set_tests_properties(
+  benchmark.kv_prefix_smoke
+  PROPERTIES LABELS "benchmark;kv_cache;smoke" TIMEOUT 30)
