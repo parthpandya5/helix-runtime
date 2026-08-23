@@ -113,6 +113,7 @@ struct SchedulerStats {
   std::uint64_t completed_iteration_count = 0;
   std::uint64_t scheduled_prefill_tokens = 0;
   std::uint64_t scheduled_decode_tokens = 0;
+  std::uint64_t reused_prefill_tokens = 0;
 };
 
 // FifoScheduler is single-thread owned. It owns every Request and never owns KV
@@ -128,6 +129,11 @@ public:
   FifoScheduler& operator=(FifoScheduler&&) = delete;
 
   void submit(Request request);
+  // Submits a waiting request whose leading block-aligned prompt tokens already
+  // have valid K/V storage owned by the runtime. Reused tokens become logical
+  // prefill progress only when FIFO admission occurs and are never scheduled as
+  // model work.
+  void submit_prefilled(Request request, std::size_t reused_prompt_tokens);
   [[nodiscard]] ScheduleResult schedule_iteration(std::size_t available_kv_blocks,
                                                   RequestTimePoint now);
   [[nodiscard]] CompletionReport complete_iteration(IterationId iteration_id,

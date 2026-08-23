@@ -99,6 +99,7 @@ public:
   [[nodiscard]] std::span<const TokenId> prompt_tokens() const noexcept;
   [[nodiscard]] std::span<const GeneratedToken> generated_tokens() const noexcept;
   [[nodiscard]] std::size_t max_new_tokens() const noexcept;
+  [[nodiscard]] std::size_t reused_prompt_tokens() const noexcept;
   [[nodiscard]] std::size_t prompt_tokens_processed() const noexcept;
   [[nodiscard]] std::size_t remaining_prompt_tokens() const noexcept;
   [[nodiscard]] std::size_t remaining_generation_tokens() const noexcept;
@@ -125,6 +126,7 @@ private:
   friend class FifoScheduler;
 
   void reserve_generated_capacity(std::size_t capacity);
+  void seed_reused_prompt_tokens(std::size_t token_count) noexcept;
   void require_time_not_before_latest(RequestTimePoint now, std::string_view operation) const;
   void transition_to(RequestState next, RequestTimePoint now, std::string_view operation);
   void terminate(RequestState terminal_state, FinishReason reason, RequestTimePoint now,
@@ -134,6 +136,7 @@ private:
   std::vector<TokenId> prompt_tokens_;
   std::vector<GeneratedToken> generated_tokens_;
   std::size_t max_new_tokens_ = 0;
+  std::size_t reused_prompt_tokens_ = 0;
   std::size_t prompt_tokens_processed_ = 0;
   RequestState state_ = RequestState::kWaiting;
   FinishReason finish_reason_ = FinishReason::kNone;

@@ -93,6 +93,7 @@ Request::Request(RequestId id, std::vector<TokenId> prompt_tokens, std::size_t m
 Request::Request(Request&& other) noexcept
     : id_(other.id_), prompt_tokens_(std::move(other.prompt_tokens_)),
       generated_tokens_(std::move(other.generated_tokens_)), max_new_tokens_(other.max_new_tokens_),
+      reused_prompt_tokens_(other.reused_prompt_tokens_),
       prompt_tokens_processed_(other.prompt_tokens_processed_), state_(other.state_),
       finish_reason_(other.finish_reason_), terminal_context_(std::move(other.terminal_context_)),
       created_at_(other.created_at_), latest_event_at_(other.latest_event_at_),
@@ -101,6 +102,7 @@ Request::Request(Request&& other) noexcept
       last_token_at_(other.last_token_at_), completed_at_(other.completed_at_) {
   other.id_ = RequestId{};
   other.max_new_tokens_ = 0;
+  other.reused_prompt_tokens_ = 0;
   other.prompt_tokens_processed_ = 0;
   other.state_ = RequestState::kFailed;
   other.finish_reason_ = FinishReason::kFailed;
@@ -137,6 +139,10 @@ std::span<const GeneratedToken> Request::generated_tokens() const noexcept {
 
 std::size_t Request::max_new_tokens() const noexcept {
   return max_new_tokens_;
+}
+
+std::size_t Request::reused_prompt_tokens() const noexcept {
+  return reused_prompt_tokens_;
 }
 
 std::size_t Request::prompt_tokens_processed() const noexcept {
@@ -201,6 +207,13 @@ void Request::reserve_generated_capacity(std::size_t capacity) {
   HELIX_ASSERT(capacity <= max_new_tokens_,
                "scheduler requested generated-token capacity beyond the request limit");
   generated_tokens_.reserve(capacity);
+}
+
+void Request::seed_reused_prompt_tokens(std::size_t token_count) noexcept {
+  HELIX_ASSERT(state_ == RequestState::kWaiting && prompt_tokens_processed_ == 0 &&
+                   reused_prompt_tokens_ == 0 && token_count < prompt_tokens_.size(),
+               "scheduler attempted to seed an invalid cached prompt prefix");
+  reused_prompt_tokens_ = token_count;
 }
 
 void Request::require_time_not_before_latest(RequestTimePoint now,

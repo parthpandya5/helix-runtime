@@ -52,6 +52,10 @@ FifoScheduler::FifoScheduler(SchedulerConfig config) : config_(config) {
 }
 
 void FifoScheduler::submit(Request request) {
+  submit_prefilled(std::move(request), 0);
+}
+
+void FifoScheduler::submit_prefilled(Request request, std::size_t reused_prompt_tokens) {
   const RequestId id = request.id();
   HELIX_CHECK(id.valid(), ErrorCode::kInvalidArgument,
               "scheduler::FifoScheduler::submit: request has an invalid ID");
@@ -59,10 +63,23 @@ void FifoScheduler::submit(Request request) {
               scheduler_context("submit") + ": request must be waiting");
   HELIX_CHECK(!contains(id), ErrorCode::kInvalidArgument,
               scheduler_context("submit") + ": duplicate " + request_error(id, "ID"));
+  HELIX_CHECK(reused_prompt_tokens < request.prompt_tokens().size(), ErrorCode::kInvalidArgument,
+              scheduler_context("submit_prefilled") +
+                  ": reused prefix must leave at least one prompt token to execute");
+  HELIX_CHECK(reused_prompt_tokens % config_.kv_block_tokens == 0, ErrorCode::kInvalidArgument,
+              scheduler_context("submit_prefilled") +
+                  ": reused prefix must end on a KV block boundary");
   HELIX_CHECK(cumulative_stats_.submitted_count != std::numeric_limits<std::uint64_t>::max(),
               ErrorCode::kResourceExhausted,
               scheduler_context("submit") + ": submitted counter exhausted");
+  HELIX_CHECK(reused_prompt_tokens <= std::numeric_limits<std::uint64_t>::max() -
+                                          cumulative_stats_.reused_prefill_tokens,
+              ErrorCode::kResourceExhausted,
+              scheduler_context("submit_prefilled") + ": reused-prefill counter exhausted");
 
+  if (reused_prompt_tokens != 0) {
+    request.seed_reused_prompt_tokens(reused_prompt_tokens);
+  }
   auto owned_request = std::make_unique<Request>(std::move(request));
   const auto [position, inserted] = requests_.emplace(id, std::move(owned_request));
   HELIX_ASSERT(inserted, "duplicate request passed prevalidated scheduler insertion");
@@ -73,12 +90,19 @@ void FifoScheduler::submit(Request request) {
     throw;
   }
   ++cumulative_stats_.submitted_count;
+  cumulative_stats_.reused_prefill_tokens += static_cast<std::uint64_t>(reused_prompt_tokens);
   verify_invariants();
 }
 
 std::size_t FifoScheduler::current_kv_tokens(const Request& request) const {
-  return checked_add(request.prompt_tokens_processed(), request.generated_tokens().size(),
-                     scheduler_context("current_kv_tokens"));
+  std::size_t tokens =
+      checked_add(request.prompt_tokens_processed(), request.generated_tokens().size(),
+                  scheduler_context("current_kv_tokens"));
+  if (request.state() == RequestState::kWaiting) {
+    tokens =
+        checked_add(tokens, request.reused_prompt_tokens(), scheduler_context("current_kv_tokens"));
+  }
+  return tokens;
 }
 
 std::size_t FifoScheduler::kv_block_count(std::size_t tokens) const noexcept {
@@ -147,8 +171,12 @@ ScheduleResult FifoScheduler::schedule_iteration(std::size_t available_kv_blocks
                 scheduler_context(kOperation) + ": schedule time precedes " +
                     request_error(request.id(), "creation"));
 
+    const std::size_t waiting_reuse =
+        waiting_request ? request.reused_prompt_tokens() : std::size_t{0};
+    HELIX_ASSERT(waiting_reuse <= request.remaining_prompt_tokens(),
+                 "scheduler waiting prefix exceeds remaining prompt work");
     const std::size_t desired_tokens =
-        state == RequestState::kPrefill ? request.remaining_prompt_tokens() : 1;
+        state == RequestState::kPrefill ? request.remaining_prompt_tokens() - waiting_reuse : 1;
     HELIX_ASSERT(desired_tokens != 0, "scheduler selected zero work for an active request");
     const std::size_t budgeted_tokens = std::min(desired_tokens, remaining_tokens);
     const std::size_t current_tokens = current_kv_tokens(request);
@@ -174,7 +202,8 @@ ScheduleResult FifoScheduler::schedule_iteration(std::size_t available_kv_blocks
         final_length_decode ? 0 : additional_kv_blocks(current_tokens, scheduled_tokens);
     planned.work.push_back(ScheduledWork{
         request.id(), state == RequestState::kPrefill ? WorkKind::kPrefill : WorkKind::kDecode,
-        state == RequestState::kPrefill ? request.prompt_tokens_processed() : current_tokens,
+        state == RequestState::kPrefill ? request.prompt_tokens_processed() + waiting_reuse
+                                        : current_tokens,
         scheduled_tokens, blocks_before, new_blocks});
     planned.scheduled_tokens += scheduled_tokens;
     planned.new_kv_blocks += new_blocks;
@@ -250,7 +279,11 @@ ScheduleResult FifoScheduler::schedule_iteration(std::size_t available_kv_blocks
   for (const RequestId id : admissions) {
     HELIX_ASSERT(!waiting_.empty() && waiting_.front() == id,
                  "scheduler admission plan diverged from the FIFO queue");
-    mutable_request(id).begin_prefill(now);
+    Request& admitted = mutable_request(id);
+    admitted.begin_prefill(now);
+    if (admitted.reused_prompt_tokens() != 0) {
+      admitted.record_prefill_progress(admitted.reused_prompt_tokens(), now);
+    }
     waiting_.pop_front();
     running_.push_back(id);
   }
@@ -543,11 +576,17 @@ void FifoScheduler::verify_invariants() const {
     case RequestState::kWaiting:
       HELIX_ASSERT(waiting_occurrences == 1 && running_occurrences == 0,
                    "waiting request membership is inconsistent");
+      HELIX_ASSERT(owned->prompt_tokens_processed() == 0 &&
+                       owned->reused_prompt_tokens() < owned->prompt_tokens().size() &&
+                       owned->reused_prompt_tokens() % config_.kv_block_tokens == 0,
+                   "waiting request has inconsistent reused-prefix progress");
       break;
     case RequestState::kPrefill:
     case RequestState::kDecoding:
       HELIX_ASSERT(waiting_occurrences == 0 && running_occurrences == 1,
                    "running request membership is inconsistent");
+      HELIX_ASSERT(owned->prompt_tokens_processed() >= owned->reused_prompt_tokens(),
+                   "running request lost reused-prefix progress");
       break;
     case RequestState::kFinished:
     case RequestState::kCancelled:

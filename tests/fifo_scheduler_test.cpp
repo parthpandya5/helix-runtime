@@ -164,6 +164,61 @@ TEST(FifoSchedulerTest, FinalDecodeNeedsNoNewBlockAtAnExactBoundary) {
   EXPECT_EQ(scheduler.request(RequestId{11}).finish_reason(), FinishReason::kLength);
 }
 
+TEST(FifoSchedulerTest, ReusedPrefixSeedsAdmissionAndSchedulesOnlyPromptSuffix) {
+  FifoScheduler scheduler(SchedulerConfig{8, 1, 2});
+  scheduler.submit_prefilled(make_request(12, 6, 1), 4);
+  const Request& waiting = scheduler.request(RequestId{12});
+  EXPECT_EQ(waiting.state(), RequestState::kWaiting);
+  EXPECT_EQ(waiting.reused_prompt_tokens(), 4U);
+  EXPECT_EQ(waiting.prompt_tokens_processed(), 0U);
+
+  const ScheduleResult blocked = scheduler.schedule_iteration(0, kStart);
+  EXPECT_FALSE(blocked.batch.has_value());
+  EXPECT_TRUE(blocked.kv_capacity_limited);
+
+  const ScheduleResult suffix = scheduler.schedule_iteration(1, kStart + 1ms);
+  ASSERT_TRUE(suffix.batch.has_value());
+  ASSERT_EQ(suffix.batch->work.size(), 1U);
+  EXPECT_EQ(suffix.batch->work[0].kind, WorkKind::kPrefill);
+  EXPECT_EQ(suffix.batch->work[0].token_offset, 4U);
+  EXPECT_EQ(suffix.batch->work[0].token_count, 2U);
+  EXPECT_EQ(suffix.batch->work[0].kv_blocks_before, 2U);
+  EXPECT_EQ(suffix.batch->work[0].new_kv_blocks, 1U);
+  EXPECT_EQ(scheduler.request(RequestId{12}).prompt_tokens_processed(), 4U);
+  static_cast<void>(scheduler.complete_iteration(
+      suffix.batch->id, std::vector{prefill_success(RequestId{12})}, kStart + 2ms));
+  EXPECT_EQ(scheduler.request(RequestId{12}).state(), RequestState::kDecoding);
+  EXPECT_EQ(scheduler.request(RequestId{12}).prompt_tokens_processed(), 6U);
+
+  const ScheduleResult decode = scheduler.schedule_iteration(0, kStart + 3ms);
+  ASSERT_TRUE(decode.batch.has_value());
+  EXPECT_EQ(decode.batch->work[0].new_kv_blocks, 0U);
+  const CompletionReport completion = scheduler.complete_iteration(
+      decode.batch->id, std::vector{decode_success(RequestId{12}, 900)}, kStart + 4ms);
+  EXPECT_EQ(completion.released_kv_blocks, 3U);
+  EXPECT_EQ(scheduler.stats().scheduled_prefill_tokens, 2U);
+  EXPECT_EQ(scheduler.stats().reused_prefill_tokens, 4U);
+}
+
+TEST(FifoSchedulerTest, ReusedPrefixValidationAndWaitingCancellationAreTransactional) {
+  FifoScheduler scheduler(SchedulerConfig{8, 1, 2});
+  EXPECT_THROW(scheduler.submit_prefilled(make_request(13, 4, 1), 1), Error);
+  EXPECT_THROW(scheduler.submit_prefilled(make_request(14, 4, 1), 4), Error);
+  EXPECT_THROW(scheduler.submit_prefilled(make_request(15, 4, 1), 6), Error);
+  EXPECT_EQ(scheduler.stats().request_count, 0U);
+  EXPECT_EQ(scheduler.stats().submitted_count, 0U);
+  EXPECT_EQ(scheduler.stats().reused_prefill_tokens, 0U);
+
+  scheduler.submit_prefilled(make_request(16, 5, 1), 4);
+  const RetiredRequest cancelled =
+      scheduler.cancel(RequestId{16}, kStart, "cancelled before cached admission");
+  EXPECT_EQ(cancelled.released_kv_blocks, 2U);
+  EXPECT_EQ(scheduler.request(RequestId{16}).state(), RequestState::kCancelled);
+  EXPECT_EQ(scheduler.request(RequestId{16}).prompt_tokens_processed(), 0U);
+  EXPECT_EQ(scheduler.request(RequestId{16}).reused_prompt_tokens(), 4U);
+  EXPECT_EQ(scheduler.stats().reused_prefill_tokens, 4U);
+}
+
 TEST(FifoSchedulerTest, RunningCapacityLeavesLaterRequestsInFifoOrder) {
   FifoScheduler scheduler(SchedulerConfig{16, 1, 4});
   scheduler.submit(make_request(20, 1, 2));
