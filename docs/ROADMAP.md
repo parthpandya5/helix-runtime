@@ -367,7 +367,8 @@ CPU lifecycle and allocation-free layer-copy baselines are recorded in
 - deterministic allocation/reclamation tests
 - fragmentation/capacity comparison with contiguous sequence allocation
 
-Reference counting is deferred until prefix sharing creates a real need.
+M12 deliberately deferred reference counting until prefix sharing created a real
+need; the M22 record below adds it without changing the original paging baseline.
 
 Implementation/validation record (2026-08-21, commit `68e8d31`):
 `PagedKvCache` owns a fixed Float32 pool laid out as
@@ -685,9 +686,39 @@ improves a measured workload.
 Profile-driven candidates such as bias/activation, RMSNorm, or SwiGLU. Record
 latency, launch count, and traffic before and after.
 
-### M22 — Prefix cache — Optional
+### M22 — Prefix cache — Block-sharing primitive implemented; content cache pending
 
-Content key, KV block reference counts, ownership, eviction, and concurrency tests.
+Implemented/validation record (2026-08-23, commit `56d0cd0`):
+`PagedKvCache::fork_sequence` aliases a positive, block-aligned source prefix by
+copying only physical IDs into a new block table and incrementing per-page
+reference counts. Full-page alignment is the immutability contract: each branch
+only writes an exclusive tail, so divergence needs no partial-page copy-on-write.
+The fork allocates a new tail at its next write; the source may already own a later
+exclusive tail. Release decrements references and returns a page to the FIFO only
+on the final owner. Fork metadata is constructed before counters change,
+and a fork can succeed with zero free pages.
+
+Statistics now separate logical active tokens from unique resident payload and
+report total block-table references, shared physical blocks, and fork count. Debug
+invariants rebuild reference counts from all tables, require aliased pages to be
+full, validate written-token counts, detect duplicate free-queue entries, and
+reconcile bytes/slots/logical/resident accounting. Three new tests cover exact
+prefix values, scalar/bulk divergence, either-owner release, invalid and stale
+handles, full-pool behavior, FIFO reuse, and concurrent reference transitions
+above two. The current Debug, Release, and ASan/UBSan CPU suites pass 156/156; a
+CUDA 12.6.85 warnings-as-errors build passes those 156 host tests and explicitly
+skips 57 GPU tests without a driver/device.
+
+The retained duplicate-payload benchmark copies the same aligned prefix into a
+new sequence. On the disclosed Apple M3 Pro host, page sharing reduced median
+lifecycle CPU time from 916 to 83.1 ns for 32 KiB, 3.180 us to 93.3 ns for 93,240
+B, and 29.598 us to 92.3 ns for 1 MiB while assigning no additional physical
+payload. The fixed pool was already reserved in both modes, and content lookup,
+hashing, runtime integration, and eviction were excluded.
+
+M22 is not complete: content keys, collision-safe longest-prefix lookup,
+persistent anchor ownership, admission-aware eviction, and runtime reuse remain
+planned. This lower-level primitive is not described as an automatic prefix cache.
 
 ### M23 — Memory pressure and preemption — Safe-admission baseline implemented; optional extension
 

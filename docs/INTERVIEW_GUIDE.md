@@ -192,9 +192,26 @@ Logical position `p` maps to table entry `p / block_tokens` and in-block offset
 `p % block_tokens`. The physical pool is laid out
 `[block, layer, head, token_in_block, dimension]`. Appending reserves table
 capacity before consuming a free block so metadata allocation or block exhaustion
-cannot partially change the mapping. Release prevalidates ownership, then returns
-every block exactly once. A move-only read lease pins storage/table state while
-direct paged attention traverses spans.
+cannot partially change the mapping. Release prevalidates physical references,
+decrements once per table entry, and returns a page to the FIFO only at zero. A
+move-only read lease pins storage/table state while direct paged attention traverses
+spans.
+
+## How does Helix share a KV prefix?
+
+`PagedKvCache::fork_sequence` accepts a positive prefix ending exactly on a page
+boundary. It copies the source's leading physical IDs into a new logical table and
+increments each page's reference count; it never copies K/V payload. Since every
+shared page is full, future writes touch only exclusive tail pages, which makes
+divergent continuation safe without copy-on-write. Release decrements
+references and returns a page to the FIFO only at zero, so either sequence may die
+first. Statistics distinguish logical active tokens from unique resident tokens.
+
+This is intentionally only the ownership primitive. Helix does not yet hash prompt
+content, find the longest cached match, retain an anchor after all requests finish,
+or evict prefixes under pressure. Its paired CPU benchmark measures 11.02x–320.67x
+faster child lifecycle than duplicating 32 KiB–1 MiB of already-computed payload;
+the result excludes lookup and model execution and is not a GPU claim.
 
 ## Explain continuous batching
 

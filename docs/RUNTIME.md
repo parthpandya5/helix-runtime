@@ -207,8 +207,8 @@ Nine engine tests exercise:
 - injected non-finite model output converted to request failure and reclaimed K/V.
 
 The bulk cache, scheduler final-token rule, and paged model decode have additional
-focused tests. The full Debug, Release, and ASan/UBSan CPU suites pass 152/152. A
-CUDA 12.6 warnings-as-errors build passes the same 152 host tests and registers 57
+focused tests. The full Debug, Release, and ASan/UBSan CPU suites pass 156/156. A
+CUDA 12.6 warnings-as-errors build passes the same 156 host tests and registers 57
 GPU tests, all skipped without an NVIDIA driver/device.
 
 ## Current limitations

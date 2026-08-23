@@ -6,7 +6,7 @@ Milestones 14–16 are implemented and integrated by the M19 CPU engine: the
 host-only request state machine feeds a single-thread-owned FIFO/token/KV-budget
 scheduler, finished slots are refilled between iterations, and deterministic
 metric aggregation exposes lifecycle distributions and rates. Normal, Release,
-and ASan/UBSan suites pass 152/152 tests. The CUDA build passes the same host tests
+and ASan/UBSan suites pass 156/156 tests. The CUDA build passes the same host tests
 and registers 57 GPU tests, but this scheduler is host policy and requires no GPU.
 
 ## Ownership and thread safety

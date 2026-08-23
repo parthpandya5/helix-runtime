@@ -3,9 +3,10 @@
 ## Status
 
 The M11 contiguous cache, M12 paged cache, M13 direct paged-attention read path,
-and M19 bulk-append/runtime/direct-decode integration are implemented,
-CPU-validated, sanitized, and benchmarked in Float32. They expose
-the memory-capacity, compaction, and direct-traversal tradeoffs between a
+M19 bulk-append/runtime/direct-decode integration, and M22 block-aligned prefix
+sharing primitive are implemented, CPU-validated, sanitized, and benchmarked in
+Float32. They expose the memory-capacity, compaction, and direct-traversal
+tradeoffs between a
 per-sequence allocation and a global fixed-block pool. There is not yet a GPU-
 resident KV-cache or CUDA paged-attention path.
 
@@ -173,20 +174,21 @@ block's token vectors are contiguous. Retrieving a compact layer therefore issue
 two copies per head per logical block instead of two copies per head in the
 contiguous cache.
 
-### Free pool and ownership
+### Free pool, references, and payload lifetime
 
 The free pool is a fixed-capacity circular FIFO initialized with block IDs in
 ascending order. It allocates no metadata during release, returns blocks in a
 deterministic order, and prefers never-used blocks before recycled blocks. Parallel
-arrays record the owning sequence, free membership, and whether each block has ever
-been assigned. `PagedSequenceHandle` carries a cache identity and monotonic
-sequence identity independently from the contiguous handle type.
+arrays record each physical block's reference count, written-token count, free
+membership, and whether it has ever been assigned. `PagedSequenceHandle` carries
+a cache identity and monotonic sequence identity independently from the contiguous
+handle type.
 
 When an append needs a new block, Helix validates the input and checks availability
 before changing the free queue. It first grows the sequence table; only after that
 potentially throwing allocation succeeds does it dequeue and assign the physical
 block. All remaining writes are bounds-derived nonthrowing copies, so exhaustion or
-host metadata OOM cannot leave a partial mapping. An append inside an already-owned
+host metadata OOM cannot leave a partial mapping. An append inside an exclusive
 partial block remains legal even when the free pool is empty.
 
 `append_layer_major` is the full-prompt companion to scalar append. It accepts one
@@ -199,11 +201,44 @@ the meaning of `append_count` across scalar and bulk paths. A focused test compa
 five tokens spanning three blocks byte-for-byte with scalar append and proves
 shape, zero-length, and pool-exhaustion failures leave an empty sequence unchanged.
 
-Release validates every block owner before mutation, then returns all blocks
-without allocating. Reused storage is not cleared, but retrieval exposes only the
-new sequence's written logical length; every visible token position is overwritten
-before it can be read. There is one owner per block. Reference counting is
-intentionally absent until prefix sharing creates shared ownership.
+Release validates every block reference before mutation and does not allocate. It
+decrements one reference per table entry and returns a physical block to the FIFO
+only when the count reaches zero. Reused storage is not cleared, but retrieval
+exposes only the new sequence's written logical length; every visible token
+position is overwritten before it can be read.
+
+### Block-aligned prefix sharing
+
+`fork_sequence(source, prefix_tokens)` creates a new logical sequence by copying
+only the source's leading block IDs and incrementing their physical reference
+counts. The prefix must be positive, no longer than the source, and exactly aligned
+to `block_tokens`:
+
+```mermaid
+flowchart LR
+    Source[Source table] --> A[Page A<br/>refs = 2]
+    Source --> B[Page B<br/>refs = 2]
+    Source --> C[Exclusive source tail]
+    Fork[Fork table] --> A
+    Fork --> B
+    Fork --> D[Exclusive fork tail]
+```
+
+Alignment is the immutability boundary. Every aliased page is full, so the fork
+allocates an exclusive page before writing its next token; the source either writes
+an already-existing later exclusive tail or allocates a new exclusive page. Helix
+therefore needs no partial-page copy-on-write, and branch appends cannot overwrite
+one another. Either sequence can be released first; referenced pages remain
+readable through the survivor and are reclaimed exactly once after the last
+release.
+
+Forking is transactional with respect to metadata allocation and counter overflow.
+The new block table and map entry are created before any reference count changes.
+It requires no free physical page and can succeed when the pool is full; a later
+append at the aligned boundary still fails transactionally until a page is freed.
+The cache mutex serializes forks with append, release, and read leases. This API is
+the ownership primitive beneath a future prefix cache; it does not hash prompts,
+find matches, retain hidden anchors, or evict entries automatically.
 
 ### Accounting and invariants
 
@@ -214,11 +249,22 @@ pool_bytes = physical_blocks * block_tokens * bytes_per_token
 ```
 
 Assigned capacity is `used_blocks * block_tokens`; per-sequence tail slack is less
-than `block_tokens`. Statistics report reserved/used/free/peak bytes, total/used/
-free blocks, active sequences/tokens, allocated and unused token slots, successful
-lifecycle counts, block assignments, and reuse. Debug builds re-derive ownership,
-block-table lengths, free membership, byte totals, token slots, and all major
-counters after every mutation.
+than `block_tokens`. With sharing, `active_tokens` is logical demand summed across
+all live sequences, while `resident_tokens` counts unique written physical slots.
+Consequently:
+
+```text
+shared_token_references = active_tokens - resident_tokens
+unused_token_slots      = allocated_token_slots - resident_tokens
+token_slot_utilization  = resident_tokens / allocated_token_slots
+```
+
+Statistics also report total block-table references, physical blocks with multiple
+references, successful forks, reserved/used/free/peak bytes, block assignments, and
+reuse. Debug builds re-derive every physical reference count from all sequence
+tables, require shared blocks to be full, reject duplicate IDs within one table,
+verify written-token counts, detect duplicate free-queue entries, and reconcile
+logical/resident tokens, bytes, slots, and counters after every mutation.
 
 The deterministic comparison test uses two requests declared with contiguous
 capacities of ten tokens but active lengths of one and five. The contiguous cache
@@ -230,7 +276,7 @@ tail.
 
 ### Paged correctness coverage
 
-Nine deterministic tests cover:
+Twelve deterministic tests cover:
 
 - multi-layer/head values spanning odd and complete block boundaries,
 - visible block-table order and compact retrieval,
@@ -241,6 +287,12 @@ Nine deterministic tests cover:
 - invalid/overflowing configuration, handles, shapes, dtypes, layers, and outputs,
 - exact statistics and contiguous-versus-paged tail accounting,
 - concurrent append followed by complete reclamation,
+- byte-exact aligned prefix sharing, divergent scalar/bulk tails, and source-first
+  release with survivor reads,
+- invalid/unaligned/foreign/stale forks, full-pool fork success, transactional tail
+  exhaustion, and recycled-page reuse,
+- concurrent multi-reference fork/append/release transitions through reference
+  counts greater than two,
 - read-lease storage pinning, physical-block identity, and final-prefix bounds,
 - normal and ASan/UBSan execution.
 
@@ -298,7 +350,10 @@ benefit and the much smaller end-to-end effect in `docs/PERFORMANCE.md`.
   unrelated sequence mutation during that layer call.
 - Contiguous sequence capacity cannot grow; the paged pool cannot grow after
   construction.
-- No prefix sharing, eviction, preemption, or reference counting yet.
+- Prefix sharing is explicitly block-aligned and caller-directed; there is no
+  content index, automatic longest-prefix lookup, persistent anchor, or eviction
+  policy yet. Partial-page sharing/copy-on-write and runtime integration are absent.
+- No request preemption exists.
 - One mutex serializes all sequences, and a direct read lease holds it for the
   complete attention call.
 

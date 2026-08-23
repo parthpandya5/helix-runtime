@@ -37,6 +37,7 @@ Every recorded experiment must include:
 | M18 contiguous-KV decode staging | Allocate a compact owning history snapshot, then copy it into the final history-plus-tail buffers | Copy the locked cache prefix directly into the final buffers | Two-stage/direct median CPU times: 858/466 ns, 1,161/634 ns, and 3,784/1,587 ns; reductions 45.7%, 45.4%, and 58.1% | Both paths include final-buffer allocation and current-tail writes. Direct copy removes two temporary tensors and one full history pass; the paired algorithm benchmark isolates this change from model math. |
 | M19 synchronous CPU runtime prefill | Execute every scheduled prompt token through the one-token paged decode path | Execute a complete newly admitted prompt once and bulk-append its layer-major K/V pages | Sequential/full-prompt median CPU trace times: 461.833/224.800 us, 2.616/1.675 ms, and 11.745/9.890 ms; reductions 51.3%, 36.0%, and 15.8% | Full prefill wins all paired tiny traces, but the benefit narrows as decode dominates. The timed region is real serial CPU model/scheduler/cache execution, not GPU or fused-batch throughput. |
 | M19 paged model decode staging | Copy all cached pages into two contiguous history-plus-current K/V tensors per layer | Traverse leased block-table spans plus an uncommitted current K/V tail | Isolated compact/direct medians: 1,609/1,239 ns, 2,359/2,045 ns, 15.667/11.324 us, and 112.007/88.662 us; reductions 23.0%, 13.3%, 27.7%, and 20.8% | Direct traversal eliminates 2 KiB–1 MiB of combined-K/V payload per layer call. Complete tiny trace medians improved only 0.08%–6.23%, so the end-to-end impact is explicitly modest. |
+| M22 block-aligned prefix sharing | Create a child sequence and bulk-copy the already-computed prefix K/V payload into newly assigned pages | Copy only block IDs and increment physical reference counts | Duplicate/shared medians: 916/83.1 ns for 32 KiB, 3.180 us/93.3 ns for 93,240 B, and 29.598 us/92.3 ns for 1 MiB (11.02x, 34.08x, and 320.67x) | The paired lifecycle isolates the page-sharing mechanism. Assigned child payload falls to zero, but the fixed pool is pre-reserved and content lookup, hashing, eviction, model execution, and GPU work are excluded. |
 
 ## M1 CPU tensor baseline — 2026-08-20
 
@@ -896,6 +897,65 @@ Commands:
 ./build-release/benchmarks/helix_benchmarks \
   '--benchmark_filter=BM_CpuRuntimePagedDecodeTrace' \
   --benchmark_min_time=100x \
+  --benchmark_repetitions=15 \
+  --benchmark_enable_random_interleaving=true \
+  --benchmark_report_aggregates_only=true
+```
+
+## M22 block-aligned prefix sharing — 2026-08-23
+
+Hypothesis: once a K/V prefix already occupies complete physical pages, creating
+another logical sequence by copying that immutable payload wastes both bandwidth
+and scarce assigned page capacity. Copying just the page IDs and incrementing
+reference counts should make fork cost scale with the number of pages rather than
+`layers * heads * tokens * head_dimension`, provided all shared pages are full.
+
+Environment:
+
+- source: commit `56d0cd0`;
+- host: Apple M3 Pro, 12 CPU cores (6 performance, 6 efficiency), 18 GB RAM;
+- OS/compiler/build: macOS 26.0.1 arm64, Apple Clang 17.0.0, Release,
+  `HELIX_ENABLE_CUDA=OFF`, warnings as errors, Float32;
+- CMake 4.2.3 and Google Benchmark 1.9.1;
+- one benchmark thread; CPU affinity/frequency metadata unavailable, so the
+  displayed synthetic 24 MHz estimate is ignored;
+- load averages at command start: 10.22/6.97/6.12.
+
+Each mode constructs a fixed pool with twice the prefix's page count, deterministic
+layer-major K/V, and one populated source while timing is excluded. One complete
+child lifecycle warms each mode. Every measured operation then either creates an
+empty child, bulk-appends the same payload, checks length, and releases it
+(`DuplicatePayload`), or forks the source's complete block table, checks length,
+and releases it (`SharedBlocks`). Both include sequence-map/table metadata, the
+cache mutex, and final reference/reclamation bookkeeping. Each repetition executes
+exactly 10,000 lifecycles; 15 repetitions are randomly interleaved, and median
+process CPU time plus aggregate CPU-time CV are reported.
+
+| L / heads / D / block / prefix | Prefix K/V payload | Duplicate median / CPU CV | Shared median / CPU CV | Reduction / speedup |
+|---|---:|---:|---:|---:|
+| 2 / 2 / 32 / 8 / 32 | 32,768 B | 916 ns / 2.07% | 83.1 ns / 5.70% | 90.9% / 11.02x |
+| 3 / 3 / 37 / 7 / 35 | 93,240 B | 3.180 us / 4.53% | 93.3 ns / 4.37% | 97.1% / 34.08x |
+| 4 / 4 / 64 / 16 / 128 | 1,048,576 B | 29.598 us / 3.28% | 92.3 ns / 4.41% | 99.7% / 320.67x |
+
+The payload column is exact `prefix_tokens * bytes_per_token`, including keys and
+values for every layer/head. The duplicate assigns and writes that many additional
+bytes; the shared child assigns zero new payload bytes and adds four, five, or
+eight block-table references. Because `PagedKvCache` reserves its entire pool at
+construction in both modes, this is saved assigned capacity—not reduced process
+RSS or pool reservation. The widening speedup mostly reflects payload-copy growth
+against small metadata work; it does not establish an end-to-end request speedup.
+
+The fixture deliberately excludes prompt hashing, collision verification,
+longest-prefix search, anchor retention, eviction, model execution, and scheduling.
+It therefore validates the M22 ownership primitive and its copy baseline, not a
+complete prefix cache. No CUDA code ran.
+
+Command:
+
+```bash
+./build-release/benchmarks/helix_benchmarks \
+  '--benchmark_filter=BM_PagedKvPrefixForkLifecycle' \
+  --benchmark_min_time=10000x \
   --benchmark_repetitions=15 \
   --benchmark_enable_random_interleaving=true \
   --benchmark_report_aggregates_only=true

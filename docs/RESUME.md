@@ -8,7 +8,7 @@ that into a GPU performance claim.
 
 - Engineered a CPU-first C++20/CUDA inference runtime with checked Tensor/storage
   ownership, deterministic reference kernels, causal attention, contiguous and
-  paged KV caches, request scheduling, and continuous batching; maintained 152
+  paged KV caches, request scheduling, and continuous batching; maintained 156
   passing Debug, Release, and ASan/UBSan CPU tests.
 - Implemented manual CUDA elementwise, reduction, stable-softmax, naive/tiled
   SGEMM, RMSNorm, RoPE, SwiGLU, and attention paths with RAII streams/events and
@@ -23,6 +23,10 @@ that into a GPU performance claim.
   and copy-free read leases; optimized CPU attention value traversal by 2.36x–
   2.99x, then measured the remaining paged-layout overhead at 2.1%–6.7% against an
   equally optimized contiguous baseline.
+- Added reference-counted, block-aligned KV prefix forks with immutable shared
+  pages, divergence-safe exclusive tails, and logical-versus-resident accounting;
+  measured 11.02x–320.67x lower child lifecycle time than copying 32 KiB–1 MiB
+  prefixes while assigning no additional payload pages.
 - Implemented a validated FIFO token-budget scheduler with explicit request state
   transitions, KV-block accounting, continuous slot refill, and wait/TTFT/p50/p95/
   inter-token metrics, separating measured host-policy cost from synthetic

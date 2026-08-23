@@ -18,19 +18,21 @@ Milestones 9–10, the M11–M12 KV caches, the M13 direct paged-attention CPU p
 the M14–M16 request and continuous-batching scheduler, the M17 narrow Llama-style
 CPU prefill runtime, the M18 single-sequence cached generation path, and the M19
 synchronous multi-request CPU execution engine are implemented and CPU-validated.
+M22 now has a measured lower-level block-aligned prefix-sharing primitive; an
+automatic content-indexed prefix cache is still future work.
 The repository
 contains the CPU-first build foundation, a checked contiguous tensor core,
 Float32 reference kernels for elementwise math, reductions, stable softmax,
 matrix multiplication, RMSNorm, SwiGLU, adjacent-pair RoPE, linear projection, and
 causal scaled dot-product attention, plus a caching allocator, completion-aware deferred
-reclamation, and layer-aware contiguous/paged KV histories with checked capacity
-accounting and copy-free block-table attention traversal. The model composes those
+reclamation, and layer-aware contiguous/paged KV histories with checked capacity,
+reference-counted prefix pages, and copy-free block-table attention traversal. The model composes those
 primitives into embedding, pre-norm attention/MLP blocks, RoPE, SwiGLU, residuals,
 final normalization, and an untied LM head, loads a checksummed versioned native
 weight format, performs greedy generation through a contiguous KV cache, and
 executes scheduler batches against a shared paged KV pool. On
 2026-08-23, Apple Clang 17 built the project on macOS arm64 with warnings as
-errors; 152/152 CPU tests passed in Debug, Release, and ASan/UBSan configurations.
+errors; 156/156 CPU tests passed in Debug, Release, and ASan/UBSan configurations.
 
 CUDA is optional at configure time. The current Apple Silicon development host has
 no NVIDIA GPU or native CUDA toolkit, so no CUDA execution or performance claim is
@@ -40,7 +42,7 @@ compile-validated in an ARM64 CUDA 12.6 development container without a
 driver/device. The M8 stream-ordered allocator and M9 block-reduced RMSNorm,
 grid-stride SwiGLU, adjacent-pair RoPE, and projection adapter are also
 compile-validated, as is the M10 three-stage contiguous attention baseline. None is
-runtime-validated on a GPU. The CUDA-on build passes the same 152 hardware-
+runtime-validated on a GPU. The CUDA-on build passes the same 156 hardware-
 independent tests and registers 57 GPU tests that cannot run without a driver and
 device.
 
@@ -151,6 +153,13 @@ compaction: direct block-table attention reduced isolated layer median CPU time 
 trace medians improved by only 0.08%–6.23%. Methodology and measurements live in
 [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md).
 
+A separate M22 fixture compares copying an already-computed aligned prefix into a
+new sequence with aliasing its physical page table. Across 32 KiB, 93,240 B, and
+1 MiB prefixes, shared lifecycle medians were 11.02x, 34.08x, and 320.67x faster
+and assigned no additional physical payload. The pool itself is fixed and already
+reserved, and the fixture excludes content lookup, hashing, and eviction; these are
+mechanism-level CPU results, not end-to-end inference or GPU claims.
+
 ## Tensor runtime
 
 `helix::Tensor` is a shallow-copy handle over shared RAII storage. It tracks a
@@ -235,6 +244,15 @@ ownership changes, then copies across partial and complete pages without
 per-token Tensor packing. Benchmarks keep the faster steady-state lifecycle and
 slower large-history compaction results. See
 [`docs/KV_CACHE.md`](docs/KV_CACHE.md).
+
+`fork_sequence` can alias a positive block-aligned prefix into a new sequence.
+Physical blocks carry checked reference and written-token counts; release returns
+a page only after its last sequence reference disappears. Alignment makes every
+shared page immutable, so subsequent scalar or bulk appends touch only exclusive
+tail pages and branches can safely diverge without copy-on-write. Statistics
+separate logical `active_tokens` from unique `resident_tokens`, physical block
+references, and shared blocks. This primitive does not yet discover matching
+prompts or retain/evict prefixes automatically.
 
 The paged cache also exposes a move-only layer read lease that pins pool/table
 lifetime and excludes append/release while attention holds raw spans. This coarse
@@ -347,7 +365,9 @@ execution, but scheduled work items run serially and no tensor batch is formed.
 Transformer execution currently supports CPU Float32 prefill, contiguous-KV
 single-sequence generation, and paged-KV multi-request orchestration; tokenization,
 public checkpoint conversion, GPU-resident paged KV, and CUDA model dispatch
-remain roadmap work. Tensor
+remain roadmap work. Block-aligned page sharing exists, but the runtime has no
+content-key lookup, prefix insertion/eviction policy, or automatic prefix reuse.
+Tensor
 allocator integration is also pending. Float16 has no arithmetic path yet. Tensor
 execution is contiguous-only; broadcasting, slicing, and general strided kernels are intentionally
 deferred. CPU kernels are reference implementations, not optimized BLAS

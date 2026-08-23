@@ -5,10 +5,10 @@
 The Milestone 10 contiguous CPU reference, Milestone 13 direct paged CPU path, and
 post-M19 paged-history-plus-tail decode path are **implemented, CPU-validated,
 sanitizer-validated, and benchmarked**. Ten focused attention tests and the full
-152-test CPU suite pass in Debug, Release, and ASan/UBSan builds. The contiguous
+156-test CPU suite pass in Debug, Release, and ASan/UBSan builds. The contiguous
 CUDA baseline, four GPU tests, and CUDA-event benchmark fixtures compile with NVCC
 12.6.85 and warnings as errors, but have not run without an NVIDIA driver/device.
-The CUDA-on build passes the same 152 host tests and registers 57 hardware-gated
+The CUDA-on build passes the same 156 host tests and registers 57 hardware-gated
 GPU tests. Paged attention is CPU-only. No GPU correctness or performance claim is
 made.
 

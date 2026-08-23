@@ -378,11 +378,12 @@ flowchart LR
 
 The implemented M12 CPU manager owns two physical-major tensors shaped
 `[physical_blocks, layers, kv_heads, block_tokens, head_dimension]`, a preallocated
-circular FIFO free-block pool, owner/free/reuse metadata, and one block table per
+circular FIFO free-block pool, reference/free/written-token/reuse metadata, and one block table per
 sequence. It allocates a physical block only when an append begins a new logical
 block. The sequence table is grown before the free queue changes, so metadata OOM
 or pool exhaustion preserves the prior mapping and logical length. Release
-prevalidates ownership and returns blocks without allocating.
+prevalidates references and returns a block without allocating only when its last
+sequence reference disappears.
 
 The M19 bulk append accepts one `[kv_heads,tokens,head_dimension]` key/value pair
 per layer. It validates the entire layer-major input, checks capacity, and reserves
@@ -391,14 +392,22 @@ spans in a partial or whole page. This lets full model prefill populate the page
 pool without allocating and repacking one `[layers,heads,dimension]` Tensor pair per
 token; scalar append remains the incremental decode path.
 
+The M22 block-sharing primitive forks a positive prefix only when its length is an
+exact multiple of `block_tokens`. The new sequence copies block IDs into its own
+metadata table and increments physical reference counts; K/V payload is not
+copied. Because every shared block is full, both branches begin future appends on
+exclusive pages and never mutate shared payload. Logical active-token accounting
+therefore differs from unique resident-token accounting. Automatic prompt-content
+lookup, persistent prefix indexing, and eviction are not part of this primitive.
+
 The first memory-pressure policy rejects append with a typed resource error while
 preserving current sequences; an append within an already-owned partial block can
 still proceed. Debug builds re-derive ownership and accounting invariants after
 every mutation. Both contiguous and paged CPU caches use one mutex per instance.
 The M13 read lease lets attention traverse written block spans without compaction;
 its exclusive lifetime lock is the current invalidation boundary. GPU-resident pool
-integration, preemption, prefix sharing, and reference counting remain separate
-milestones rather than implied features.
+integration and preemption remain separate milestones; automatic prefix
+discovery/eviction remains the unfinished portion of M22.
 
 ## Request and scheduler
 
@@ -638,6 +647,6 @@ host latency.
 ## Deliberate limitations
 
 The initial architecture does not promise training, autograd, arbitrary model
-graphs, arbitrary strides, production serving APIs, quantization, prefix sharing,
-preemption, or multi-GPU inference. Each can be considered only after the core
-runtime is correct and measured.
+graphs, arbitrary strides, production serving APIs, quantization, automatic
+prefix-cache lookup/eviction, preemption, or multi-GPU inference. Each can be
+considered only after the core runtime is correct and measured.

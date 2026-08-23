@@ -223,10 +223,10 @@ nonzero stream origins.
 
 Validation on 2026-08-23 through direct paged-decode commit `c9b151c`:
 
-- Debug, Release, and Apple Clang ASan/UBSan CPU suites: 152/152 tests passed;
+- Debug, Release, and Apple Clang ASan/UBSan CPU suites: 156/156 tests passed;
 - all Release tests and benchmark smoke workloads passed;
 - CUDA 12.6.85/GCC 13.2 warnings-as-errors build: all targets compiled and all
-  152 hardware-independent tests passed;
+  156 hardware-independent tests passed;
 - 57 GPU runtime tests remained explicitly skipped because the compile container
   has no NVIDIA driver or device.
 
