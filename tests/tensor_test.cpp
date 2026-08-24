@@ -103,6 +103,42 @@ TEST(StorageTest, ReadOnlyExternalStorageValidatesOwnershipAndAlignment) {
   EXPECT_EQ(Storage::wrap_read_only_cpu(nullptr, 0, {}, 64)->data(), nullptr);
 }
 
+TEST(StorageTest, MutableExternalStoragePreservesLifetimeAndValidatesContract) {
+  struct alignas(64) Buffer final {
+    std::array<float, 4> values{1.0F, 2.0F, 3.0F, 4.0F};
+  };
+  auto owner = std::make_shared<Buffer>();
+  std::weak_ptr<Buffer> lifetime = owner;
+  auto storage = Storage::wrap_mutable_cpu(owner->values.data(), sizeof(owner->values), owner, 64);
+  owner.reset();
+
+  EXPECT_FALSE(lifetime.expired());
+  EXPECT_EQ(storage->data(), lifetime.lock()->values.data());
+  EXPECT_EQ(storage->mutable_data(), lifetime.lock()->values.data());
+  EXPECT_FALSE(storage->is_read_only());
+  static_cast<float*>(storage->mutable_data())[2] = 9.0F;
+  EXPECT_FLOAT_EQ(static_cast<const float*>(storage->data())[2], 9.0F);
+
+  const auto validation_owner = std::make_shared<Buffer>();
+  EXPECT_THROW(static_cast<void>(Storage::wrap_mutable_cpu(
+                   validation_owner->values.data(), sizeof(validation_owner->values), {}, 64)),
+               Error);
+  EXPECT_THROW(static_cast<void>(Storage::wrap_mutable_cpu(
+                   reinterpret_cast<std::byte*>(validation_owner->values.data()) + sizeof(float),
+                   sizeof(validation_owner->values) - sizeof(float), validation_owner, 64)),
+               Error);
+  EXPECT_THROW(static_cast<void>(Storage::wrap_mutable_cpu(validation_owner->values.data(), 0,
+                                                           validation_owner, 64)),
+               Error);
+  EXPECT_THROW(static_cast<void>(Storage::wrap_mutable_cpu(
+                   nullptr, sizeof(validation_owner->values), validation_owner, 64)),
+               Error);
+  EXPECT_EQ(Storage::wrap_mutable_cpu(nullptr, 0, {}, 64)->mutable_data(), nullptr);
+
+  storage.reset();
+  EXPECT_TRUE(lifetime.expired());
+}
+
 TEST(TensorTest, OwnsCanonicalContiguousMetadata) {
   const Tensor tensor({2, 3, 4}, DType::kFloat32, Device::cpu());
 
@@ -223,6 +259,70 @@ TEST(TensorTest, ReadOnlyExternalBufferPreservesLifetimeAndSupportsDeepClone) {
   EXPECT_FALSE(lifetime.expired());
   view = Tensor::zeros({1});
   EXPECT_TRUE(lifetime.expired());
+}
+
+TEST(TensorTest, MutableExternalBufferExposesCapacityAndSharesOwnershipWithViews) {
+  struct alignas(64) Buffer final {
+    std::array<float, 8> values{1.0F, 2.0F, 3.0F, 4.0F, 5.0F, 6.0F, 7.0F, 8.0F};
+  };
+
+  auto owner = std::make_shared<Buffer>();
+  std::weak_ptr<Buffer> lifetime = owner;
+  Tensor tensor = Tensor::from_mutable_cpu_buffer({2, 3}, DType::kFloat32, owner->values.data(),
+                                                  sizeof(owner->values), owner, 64);
+  owner.reset();
+
+  EXPECT_FALSE(lifetime.expired());
+  EXPECT_FALSE(tensor.is_read_only());
+  EXPECT_EQ(tensor.nbytes(), 6U * sizeof(float));
+  EXPECT_EQ(tensor.allocated_bytes(), 8U * sizeof(float));
+  tensor.data_as<float>()[4] = 42.0F;
+  EXPECT_FLOAT_EQ(lifetime.lock()->values[4], 42.0F);
+
+  Tensor view = tensor.view({3, 2});
+  EXPECT_EQ(view.data(), tensor.data());
+  tensor = Tensor::zeros({1});
+  EXPECT_FALSE(lifetime.expired());
+
+  Tensor clone = view.clone();
+  EXPECT_NE(clone.data(), view.data());
+  clone.data_as<float>()[0] = -1.0F;
+  EXPECT_FLOAT_EQ(std::as_const(view).data_as<float>()[0], 1.0F);
+
+  view = Tensor::zeros({1});
+  EXPECT_TRUE(lifetime.expired());
+}
+
+TEST(TensorTest, MutableExternalBufferRejectsInvalidBoundsPointerOwnerAndAlignment) {
+  struct alignas(64) Buffer final {
+    std::array<float, 4> values{};
+  };
+  const auto owner = std::make_shared<Buffer>();
+
+  EXPECT_THROW(static_cast<void>(Tensor::from_mutable_cpu_buffer(
+                   {4}, DType::kFloat32, owner->values.data(), 3U * sizeof(float), owner, 64)),
+               Error);
+  EXPECT_THROW(static_cast<void>(Tensor::from_mutable_cpu_buffer(
+                   {4}, DType::kFloat32, owner->values.data(), sizeof(owner->values), {}, 64)),
+               Error);
+  EXPECT_THROW(static_cast<void>(Tensor::from_mutable_cpu_buffer(
+                   {0}, DType::kFloat32, owner->values.data(), 0, owner, 64)),
+               Error);
+  EXPECT_THROW(static_cast<void>(Tensor::from_mutable_cpu_buffer({4}, DType::kFloat32, nullptr,
+                                                                 sizeof(owner->values), owner, 64)),
+               Error);
+  EXPECT_THROW(
+      static_cast<void>(Tensor::from_mutable_cpu_buffer(
+          {4}, DType::kFloat32, reinterpret_cast<std::byte*>(owner->values.data()) + sizeof(float),
+          sizeof(owner->values) - sizeof(float), owner, 64)),
+      Error);
+  EXPECT_THROW(static_cast<void>(Tensor::from_mutable_cpu_buffer(
+                   {4}, DType::kFloat32, owner->values.data(), sizeof(owner->values), owner, 24)),
+               Error);
+
+  const Tensor empty = Tensor::from_mutable_cpu_buffer({3, 0}, DType::kFloat32, nullptr, 0, {}, 64);
+  EXPECT_EQ(empty.data(), nullptr);
+  EXPECT_EQ(empty.allocated_bytes(), 0U);
 }
 
 TEST(TensorTest, ReshapeRejectsIncompatibleElementCounts) {

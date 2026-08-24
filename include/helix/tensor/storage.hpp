@@ -17,6 +17,9 @@ public:
   [[nodiscard]] static std::shared_ptr<Storage>
   wrap_read_only_cpu(const void* data, std::size_t size_bytes, std::shared_ptr<const void> owner,
                      std::size_t alignment = kDefaultStorageAlignment);
+  [[nodiscard]] static std::shared_ptr<Storage>
+  wrap_mutable_cpu(void* data, std::size_t size_bytes, std::shared_ptr<void> owner,
+                   std::size_t alignment = kDefaultStorageAlignment);
 
   ~Storage();
 

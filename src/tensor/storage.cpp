@@ -10,6 +10,8 @@
 #include <cstdint>
 #include <new>
 #include <sstream>
+#include <string>
+#include <string_view>
 #include <utility>
 
 namespace helix {
@@ -17,6 +19,25 @@ namespace {
 
 bool is_power_of_two(std::size_t value) noexcept {
   return value != 0 && (value & (value - 1)) == 0;
+}
+
+void validate_external_cpu_storage(const void* data, std::size_t size_bytes,
+                                   const std::shared_ptr<const void>& owner, std::size_t alignment,
+                                   std::string_view mutability) {
+  HELIX_CHECK(is_power_of_two(alignment), ErrorCode::kInvalidArgument,
+              "storage alignment must be a non-zero power of two");
+  HELIX_CHECK(alignment >= alignof(std::max_align_t), ErrorCode::kInvalidArgument,
+              "storage alignment must be at least alignof(max_align_t)");
+  HELIX_CHECK((size_bytes == 0) == (data == nullptr), ErrorCode::kInvalidArgument,
+              std::string(mutability) +
+                  " storage requires a null pointer exactly when its size is zero");
+  HELIX_CHECK(size_bytes == 0 || owner != nullptr, ErrorCode::kInvalidArgument,
+              "non-empty " + std::string(mutability) + " storage requires a lifetime owner");
+  if (data != nullptr) {
+    HELIX_CHECK(
+        reinterpret_cast<std::uintptr_t>(data) % alignment == 0, ErrorCode::kInvalidArgument,
+        std::string(mutability) + " storage pointer does not satisfy its declared alignment");
+  }
 }
 
 } // namespace
@@ -84,21 +105,18 @@ std::shared_ptr<Storage> Storage::allocate(std::size_t size_bytes, Device device
 std::shared_ptr<Storage> Storage::wrap_read_only_cpu(const void* data, std::size_t size_bytes,
                                                      std::shared_ptr<const void> owner,
                                                      std::size_t alignment) {
-  HELIX_CHECK(is_power_of_two(alignment), ErrorCode::kInvalidArgument,
-              "storage alignment must be a non-zero power of two");
-  HELIX_CHECK(alignment >= alignof(std::max_align_t), ErrorCode::kInvalidArgument,
-              "storage alignment must be at least alignof(max_align_t)");
-  HELIX_CHECK((size_bytes == 0) == (data == nullptr), ErrorCode::kInvalidArgument,
-              "read-only storage requires a null pointer exactly when its size is zero");
-  HELIX_CHECK(size_bytes == 0 || owner != nullptr, ErrorCode::kInvalidArgument,
-              "non-empty read-only storage requires a lifetime owner");
-  if (data != nullptr) {
-    HELIX_CHECK(reinterpret_cast<std::uintptr_t>(data) % alignment == 0,
-                ErrorCode::kInvalidArgument,
-                "read-only storage pointer does not satisfy its declared alignment");
-  }
+  validate_external_cpu_storage(data, size_bytes, owner, alignment, "read-only");
   return std::shared_ptr<Storage>(new Storage(data, size_bytes, Device::cpu(), alignment, true,
                                               ReleaseKind::kExternal, std::move(owner)));
+}
+
+std::shared_ptr<Storage> Storage::wrap_mutable_cpu(void* data, std::size_t size_bytes,
+                                                   std::shared_ptr<void> owner,
+                                                   std::size_t alignment) {
+  std::shared_ptr<const void> immutable_owner = std::move(owner);
+  validate_external_cpu_storage(data, size_bytes, immutable_owner, alignment, "mutable");
+  return std::shared_ptr<Storage>(new Storage(data, size_bytes, Device::cpu(), alignment, false,
+                                              ReleaseKind::kExternal, std::move(immutable_owner)));
 }
 
 void* Storage::mutable_data() {

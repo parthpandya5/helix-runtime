@@ -81,6 +81,17 @@ Tensor Tensor::from_read_only_cpu_buffer(Shape shape, DType dtype, const void* d
   return Tensor(std::move(shape), std::move(strides), dtype, Device::cpu(), std::move(storage), 0);
 }
 
+Tensor Tensor::from_mutable_cpu_buffer(Shape shape, DType dtype, void* data,
+                                       std::size_t storage_bytes, std::shared_ptr<void> owner,
+                                       std::size_t alignment) {
+  const std::size_t logical_bytes = checked_nbytes(shape, dtype);
+  HELIX_CHECK(storage_bytes >= logical_bytes, ErrorCode::kOutOfRange,
+              "mutable CPU buffer is smaller than the Tensor logical byte count");
+  auto storage = Storage::wrap_mutable_cpu(data, storage_bytes, std::move(owner), alignment);
+  auto strides = contiguous_strides(shape);
+  return Tensor(std::move(shape), std::move(strides), dtype, Device::cpu(), std::move(storage), 0);
+}
+
 bool Tensor::is_contiguous() const {
   return has_contiguous_strides(shape_, strides_);
 }

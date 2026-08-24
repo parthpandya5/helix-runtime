@@ -1,6 +1,7 @@
 #include "helix/core/error.hpp"
 #include "helix/memory/helix_allocator.hpp"
 #include "helix/memory/system_memory_resource.hpp"
+#include "helix/memory/tensor_storage.hpp"
 
 #include <atomic>
 #include <cstddef>
@@ -10,6 +11,7 @@
 #include <memory>
 #include <mutex>
 #include <new>
+#include <optional>
 #include <thread>
 #include <unordered_map>
 #include <utility>
@@ -100,6 +102,34 @@ public:
 
 private:
   void* storage_;
+};
+
+class CudaProbeResource final : public MemoryResource {
+public:
+  [[nodiscard]] void* allocate(std::size_t, std::size_t) override {
+    ++allocation_calls_;
+    return nullptr;
+  }
+
+  void deallocate(void*, std::size_t, std::size_t) override {
+    ++deallocation_calls_;
+  }
+
+  [[nodiscard]] Device device() const noexcept override {
+    return Device::cuda(0);
+  }
+
+  [[nodiscard]] std::size_t allocation_calls() const noexcept {
+    return allocation_calls_;
+  }
+
+  [[nodiscard]] std::size_t deallocation_calls() const noexcept {
+    return deallocation_calls_;
+  }
+
+private:
+  std::size_t allocation_calls_ = 0;
+  std::size_t deallocation_calls_ = 0;
 };
 
 AllocatorConfig config(std::size_t segment_bytes = 1024,
@@ -349,6 +379,90 @@ TEST(HelixAllocatorTest, SerializesConcurrentAllocationAndFree) {
   EXPECT_EQ(stats.bytes_allocated, 0U);
   EXPECT_EQ(stats.allocation_count, kThreads * kIterations);
   EXPECT_EQ(stats.largest_free_block, stats.bytes_reserved);
+}
+
+TEST(AllocatorTensorStorageTest, RetainsRoundedBlockUntilFinalViewAndThenReusesIt) {
+  auto allocator =
+      std::make_shared<HelixAllocator>(std::make_shared<SystemMemoryResource>(), config());
+  std::optional<Tensor> view;
+  void* first_pointer = nullptr;
+  {
+    Tensor tensor = allocate_cpu_tensor({3, 5}, DType::kFloat32, allocator, 128);
+    first_pointer = tensor.data();
+    ASSERT_NE(first_pointer, nullptr);
+    EXPECT_EQ(reinterpret_cast<std::uintptr_t>(first_pointer) % 128, 0U);
+    EXPECT_EQ(tensor.nbytes(), 60U);
+    EXPECT_EQ(tensor.allocated_bytes(), 128U);
+    tensor.zero_();
+    tensor.data_as<float>()[14] = 7.0F;
+    view.emplace(tensor.view({15}));
+
+    const AllocatorStats active = allocator->stats();
+    EXPECT_EQ(active.bytes_requested, 60U);
+    EXPECT_EQ(active.bytes_allocated, 128U);
+    EXPECT_EQ(active.active_allocation_count, 1U);
+    EXPECT_EQ(allocator->release_cached(), 0U);
+  }
+
+  ASSERT_TRUE(view.has_value());
+  EXPECT_FLOAT_EQ(view->data_as<float>()[14], 7.0F);
+  EXPECT_EQ(allocator->stats().active_allocation_count, 1U);
+  view.reset();
+  EXPECT_EQ(allocator->stats().active_allocation_count, 0U);
+
+  Tensor reused = allocate_cpu_tensor({16}, DType::kFloat32, allocator, 128);
+  EXPECT_EQ(reused.data(), first_pointer);
+  EXPECT_EQ(allocator->stats().reuse_count, 1U);
+  reused = Tensor::empty({0});
+  EXPECT_EQ(allocator->stats().active_allocation_count, 0U);
+}
+
+TEST(AllocatorTensorStorageTest, TensorOwnershipKeepsAllocatorAliveUntilStorageExpires) {
+  auto allocator =
+      std::make_shared<HelixAllocator>(std::make_shared<SystemMemoryResource>(), config());
+  std::weak_ptr<HelixAllocator> lifetime = allocator;
+  std::optional<Tensor> tensor;
+  tensor.emplace(allocate_cpu_tensor({17}, DType::kFloat32, allocator));
+  allocator.reset();
+
+  EXPECT_FALSE(lifetime.expired());
+  EXPECT_EQ(tensor->allocated_bytes(), 128U);
+  tensor.reset();
+  EXPECT_TRUE(lifetime.expired());
+}
+
+TEST(AllocatorTensorStorageTest, ZeroAndRejectedRequestsCreateNoActiveAllocation) {
+  auto allocator =
+      std::make_shared<HelixAllocator>(std::make_shared<SystemMemoryResource>(), config());
+  const Tensor empty = allocate_cpu_tensor({2, 0, 3}, DType::kFloat32, allocator, 128);
+  EXPECT_EQ(empty.data(), nullptr);
+  EXPECT_EQ(empty.nbytes(), 0U);
+  EXPECT_EQ(empty.allocated_bytes(), 0U);
+
+  EXPECT_THROW(static_cast<void>(allocate_cpu_tensor({-1}, DType::kFloat32, allocator)), Error);
+  EXPECT_THROW(static_cast<void>(allocate_cpu_tensor({std::numeric_limits<Dimension>::max()},
+                                                     DType::kFloat32, allocator)),
+               Error);
+  EXPECT_THROW(static_cast<void>(allocate_cpu_tensor({4}, DType::kFloat32, allocator, 24)), Error);
+  EXPECT_THROW(
+      static_cast<void>(allocate_cpu_tensor({4}, DType::kFloat32, allocator, alignof(float))),
+      Error);
+  EXPECT_THROW(static_cast<void>(allocate_cpu_tensor({4}, DType::kFloat32, nullptr, 64)), Error);
+  EXPECT_EQ(allocator->stats().allocation_count, 0U);
+  EXPECT_EQ(allocator->stats().active_allocation_count, 0U);
+
+  auto limited = std::make_shared<HelixAllocator>(std::make_shared<SystemMemoryResource>(),
+                                                  AllocatorConfig{64, 64, 64});
+  EXPECT_THROW(static_cast<void>(allocate_cpu_tensor({17}, DType::kFloat32, limited)), Error);
+  EXPECT_EQ(limited->stats().allocation_count, 0U);
+  EXPECT_EQ(limited->stats().bytes_reserved, 0U);
+
+  auto cuda_resource = std::make_shared<CudaProbeResource>();
+  auto cuda_allocator = std::make_shared<HelixAllocator>(cuda_resource, config());
+  EXPECT_THROW(static_cast<void>(allocate_cpu_tensor({4}, DType::kFloat32, cuda_allocator)), Error);
+  EXPECT_EQ(cuda_resource->allocation_calls(), 0U);
+  EXPECT_EQ(cuda_resource->deallocation_calls(), 0U);
+  EXPECT_EQ(cuda_allocator->stats().allocation_count, 0U);
 }
 
 } // namespace

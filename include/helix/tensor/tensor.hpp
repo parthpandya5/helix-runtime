@@ -32,6 +32,10 @@ public:
   from_read_only_cpu_buffer(Shape shape, DType dtype, const void* data,
                             std::shared_ptr<const void> owner,
                             std::size_t alignment = kDefaultStorageAlignment);
+  [[nodiscard]] static Tensor
+  from_mutable_cpu_buffer(Shape shape, DType dtype, void* data, std::size_t storage_bytes,
+                          std::shared_ptr<void> owner,
+                          std::size_t alignment = kDefaultStorageAlignment);
 
   [[nodiscard]] const Shape& shape() const noexcept {
     return shape_;
