@@ -19,6 +19,7 @@ import numpy as np
 
 
 CONVERTER = Path()
+VALIDATOR = Path()
 PACKER = Path()
 INSPECTOR = Path()
 FNV_OFFSET = 14_695_981_039_346_656_037
@@ -149,6 +150,7 @@ def write_checkpoint(
     include_lm_head: bool = True,
     shape_override: tuple[str, tuple[int, ...]] | None = None,
     non_finite_name: str | None = None,
+    seed_offset: int = 0,
 ) -> dict[str, np.ndarray[Any, Any]]:
     directory.mkdir()
     (directory / "config.json").write_text(json.dumps(config), encoding="utf-8")
@@ -156,7 +158,7 @@ def write_checkpoint(
     dtype_cycle = ("F32", "F16", "BF16")
     for index, (name, original_shape) in enumerate(source_specs(config, include_lm_head)):
         shape = shape_override[1] if shape_override and name == shape_override[0] else original_shape
-        values = deterministic_values(name, shape, index + 3)
+        values = deterministic_values(name, shape, index + 3 + seed_offset)
         if non_finite_name == name:
             values.reshape(-1)[0] = np.inf
         tensors.append((name, dtype_cycle[index % len(dtype_cycle)], values))
@@ -495,6 +497,29 @@ def run_converter(
     )
 
 
+def run_validator(
+    checkpoint: Path, model: Path, tokens: Sequence[int], *additional: str
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [
+            sys.executable,
+            str(VALIDATOR),
+            "--checkpoint",
+            str(checkpoint),
+            "--model",
+            str(model),
+            "--inspector",
+            str(INSPECTOR),
+            "--tokens",
+            ",".join(str(token) for token in tokens),
+            *additional,
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
 class ConverterIntegrationTest(unittest.TestCase):
     def test_sharded_mixed_precision_layout_and_cpp_loader(self) -> None:
         with tempfile.TemporaryDirectory(prefix="helix-converter-test-") as temporary:
@@ -545,6 +570,30 @@ class ConverterIntegrationTest(unittest.TestCase):
             )
             expected_logits = reference_hf_last_logits(config, sources, tokens)
             np.testing.assert_allclose(actual_logits, expected_logits, rtol=2.0e-5, atol=2.0e-6)
+
+            validated = run_validator(checkpoint, output, tokens)
+            self.assertEqual(validated.returncode, 0, validated.stderr)
+            self.assertIn("validation=passed", validated.stdout)
+            self.assertIn("logit_count=7", validated.stdout)
+
+            rejected_tokens = run_validator(checkpoint, output, (config["vocab_size"],))
+            self.assertNotEqual(rejected_tokens.returncode, 0)
+            self.assertIn("outside the checkpoint vocabulary", rejected_tokens.stderr)
+
+            bounded = run_validator(checkpoint, output, tokens, "--max-parameters", "1")
+            self.assertNotEqual(bounded.returncode, 0)
+            self.assertIn("bounded oracle is for small models", bounded.stderr)
+
+            different_checkpoint = root / "different-checkpoint"
+            write_checkpoint(
+                different_checkpoint,
+                config,
+                sharded=False,
+                seed_offset=19,
+            )
+            mismatched = run_validator(different_checkpoint, output, tokens)
+            self.assertNotEqual(mismatched.returncode, 0)
+            self.assertIn("source-layout oracle logit mismatch", mismatched.stderr)
 
     def test_tied_embedding_fallback_and_atomic_force(self) -> None:
         with tempfile.TemporaryDirectory(prefix="helix-converter-tied-") as temporary:
@@ -629,6 +678,7 @@ class ConverterIntegrationTest(unittest.TestCase):
 def parse_test_arguments(arguments: Sequence[str]) -> tuple[argparse.Namespace, list[str]]:
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--converter", required=True, type=Path)
+    parser.add_argument("--validator", required=True, type=Path)
     parser.add_argument("--packer", required=True, type=Path)
     parser.add_argument("--inspector", required=True, type=Path)
     return parser.parse_known_args(arguments)
@@ -637,6 +687,7 @@ def parse_test_arguments(arguments: Sequence[str]) -> tuple[argparse.Namespace, 
 if __name__ == "__main__":
     options, remaining = parse_test_arguments(sys.argv[1:])
     CONVERTER = options.converter.resolve()
+    VALIDATOR = options.validator.resolve()
     PACKER = options.packer.resolve()
     INSPECTOR = options.inspector.resolve()
     unittest.main(argv=[sys.argv[0], *remaining])

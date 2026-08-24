@@ -32,6 +32,7 @@ if(HELIX_BUILD_TESTS)
         "${Python3_EXECUTABLE}"
         "${CMAKE_CURRENT_SOURCE_DIR}/test_convert_hf_llama.py"
         --converter "${CMAKE_CURRENT_SOURCE_DIR}/convert_hf_llama.py"
+        --validator "${CMAKE_CURRENT_SOURCE_DIR}/validate_hf_llama.py"
         --packer "$<TARGET_FILE:helix_model_pack>"
         --inspector "$<TARGET_FILE:helix_model_inspect>")
     set_tests_properties(
