@@ -32,6 +32,7 @@ No performance values are recorded until an actual benchmark is run.
 Deliverables:
 
 - CMake C++20 project and namespaced library targets
+- relocatable CPU/CUDA CMake package with an isolated downstream consumer test
 - explicit optional CUDA language/toolkit configuration
 - GoogleTest and Google Benchmark integration
 - compiler warnings, formatting, static analysis, sanitizer option
@@ -56,6 +57,15 @@ The CUDA-on configure check produced the intended explicit missing-compiler erro
 CUDA compilation and runtime execution remain unvalidated because this host has no
 CUDA toolkit or NVIDIA device. Local clang-tidy execution is pending tool
 availability; CPU CI installs and runs it separately.
+
+Packaging follow-up (2026-08-24): install rules now export the complete library
+dependency graph under stable `helix::` names plus a versioned `HelixConfig.cmake`.
+An isolated downstream fixture installs, discovers, links, and runs against both a
+full and dependency-free CPU build. The CUDA 12.6 compile-only build resolves the
+exported toolkit dependency, exposes only its CUDA-enabled targets, compiles the
+public CUDA model API, and runs the fixture's CPU path without claiming device
+execution. This contract is part of the ordinary CPU and hardware-independent CUDA
+CTest suites.
 
 ### M1 — Tensor core — Implemented and CPU-validated
 
@@ -782,10 +792,10 @@ device OOV ID propagates the embedding kernel's safe NaN sentinel rather than an
 out-of-bounds read. A matching device-input benchmark preloads weights/IDs/RoPE,
 performs ten warmups, checks the CPU oracle before and after timing, and uses same-
 stream events for three disclosed synthetic geometries. The benchmark has not run.
-Debug, Release, and ASan/UBSan CPU suites pass 196/196. CUDA 12.6.85/GCC 13.2
-compile and link all targets with warnings as errors; 195 hardware-independent
+Debug, Release, and ASan/UBSan CPU suites pass 197/197. CUDA 12.6.85/GCC 13.2
+compile and link all targets with warnings as errors; 196 hardware-independent
 tests pass and 75 GPU-required tests/benchmark gates skip without a driver/device
-(270 registered total). Thus CUDA full-prefill correctness, sanitizer status, and
+(271 registered total). Thus CUDA full-prefill correctness, sanitizer status, and
 performance remain pending physical NVIDIA hardware.
 
 ### M18 — Autoregressive generation — Implemented, CPU-validated, sanitized, and benchmarked

@@ -293,6 +293,21 @@ set(HELIX_INSTALL_TARGETS
 if(HELIX_ENABLE_CUDA)
   list(APPEND HELIX_INSTALL_TARGETS helix_cuda_runtime helix_cuda_kernels)
 endif()
+
+set_target_properties(helix_core PROPERTIES EXPORT_NAME core)
+set_target_properties(helix_tensor PROPERTIES EXPORT_NAME tensor)
+set_target_properties(helix_memory PROPERTIES EXPORT_NAME memory)
+set_target_properties(helix_cpu_kernels PROPERTIES EXPORT_NAME cpu_kernels)
+set_target_properties(helix_attention PROPERTIES EXPORT_NAME attention)
+set_target_properties(helix_kv_cache PROPERTIES EXPORT_NAME kv_cache)
+set_target_properties(helix_model PROPERTIES EXPORT_NAME model)
+set_target_properties(helix_runtime PROPERTIES EXPORT_NAME runtime)
+set_target_properties(helix_scheduler PROPERTIES EXPORT_NAME scheduler)
+if(HELIX_ENABLE_CUDA)
+  set_target_properties(helix_cuda_runtime PROPERTIES EXPORT_NAME cuda_runtime)
+  set_target_properties(helix_cuda_kernels PROPERTIES EXPORT_NAME cuda_kernels)
+endif()
+
 install(
   TARGETS ${HELIX_INSTALL_TARGETS}
   EXPORT HelixTargets
@@ -303,6 +318,27 @@ install(DIRECTORY include/ DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}")
 install(
   FILES "${HELIX_GENERATED_INCLUDE_DIR}/helix/core/config.hpp"
   DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/helix/core")
+
+include(CMakePackageConfigHelpers)
+set(HELIX_CMAKE_PACKAGE_DIR "${CMAKE_INSTALL_LIBDIR}/cmake/Helix")
+configure_package_config_file(
+  "${CMAKE_CURRENT_SOURCE_DIR}/cmake/HelixConfig.cmake.in"
+  "${CMAKE_CURRENT_BINARY_DIR}/HelixConfig.cmake"
+  INSTALL_DESTINATION "${HELIX_CMAKE_PACKAGE_DIR}")
+write_basic_package_version_file(
+  "${CMAKE_CURRENT_BINARY_DIR}/HelixConfigVersion.cmake"
+  VERSION "${PROJECT_VERSION}"
+  COMPATIBILITY SameMinorVersion)
+install(
+  EXPORT HelixTargets
+  FILE HelixTargets.cmake
+  NAMESPACE helix::
+  DESTINATION "${HELIX_CMAKE_PACKAGE_DIR}")
+install(
+  FILES
+    "${CMAKE_CURRENT_BINARY_DIR}/HelixConfig.cmake"
+    "${CMAKE_CURRENT_BINARY_DIR}/HelixConfigVersion.cmake"
+  DESTINATION "${HELIX_CMAKE_PACKAGE_DIR}")
 
 message(STATUS "Helix ${PROJECT_VERSION}")
 message(STATUS "  CUDA backend:       ${HELIX_ENABLE_CUDA}")

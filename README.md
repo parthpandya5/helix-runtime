@@ -58,7 +58,7 @@ weight format, performs greedy generation through a contiguous KV cache, and
 executes scheduler batches against a shared paged KV pool with optional prompt-
 prefix reuse. On
 2026-08-24, Apple Clang 17 built the project on macOS arm64 with warnings as
-errors; 196/196 CPU tests passed in Debug, Release, and ASan/UBSan configurations.
+errors; 197/197 CPU tests passed in Debug, Release, and ASan/UBSan configurations.
 
 CUDA is optional at configure time. The current Apple Silicon development host has
 no NVIDIA GPU or native CUDA toolkit, so no CUDA execution or performance claim is
@@ -70,8 +70,8 @@ head-layout transforms, block-reduced RMSNorm, grid-stride SwiGLU, adjacent-pair
 RoPE, and projection adapter are also compile-validated, as are the M10 contiguous
 and M13 paged three-stage attention
 baselines and the synchronous M17 full-prefill model composition. None is runtime-
-validated on a GPU. The CUDA-on build passes 195 hardware-independent tests and
-explicitly skips 75 GPU-required tests without a driver/device (270 registered
+validated on a GPU. The CUDA-on build passes 196 hardware-independent tests and
+explicitly skips 75 GPU-required tests without a driver/device (271 registered
 tests total). Its container lacks Python/NumPy, so the separate converter
 integration test is not registered there; it passes in all three native CPU
 configurations.
@@ -142,6 +142,31 @@ composes those paths into one synchronous Float32 causal-prefill baseline with
 device-owned weights and explicit stream lifetime boundaries. The build is
 compile-validated, but those tests and benchmarks have not executed on a physical
 NVIDIA GPU.
+
+### Install and consume from CMake
+
+The selected build mode is preserved by the installed package:
+
+```bash
+cmake --install build --prefix "$PWD/install"
+```
+
+```cmake
+find_package(Helix 0.1 CONFIG REQUIRED)
+target_link_libraries(my_runtime PRIVATE helix::runtime)
+```
+
+The package exports `helix::core`, `helix::tensor`, `helix::memory`,
+`helix::cpu_kernels`, `helix::attention`, `helix::kv_cache`, `helix::scheduler`,
+`helix::model`, and `helix::runtime`. A CUDA-on installation additionally exports
+`helix::cuda_runtime` and `helix::cuda_kernels`, resolves the CUDA Toolkit for the
+consumer, and sets `Helix_CUDA_ENABLED` to true. A CPU-only installation sets that
+variable to false and does not advertise CUDA targets.
+
+CTest installs into an isolated prefix, configures a fresh downstream project with
+`find_package(Helix)`, links the full runtime dependency graph, and executes a CPU
+tensor operation. The same consumer is compile-validated against the CUDA package
+without executing device work.
 
 ### Sanitizers and analysis
 

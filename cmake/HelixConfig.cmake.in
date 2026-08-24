@@ -1,0 +1,12 @@
+@PACKAGE_INIT@
+
+include(CMakeFindDependencyMacro)
+
+set(Helix_CUDA_ENABLED @HELIX_ENABLE_CUDA@)
+if(Helix_CUDA_ENABLED)
+  find_dependency(CUDAToolkit REQUIRED)
+endif()
+
+include("${CMAKE_CURRENT_LIST_DIR}/HelixTargets.cmake")
+
+check_required_components(Helix)

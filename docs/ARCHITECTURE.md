@@ -114,6 +114,30 @@ CUDA validation has three distinct levels:
 3. GPU runtime validation: correctness, sanitizer, and benchmark workloads run on
    named NVIDIA hardware.
 
+### Installed package boundary
+
+Helix installs its public headers, the generated build-mode configuration header,
+static libraries, and a relocatable CMake package. `find_package(Helix CONFIG)`
+reconstructs the public dependency graph through stable imported names such as
+`helix::tensor`, `helix::model`, and `helix::runtime`; consumers do not need to
+repeat Helix's internal library ordering.
+
+The package records whether it was built with CUDA in `Helix_CUDA_ENABLED`. A
+CPU-only package exports no CUDA target. A CUDA package additionally exports
+`helix::cuda_runtime` and `helix::cuda_kernels` and resolves `CUDAToolkit` before
+loading those imported targets. This is a build-contract distinction, not runtime
+device detection: a CUDA package may be consumed and compile-checked on a machine
+whose toolkit is present but whose NVIDIA driver/device is absent.
+
+The package smoke test deliberately crosses the repository boundary. It installs
+to a fresh prefix, configures a separate CMake project using only
+`find_package(Helix)`, links `helix::runtime`, compiles against installed headers,
+and runs a CPU reference operation. CUDA builds also compile a public CUDA-model
+type assertion while keeping the executable path device-independent. Instrumented
+static libraries export their sanitizer-runtime link requirement; the ASan/UBSan
+configuration runs the same downstream test instead of assuming in-tree link flags
+will cover consumers.
+
 ## Core types and error policy
 
 `Device` is a value type containing a backend kind (`CPU` or `CUDA`) and a device

@@ -34,7 +34,9 @@ function(helix_configure_target target_name)
         ${target_name} PRIVATE
         $<$<COMPILE_LANGUAGE:CXX>:-fsanitize=address,undefined>
         $<$<COMPILE_LANGUAGE:CXX>:-fno-omit-frame-pointer>)
-      target_link_options(${target_name} PRIVATE -fsanitize=address,undefined)
+      # Instrumented static archives call into the sanitizer runtimes. Preserve
+      # that link requirement for installed consumers as well as in-tree tests.
+      target_link_options(${target_name} PUBLIC -fsanitize=address,undefined)
     else()
       message(FATAL_ERROR
         "HELIX_ENABLE_SANITIZERS currently requires Clang or GCC on a non-Windows host")
