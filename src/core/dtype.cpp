@@ -10,6 +10,8 @@ std::string_view dtype_name(DType dtype) {
     return "float32";
   case DType::kFloat16:
     return "float16";
+  case DType::kUInt32:
+    return "uint32";
   }
   throw_error(ErrorCode::kInvalidArgument, "unknown dtype");
 }
@@ -20,6 +22,8 @@ std::size_t dtype_size(DType dtype) {
     return 4;
   case DType::kFloat16:
     return 2;
+  case DType::kUInt32:
+    return 4;
   }
   throw_error(ErrorCode::kInvalidArgument, "unknown dtype");
 }
@@ -29,6 +33,8 @@ bool dtype_is_floating_point(DType dtype) {
   case DType::kFloat32:
   case DType::kFloat16:
     return true;
+  case DType::kUInt32:
+    return false;
   }
   throw_error(ErrorCode::kInvalidArgument, "unknown dtype");
 }

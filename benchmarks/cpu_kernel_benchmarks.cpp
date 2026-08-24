@@ -117,6 +117,35 @@ void BM_CpuRope(benchmark::State& state) {
   finish_elementwise_iteration(state, state.range(0) * state.range(1) * state.range(2), 3);
 }
 
+void BM_CpuEmbeddingLookup(benchmark::State& state) {
+  const auto tokens = static_cast<Dimension>(state.range(0));
+  const auto vocabulary = static_cast<Dimension>(state.range(1));
+  const auto width = static_cast<Dimension>(state.range(2));
+  std::vector<std::uint32_t> ids(static_cast<std::size_t>(tokens));
+  for (std::size_t token = 0; token < ids.size(); ++token) {
+    ids[token] =
+        static_cast<std::uint32_t>((token * 7'919U + 17U) % static_cast<std::size_t>(vocabulary));
+  }
+  const Tensor token_ids = Tensor::from_values({tokens}, ids);
+  const Tensor table = Tensor::random_uniform({vocabulary, width}, 1'212);
+  Tensor output = Tensor::empty({tokens, width});
+  for (int warmup = 0; warmup < 10; ++warmup) {
+    embedding_lookup_out(token_ids, table, output);
+  }
+  for ([[maybe_unused]] auto iteration : state) {
+    embedding_lookup_out(token_ids, table, output);
+    benchmark::ClobberMemory();
+  }
+  const auto elements = state.range(0) * state.range(2);
+  state.SetItemsProcessed(state.iterations() * elements);
+  state.SetBytesProcessed(state.iterations() *
+                          (2 * elements * static_cast<std::int64_t>(sizeof(float)) +
+                           state.range(0) * static_cast<std::int64_t>(sizeof(std::uint32_t))));
+  state.counters["tokens"] = static_cast<double>(state.range(0));
+  state.counters["vocabulary"] = static_cast<double>(state.range(1));
+  state.counters["width"] = static_cast<double>(state.range(2));
+}
+
 BENCHMARK(BM_CpuAdd)->Arg(1)->Arg(1024)->Arg(1 << 20);
 BENCHMARK(BM_CpuSilu)->Arg(1)->Arg(1024)->Arg(1 << 20);
 BENCHMARK(BM_CpuSoftmax)->Args({1, 128})->Args({32, 128})->Args({16, 1023});
@@ -124,6 +153,12 @@ BENCHMARK(BM_CpuMatmul)->Args({31, 29, 37})->Args({64, 64, 64})->Args({128, 128,
 BENCHMARK(BM_CpuRmsNorm)->Args({1, 4096})->Args({32, 4096});
 BENCHMARK(BM_CpuSwiGlu)->Arg(4096)->Arg(32 * 4096);
 BENCHMARK(BM_CpuRope)->Args({1, 32, 128})->Args({128, 32, 128});
+BENCHMARK(BM_CpuEmbeddingLookup)
+    ->Args({1, 128, 32})
+    ->Args({7, 128, 32})
+    ->Args({1, 4096, 256})
+    ->Args({128, 4096, 256})
+    ->Args({1, 32000, 1024});
 
 } // namespace
 } // namespace helix::cpu

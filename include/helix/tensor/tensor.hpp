@@ -28,6 +28,8 @@ public:
                                              Device device = Device::cpu());
   [[nodiscard]] static Tensor from_values(Shape shape, std::span<const float> values,
                                           Device device = Device::cpu());
+  [[nodiscard]] static Tensor from_values(Shape shape, std::span<const std::uint32_t> values,
+                                          Device device = Device::cpu());
   [[nodiscard]] static Tensor
   from_read_only_cpu_buffer(Shape shape, DType dtype, const void* data,
                             std::shared_ptr<const void> owner,
@@ -80,19 +82,21 @@ public:
 
   template <typename T> [[nodiscard]] T* data_as() {
     using Value = std::remove_cv_t<T>;
-    static_assert(std::is_same_v<Value, float>,
-                  "Milestone 1 exposes typed access only for Float32");
-    HELIX_CHECK(dtype_ == DType::kFloat32, ErrorCode::kInvalidArgument,
-                "typed float access requires a float32 tensor");
+    static_assert(std::is_same_v<Value, float> || std::is_same_v<Value, std::uint32_t>,
+                  "typed Tensor access supports only float and uint32_t");
+    constexpr DType expected = std::is_same_v<Value, float> ? DType::kFloat32 : DType::kUInt32;
+    HELIX_CHECK(dtype_ == expected, ErrorCode::kInvalidArgument,
+                "requested C++ element type does not match the Tensor dtype");
     return static_cast<T*>(data());
   }
 
   template <typename T> [[nodiscard]] const T* data_as() const {
     using Value = std::remove_cv_t<T>;
-    static_assert(std::is_same_v<Value, float>,
-                  "Milestone 1 exposes typed access only for Float32");
-    HELIX_CHECK(dtype_ == DType::kFloat32, ErrorCode::kInvalidArgument,
-                "typed float access requires a float32 tensor");
+    static_assert(std::is_same_v<Value, float> || std::is_same_v<Value, std::uint32_t>,
+                  "typed Tensor access supports only float and uint32_t");
+    constexpr DType expected = std::is_same_v<Value, float> ? DType::kFloat32 : DType::kUInt32;
+    HELIX_CHECK(dtype_ == expected, ErrorCode::kInvalidArgument,
+                "requested C++ element type does not match the Tensor dtype");
     return static_cast<const T*>(data());
   }
 

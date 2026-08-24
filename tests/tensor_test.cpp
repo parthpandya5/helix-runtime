@@ -180,6 +180,33 @@ TEST(TensorTest, ZeroInitializesSupportedStorageRepresentations) {
   EXPECT_TRUE(std::all_of(bytes, bytes + half_bytes.nbytes(),
                           [](std::byte value) { return value == std::byte{0}; }));
   EXPECT_THROW(static_cast<void>(half_bytes.data_as<float>()), Error);
+
+  const Tensor token_ids = Tensor::zeros({5}, DType::kUInt32);
+  EXPECT_TRUE(std::all_of(token_ids.data_as<std::uint32_t>(),
+                          token_ids.data_as<std::uint32_t>() + token_ids.numel(),
+                          [](std::uint32_t value) { return value == 0; }));
+  EXPECT_THROW(static_cast<void>(token_ids.data_as<float>()), Error);
+  EXPECT_THROW(static_cast<void>(float_tensor.data_as<std::uint32_t>()), Error);
+}
+
+TEST(TensorTest, ConstructsUInt32ValuesAndPreservesThemAcrossViewsAndClones) {
+  constexpr std::array<std::uint32_t, 6> kValues{0, 7, 4'294'967'295U, 11, 7, 3};
+  Tensor tensor = Tensor::from_values({2, 3}, kValues);
+
+  ASSERT_EQ(tensor.dtype(), DType::kUInt32);
+  ASSERT_EQ(tensor.nbytes(), kValues.size() * sizeof(std::uint32_t));
+  EXPECT_TRUE(std::equal(tensor.data_as<std::uint32_t>(),
+                         tensor.data_as<std::uint32_t>() + tensor.numel(), kValues.begin()));
+
+  Tensor view = tensor.view({6});
+  view.data_as<std::uint32_t>()[1] = 19;
+  EXPECT_EQ(tensor.data_as<std::uint32_t>()[1], 19U);
+
+  const Tensor clone = tensor.clone();
+  EXPECT_NE(clone.data(), tensor.data());
+  EXPECT_TRUE(std::equal(clone.data_as<std::uint32_t>(),
+                         clone.data_as<std::uint32_t>() + clone.numel(),
+                         tensor.data_as<std::uint32_t>()));
 }
 
 TEST(TensorTest, RandomInitializationIsDeterministicAndBounded) {

@@ -34,6 +34,11 @@ void rms_norm_out(const Tensor& input, const Tensor& weight, float epsilon, Tens
 void swiglu_out(const Tensor& gate, const Tensor& up, Tensor& output);
 [[nodiscard]] Tensor swiglu(const Tensor& gate, const Tensor& up);
 
+// Gathers rows from a Float32 [vocabulary, width] table using UInt32 [tokens]
+// indices. Output is contiguous Float32 [tokens, width].
+void embedding_lookup_out(const Tensor& token_ids, const Tensor& table, Tensor& output);
+[[nodiscard]] Tensor embedding_lookup(const Tensor& token_ids, const Tensor& table);
+
 // Applies adjacent-pair rotary embedding to the complete last dimension. Input is
 // [tokens, ..., head_dimension]; cosine/sine are [tokens, head_dimension / 2].
 void rope_out(const Tensor& input, const Tensor& cosine, const Tensor& sine, Tensor& output);

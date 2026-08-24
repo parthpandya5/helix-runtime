@@ -181,6 +181,18 @@ gtest_discover_tests(
   DISCOVERY_MODE PRE_TEST)
 
 if(HELIX_ENABLE_CUDA)
+  add_executable(helix_cuda_embedding_tests cuda_embedding_test.cpp)
+  target_link_libraries(
+    helix_cuda_embedding_tests
+    PRIVATE helix::cuda_kernels helix::cpu_kernels GTest::gtest_main)
+  helix_configure_target(helix_cuda_embedding_tests)
+
+  gtest_discover_tests(
+    helix_cuda_embedding_tests
+    TEST_PREFIX "cuda_embedding."
+    DISCOVERY_MODE PRE_TEST
+    PROPERTIES LABELS gpu TIMEOUT 120)
+
   add_executable(helix_cuda_runtime_tests cuda_runtime_test.cpp)
   target_link_libraries(
     helix_cuda_runtime_tests

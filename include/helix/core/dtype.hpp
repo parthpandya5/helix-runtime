@@ -9,6 +9,7 @@ namespace helix {
 enum class DType : std::uint8_t {
   kFloat32,
   kFloat16,
+  kUInt32,
 };
 
 [[nodiscard]] std::string_view dtype_name(DType dtype);

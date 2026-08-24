@@ -21,16 +21,10 @@ Dimension dimension(std::size_t value) {
 
 Tensor embed_tokens(std::span<const std::uint32_t> token_ids, const Tensor& embedding,
                     std::size_t hidden_size, std::size_t vocabulary_size) {
-  Tensor output = Tensor::empty({dimension(token_ids.size()), dimension(hidden_size)});
-  const auto* source = embedding.data_as<float>();
-  auto* destination = output.data_as<float>();
-  for (std::size_t token = 0; token < token_ids.size(); ++token) {
-    const std::size_t id = token_ids[token];
-    HELIX_CHECK(id < vocabulary_size, ErrorCode::kOutOfRange,
-                "model::CpuLlamaModel::forward: token ID is outside the vocabulary");
-    std::copy_n(source + id * hidden_size, hidden_size, destination + token * hidden_size);
-  }
-  return output;
+  HELIX_ASSERT(embedding.shape() == (Shape{dimension(vocabulary_size), dimension(hidden_size)}),
+               "validated Llama embedding geometry changed during execution");
+  const Tensor indices = Tensor::from_values({dimension(token_ids.size())}, token_ids);
+  return cpu::embedding_lookup(indices, embedding);
 }
 
 struct RopeCache {

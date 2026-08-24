@@ -25,6 +25,7 @@ if(HELIX_ENABLE_CUDA)
     helix_benchmarks
     PRIVATE
       cuda_attention_benchmarks.cpp
+      cuda_embedding_benchmarks.cpp
       cuda_elementwise_benchmarks.cpp
       cuda_allocator_benchmarks.cpp
       cuda_matmul_benchmarks.cpp
@@ -83,6 +84,16 @@ add_test(
 set_tests_properties(
   benchmark.model_smoke
   PROPERTIES LABELS "benchmark;model;smoke")
+
+add_test(
+  NAME benchmark.cpu_embedding_smoke
+  COMMAND helix_benchmarks
+          --benchmark_filter=BM_CpuEmbeddingLookup/7/128/32$
+          --benchmark_min_time=1x
+          --benchmark_repetitions=1)
+set_tests_properties(
+  benchmark.cpu_embedding_smoke
+  PROPERTIES LABELS "benchmark;kernels;model;smoke")
 
 add_test(
   NAME benchmark.model_load_smoke

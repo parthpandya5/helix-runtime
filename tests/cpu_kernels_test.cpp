@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <gtest/gtest.h>
 #include <limits>
+#include <memory>
 #include <span>
 #include <vector>
 
@@ -254,6 +255,64 @@ TEST(SwiGluTest, ComputesSiluGateTimesUpProjection) {
 
 TEST(SwiGluTest, RejectsShapeMismatch) {
   EXPECT_THROW(static_cast<void>(swiglu(Tensor::zeros({2, 3}), Tensor::zeros({6}))), Error);
+}
+
+TEST(EmbeddingLookupTest, GathersRepeatedAndOutOfOrderRowsWithOddWidth) {
+  const Tensor token_ids = Tensor::from_values({4}, std::array<std::uint32_t, 4>{3, 0, 3, 1});
+  const Tensor table = Tensor::from_values(
+      {4, 5}, std::array{0.0F,  1.0F,  2.0F,  3.0F,  4.0F,  10.0F, 11.0F, 12.0F, 13.0F, 14.0F,
+                         20.0F, 21.0F, 22.0F, 23.0F, 24.0F, 30.0F, 31.0F, 32.0F, 33.0F, 34.0F});
+
+  const Tensor output = embedding_lookup(token_ids, table);
+  EXPECT_EQ(output.shape(), (Shape{4, 5}));
+  expect_values_near(output, std::array{30.0F, 31.0F, 32.0F, 33.0F, 34.0F, 0.0F,  1.0F,
+                                        2.0F,  3.0F,  4.0F,  30.0F, 31.0F, 32.0F, 33.0F,
+                                        34.0F, 10.0F, 11.0F, 12.0F, 13.0F, 14.0F});
+}
+
+TEST(EmbeddingLookupTest, SupportsEmptyTokensAndRejectsZeroWidth) {
+  const Tensor empty_ids = Tensor::from_values({0}, std::span<const std::uint32_t>{});
+  const Tensor table = Tensor::zeros({3, 5});
+  const Tensor empty_output = embedding_lookup(empty_ids, table);
+  EXPECT_EQ(empty_output.shape(), (Shape{0, 5}));
+  EXPECT_EQ(empty_output.numel(), 0U);
+
+  const Tensor ids = Tensor::from_values({2}, std::array<std::uint32_t, 2>{2, 0});
+  EXPECT_THROW(static_cast<void>(embedding_lookup(ids, Tensor::zeros({3, 0}))), Error);
+}
+
+TEST(EmbeddingLookupTest, RejectsInvalidContractsWithoutPartiallyWritingOutput) {
+  const Tensor ids = Tensor::from_values({3}, std::array<std::uint32_t, 3>{0, 3, 1});
+  const Tensor table = Tensor::from_values({3, 2}, std::array{1.0F, 2.0F, 3.0F, 4.0F, 5.0F, 6.0F});
+  Tensor output = Tensor::from_values({3, 2}, std::array{-7.0F, -7.0F, -7.0F, -7.0F, -7.0F, -7.0F});
+  EXPECT_THROW(embedding_lookup_out(ids, table, output), Error);
+  expect_values_near(output, std::array{-7.0F, -7.0F, -7.0F, -7.0F, -7.0F, -7.0F});
+
+  const Tensor valid_ids = Tensor::from_values({2}, std::array<std::uint32_t, 2>{0, 1});
+  EXPECT_THROW(static_cast<void>(embedding_lookup(Tensor::zeros({2}), table)), Error);
+  EXPECT_THROW(static_cast<void>(embedding_lookup(valid_ids.view({1, 2}), table)), Error);
+  EXPECT_THROW(static_cast<void>(embedding_lookup(valid_ids, Tensor::zeros({6}))), Error);
+  EXPECT_THROW(
+      static_cast<void>(embedding_lookup(valid_ids, Tensor::zeros({3, 2}, DType::kFloat16))),
+      Error);
+
+  Tensor wrong_shape = Tensor::zeros({2, 3});
+  EXPECT_THROW(embedding_lookup_out(valid_ids, table, wrong_shape), Error);
+  Tensor wrong_dtype = Tensor::zeros({2, 2}, DType::kUInt32);
+  EXPECT_THROW(embedding_lookup_out(valid_ids, table, wrong_dtype), Error);
+
+  Tensor aliased_table = Tensor::zeros({2, 2});
+  EXPECT_THROW(embedding_lookup_out(valid_ids, aliased_table, aliased_table), Error);
+
+  struct alignas(64) OverlappingStorage final {
+    std::array<float, 10> values{};
+  };
+  const auto owner = std::make_shared<OverlappingStorage>();
+  const Tensor partial_table = Tensor::from_mutable_cpu_buffer(
+      {2, 3}, DType::kFloat32, owner->values.data(), 6 * sizeof(float), owner, 16);
+  Tensor partial_output = Tensor::from_mutable_cpu_buffer(
+      {2, 3}, DType::kFloat32, owner->values.data() + 4, 6 * sizeof(float), owner, 16);
+  EXPECT_THROW(embedding_lookup_out(valid_ids, partial_table, partial_output), Error);
 }
 
 TEST(RopeTest, RotatesAdjacentPairsForEveryTokenAndHead) {

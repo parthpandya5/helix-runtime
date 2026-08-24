@@ -142,6 +142,7 @@ helix_configure_target(helix_memory)
 
 if(HELIX_ENABLE_CUDA)
   add_library(helix_cuda_kernels
+    src/kernels/cuda/embedding.cu
     src/kernels/cuda/elementwise.cu
     src/kernels/cuda/matmul.cu
     src/kernels/cuda/reduction.cu

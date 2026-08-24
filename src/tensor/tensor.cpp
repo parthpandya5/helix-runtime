@@ -73,6 +73,16 @@ Tensor Tensor::from_values(Shape shape, std::span<const float> values, Device de
   return device.is_cpu() ? result : result.to(device);
 }
 
+Tensor Tensor::from_values(Shape shape, std::span<const std::uint32_t> values, Device device) {
+  HELIX_CHECK(values.size() == checked_numel(shape), ErrorCode::kInvalidArgument,
+              "value count does not match tensor element count");
+  Tensor result(std::move(shape), DType::kUInt32, Device::cpu());
+  if (!values.empty()) {
+    std::memcpy(result.data(), values.data(), result.nbytes());
+  }
+  return device.is_cpu() ? result : result.to(device);
+}
+
 Tensor Tensor::from_read_only_cpu_buffer(Shape shape, DType dtype, const void* data,
                                          std::shared_ptr<const void> owner, std::size_t alignment) {
   const std::size_t size_bytes = checked_nbytes(shape, dtype);

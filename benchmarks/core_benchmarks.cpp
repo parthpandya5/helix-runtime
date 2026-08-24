@@ -15,7 +15,8 @@ void BM_DTypeMetadata(benchmark::State& state) {
 
 BENCHMARK(BM_DTypeMetadata)
     ->Arg(static_cast<int>(DType::kFloat32))
-    ->Arg(static_cast<int>(DType::kFloat16));
+    ->Arg(static_cast<int>(DType::kFloat16))
+    ->Arg(static_cast<int>(DType::kUInt32));
 
 } // namespace
 } // namespace helix

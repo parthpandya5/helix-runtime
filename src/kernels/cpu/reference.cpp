@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
+#include <cstdint>
 #include <limits>
 #include <sstream>
 #include <string>
@@ -27,6 +28,16 @@ void require_reference_tensor(const Tensor& tensor, std::string_view tensor_name
               tensor_contract_message(operation, tensor_name, "must be on CPU"));
   HELIX_CHECK(tensor.dtype() == DType::kFloat32, ErrorCode::kInvalidArgument,
               tensor_contract_message(operation, tensor_name, "must have dtype float32"));
+  HELIX_CHECK(tensor.is_contiguous(), ErrorCode::kInvalidArgument,
+              tensor_contract_message(operation, tensor_name, "must be contiguous"));
+}
+
+void require_index_tensor(const Tensor& tensor, std::string_view tensor_name,
+                          std::string_view operation) {
+  HELIX_CHECK(tensor.device().is_cpu(), ErrorCode::kInvalidArgument,
+              tensor_contract_message(operation, tensor_name, "must be on CPU"));
+  HELIX_CHECK(tensor.dtype() == DType::kUInt32, ErrorCode::kInvalidArgument,
+              tensor_contract_message(operation, tensor_name, "must have dtype uint32"));
   HELIX_CHECK(tensor.is_contiguous(), ErrorCode::kInvalidArgument,
               tensor_contract_message(operation, tensor_name, "must be contiguous"));
 }
@@ -110,7 +121,17 @@ Shape reduced_last_dim_shape(const Tensor& input, bool keep_dim, std::string_vie
 
 void require_distinct_output(const Tensor& input, const Tensor& output, std::string_view operation,
                              std::string_view input_name) {
-  if (input.nbytes() != 0 && input.data() == output.data()) {
+  if (input.nbytes() == 0 || output.nbytes() == 0 || input.device() != output.device()) {
+    return;
+  }
+  const auto input_begin = reinterpret_cast<std::uintptr_t>(input.data());
+  const auto output_begin = reinterpret_cast<std::uintptr_t>(output.data());
+  const auto maximum = std::numeric_limits<std::uintptr_t>::max();
+  const bool invalid_range =
+      input_begin > maximum - input.nbytes() || output_begin > maximum - output.nbytes();
+  const bool overlaps = invalid_range || (input_begin < output_begin + output.nbytes() &&
+                                          output_begin < input_begin + input.nbytes());
+  if (overlaps) {
     std::ostringstream message;
     message << operation << ": output must not alias " << input_name;
     throw_error(ErrorCode::kInvalidArgument, message.str());
@@ -368,6 +389,48 @@ void swiglu_out(const Tensor& gate, const Tensor& up, Tensor& output) {
 Tensor swiglu(const Tensor& gate, const Tensor& up) {
   Tensor output = Tensor::empty(gate.shape(), DType::kFloat32, Device::cpu());
   swiglu_out(gate, up, output);
+  return output;
+}
+
+void embedding_lookup_out(const Tensor& token_ids, const Tensor& table, Tensor& output) {
+  constexpr std::string_view kOperation = "cpu::embedding_lookup_out";
+  require_index_tensor(token_ids, "token_ids", kOperation);
+  require_reference_tensor(table, "table", kOperation);
+  HELIX_CHECK(token_ids.rank() == 1, ErrorCode::kInvalidArgument,
+              tensor_contract_message(kOperation, "token_ids", "must have rank one"));
+  HELIX_CHECK(table.rank() == 2, ErrorCode::kInvalidArgument,
+              tensor_contract_message(kOperation, "table", "must have rank two"));
+  HELIX_CHECK(table.shape()[1] != 0, ErrorCode::kInvalidArgument,
+              tensor_contract_message(kOperation, "table width", "must be non-zero"));
+  const Shape output_shape{token_ids.shape()[0], table.shape()[1]};
+  require_output(output, output_shape, kOperation);
+  require_distinct_output(token_ids, output, kOperation, "token_ids");
+  require_distinct_output(table, output, kOperation, "table");
+
+  const auto vocabulary = static_cast<std::size_t>(table.shape()[0]);
+  const auto width = static_cast<std::size_t>(table.shape()[1]);
+  const auto* ids = token_ids.data_as<std::uint32_t>();
+  for (std::size_t token = 0; token < token_ids.numel(); ++token) {
+    HELIX_CHECK(static_cast<std::size_t>(ids[token]) < vocabulary, ErrorCode::kOutOfRange,
+                "cpu::embedding_lookup_out: token ID is outside the table vocabulary");
+  }
+
+  const auto* table_values = table.data_as<float>();
+  auto* output_values = output.data_as<float>();
+  for (std::size_t token = 0; token < token_ids.numel(); ++token) {
+    std::copy_n(table_values + static_cast<std::size_t>(ids[token]) * width, width,
+                output_values + token * width);
+  }
+}
+
+Tensor embedding_lookup(const Tensor& token_ids, const Tensor& table) {
+  HELIX_CHECK(token_ids.rank() == 1, ErrorCode::kInvalidArgument,
+              "cpu::embedding_lookup: token_ids must have rank one");
+  HELIX_CHECK(table.rank() == 2, ErrorCode::kInvalidArgument,
+              "cpu::embedding_lookup: table must have rank two");
+  Tensor output =
+      Tensor::empty({token_ids.shape()[0], table.shape()[1]}, DType::kFloat32, Device::cpu());
+  embedding_lookup_out(token_ids, table, output);
   return output;
 }
 

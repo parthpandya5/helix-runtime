@@ -50,6 +50,10 @@ TEST(DTypeTest, ReportsStableMetadata) {
   EXPECT_EQ(dtype_name(DType::kFloat16), "float16");
   EXPECT_EQ(dtype_size(DType::kFloat16), 2U);
   EXPECT_TRUE(dtype_is_floating_point(DType::kFloat16));
+
+  EXPECT_EQ(dtype_name(DType::kUInt32), "uint32");
+  EXPECT_EQ(dtype_size(DType::kUInt32), sizeof(std::uint32_t));
+  EXPECT_FALSE(dtype_is_floating_point(DType::kUInt32));
 }
 
 TEST(DTypeTest, RejectsUnknownValues) {
