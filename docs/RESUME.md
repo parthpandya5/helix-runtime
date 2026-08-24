@@ -8,7 +8,7 @@ that into a GPU performance claim.
 
 - Engineered a CPU-first C++20/CUDA inference runtime with checked Tensor/storage
   ownership, deterministic reference kernels, causal attention, contiguous and
-  paged KV caches, request scheduling, and continuous batching; maintained 177
+  paged KV caches, request scheduling, and continuous batching; maintained 184
   passing Debug, Release, and ASan/UBSan CPU tests.
 - Implemented manual CUDA elementwise, reduction, stable-softmax, naive/tiled
   SGEMM, RMSNorm, RoPE, SwiGLU, and attention paths with RAII streams/events and
@@ -17,7 +17,9 @@ that into a GPU performance claim.
 - Designed a best-fit caching allocator with aligned split/coalesce, reservation
   limits, generation-tagged stale/double-free protection, internal/external
   fragmentation metrics, and event-backed deferred reuse for stream-ordered CUDA
-  lifetimes.
+  lifetimes; added shared RAII CPU Tensor ownership and measured 47.9% lower 4 MiB
+  allocation lifecycle latency while retaining the approximately 2x small-
+  allocation regression as an explicit limitation.
 - Built a paged KV manager with fixed physical blocks, logical block tables,
   deterministic FIFO reclamation, transactional exhaustion, cache-tagged handles,
   and copy-free read leases; optimized CPU attention value traversal by 2.36x–

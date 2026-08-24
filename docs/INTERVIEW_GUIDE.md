@@ -40,10 +40,11 @@ after checked bounds and element-count validation. Shape and byte multiplication
 reject negative values and overflow before pointer arithmetic or allocation.
 
 Storage can also wrap an aligned externally owned CPU range with an explicit
-shared lifetime. That path is read-only: mutable `data()` access and in-place
-operations fail, views preserve immutability, and `clone` returns writable owned
-storage. Helix uses this contract for mapped model weights so a shallow alias
-cannot silently mutate parameters.
+shared lifetime. Read-only ranges reject mutable `data()` and in-place operations,
+views preserve immutability, and `clone` returns writable owned storage; Helix uses
+that contract for mapped weights. Mutable external ranges validate capacity,
+pointer, owner, and alignment separately. The CPU allocator bridge uses the latter
+to preserve rounded capacity and keep one pool allocation alive across all views.
 
 ## Why is GPU memory allocation expensive?
 
@@ -63,6 +64,12 @@ allocation ID, and generation to reject foreign handles, double frees, and stale
 ABA-style reuse. A mutex protects the metadata boundary. Statistics include
 reserved, requested, rounded-active, free, peak, largest-free-block, reuse, and
 upstream-call counts.
+
+`allocate_cpu_tensor` supplies the RAII boundary missing from a raw `Allocation`:
+its private shared lifetime token captures both the exact descriptor and a
+`shared_ptr` to the allocator, and final Storage release returns the block once.
+Zero-sized requests bypass the pool, and invalid requests are transactional. This
+bridge is CPU-only; ordinary Tensor factories and clones still allocate directly.
 
 Best fit was selected as an auditable baseline for mixed lifetimes, not assumed to
 be universally optimal. Its linear scan and metadata cost remain visible in host
@@ -94,7 +101,9 @@ users are ordered complete creates use-after-free-style corruption on the device
 object. `StreamOrderedAllocator` records a CUDA event on the explicit release
 stream and only makes the block reusable after the event completes. This is safe
 only if that stream is ordered after every use; Tensor does not yet track arbitrary
-cross-stream use, so general allocator integration remains pending.
+cross-stream use, so CUDA Tensor allocator integration remains pending. The CPU
+Tensor bridge is safe precisely because host Tensor operations have no asynchronous
+device work to outlive the final owner.
 
 ## What are CUDA streams?
 
@@ -298,8 +307,8 @@ workspace, and holds a coarse cache-wide read lease per layer. The engine execut
 scheduled work serially rather than forming tensor batches, and the scheduler
 retains terminal request history. For KV, fixed pool
 capacity becomes the admission boundary. On GPU, the answer requires profiling;
-likely constraints include KV capacity/bandwidth, GEMM efficiency, allocator/Tensor
-integration, and missing batched executor plumbing.
+likely constraints include KV capacity/bandwidth, GEMM efficiency, CUDA allocator/
+Tensor integration, and missing batched executor plumbing.
 
 ## How would this architecture change across multiple GPUs?
 

@@ -25,6 +25,7 @@ Every recorded experiment must include:
 | M1 `Tensor::zeros` baseline | No earlier implementation | Allocate 64-byte-aligned CPU storage and zero it | Median CPU time: 191 ns (1 float), 240 ns (1,024 floats), 23.589 us (1,048,576 floats) | This measures allocation, tensor metadata construction, and zeroing together. It is a starting point, not evidence of an optimization or a standalone memory-bandwidth result. |
 | M2 CPU reference kernels | No earlier implementation | Clear single-threaded Float32 correctness paths with preallocated output | Representative median CPU times: add 1,048,576 values 121.685 us; softmax 32x128 21.172 us; matmul 128x128x128 1.521 ms (2.758 GFLOP/s); RMSNorm 32x4096 132.403 us | These establish correctness-oracle baselines. They are not optimized CPU-library comparisons, and allocation is excluded through `_out` APIs. |
 | M7 host-resource allocator baseline | Direct aligned C++ allocation/free | Route identical fixed and 16-allocation mixed traces through the best-fit cache | Median CPU time per fixed pair: direct/Helix 22.6/87.1 ns (256 B), 22.0/88.6 ns (4 KiB), 548/88.2 ns (1 MiB); mixed trace 1.657/2.016 us | Host allocation already caches small blocks, so Helix metadata loses on small/mixed traces but avoids repeated upstream work for 1 MiB. This does not predict `cudaMalloc` behavior. |
+| M7 allocator-backed CPU Tensor ownership | Direct `Tensor::empty` allocation/destruction | Retain one pool allocation and allocator through shared Tensor Storage, then return it on final release | Direct/pooled median CPU time: 117/238 ns (1 element), 117/239 ns (1,024), and 459/239 ns (1,048,576) | Shared-owner plus allocator metadata was about 2.04x slower for small Tensors, while cached 4 MiB lifecycle latency was 47.9% lower. The 64 MiB retained host segment and untouched payload make this an ownership/cache result, not bandwidth or CUDA evidence. |
 | M9 CPU transformer primitives | No earlier RoPE fixture; M2 provided scalar SiLU only | Add preallocated SwiGLU and adjacent-pair RoPE reference paths | Median CPU time: SwiGLU 4,096 values 44.602 us and 131,072 values 1.512 ms; RoPE 1x32x128 1.904 us and 128x32x128 187.894 us | These are single-threaded correctness baselines, not optimized CPU or GPU comparisons. High host load makes wall-time variation substantial. |
 | M10 contiguous CPU attention | No earlier attention path | Materialize scaled/masked scores, stable softmax in place, then probabilities x V with reusable output/workspace | Median CPU time: 8x1x128x64x64 76.371 us; 8x1x1,024x64x64 825.128 us; 3x17x29x37x41 46.284 us; 8x128x128x64x64 8.164 ms | Workspace is exactly `4*H*Q*K` bytes. These single-threaded results include softmax but the reported dot FLOP/s numerator does not; they are correctness baselines. |
 | M11 contiguous CPU KV cache | No earlier KV storage | Reserve per-sequence K/V tensors, append complete tokens, and copy a compact layer history into preallocated outputs | Lifecycle median CPU time: 26.898 us (2x2x64, capacity/append 128), 63.700 us (4x8x64, capacity 512/append 32), 7.853 us (odd 3x3x37, 29); layer-copy median: 1.595 us (128 KiB), 29.609 us (2 MiB), 613 ns (25,752 B) | Lifecycle includes sequence allocation, appends, and release. Layer copy excludes output allocation. This is a contiguous baseline under high host load, not evidence that paging or another layout is faster. |
@@ -173,6 +174,57 @@ Command:
 The relevant production question is native `cudaMalloc/cudaFree` versus the CUDA-
 backed cache under GPU allocation traces. Those fixtures compile, but the current
 machine cannot execute them; no CUDA allocation latency or speedup is reported.
+
+## M7 allocator-backed CPU Tensor ownership — 2026-08-24
+
+Hypothesis: an explicit RAII bridge can preserve Tensor/view lifetime while
+amortizing expensive upstream allocation. On the host, the shared owner, allocator
+mutex, best-fit scan, block rebuild, and active-map bookkeeping may dominate small
+requests, so direct allocation remains a required paired baseline.
+
+Environment:
+
+- source: commit `4f6fc7f`;
+- host: Apple M3 Pro, 12 CPU cores (6 performance, 6 efficiency), 18 GB RAM;
+- OS/compiler/build: macOS 26.0.1 arm64, Apple Clang 17.0.0, Release,
+  `HELIX_ENABLE_CUDA=OFF`, warnings as errors, Float32;
+- CMake 4.2.3 and Google Benchmark 1.9.1;
+- one benchmark thread; clock-rate metadata and affinity unavailable;
+- load averages at command start: 5.50/7.06/7.03;
+- workload: construct and destroy one contiguous Tensor; payload bytes are not
+  initialized or read; direct Storage uses its default 64-byte alignment, while
+  the default Helix pool uses 256-byte minimum alignment and a 64 MiB segment;
+- warmup: one same-shape construct/destroy operation inside each benchmark before
+  timing; this acquires and then caches the pool's one upstream segment;
+- measurement: 0.1-second minimum per case, 15 randomly interleaved repetitions,
+  median process CPU time; the timed iterations per repetition were 1,199,966,
+  1,202,852, and 309,961 for direct 1/1,024/1,048,576-element cases and 562,136,
+  567,192, and 574,972 for their pooled counterparts.
+
+| Float32 elements / logical bytes | Direct median / CPU CV | Pooled median / CPU CV | Observed outcome |
+|---:|---:|---:|---|
+| 1 / 4 B | 117 ns / 2.20% | 238 ns / 2.86% | Pool is 2.03x slower. |
+| 1,024 / 4 KiB | 117 ns / 1.47% | 239 ns / 1.71% | Pool is 2.04x slower. |
+| 1,048,576 / 4 MiB | 459 ns / 1.02% | 239 ns / 2.94% | Pool is 47.9% lower latency (1.92x). |
+
+Every pooled case made one upstream allocation, reused the cached block on every
+timed iteration, and retained 67,108,864 bytes. The one-element request also
+rounds from 4 B to 256 B. These costs make the CPU bridge intentionally opt-in: the
+host allocator already handles small transient allocations efficiently, whereas a
+large aligned host allocation has enough lifecycle cost for cache reuse to win in
+this fixture. No bytes-per-second value is reported because the workload does not
+touch payload pages. The result does not establish CUDA behavior, where upstream
+allocation and asynchronous lifetime have different costs.
+
+Command:
+
+```bash
+./build-release/benchmarks/helix_benchmarks \
+  '--benchmark_filter=BM_Tensor(DirectAllocation|HelixAllocator)SteadyState' \
+  --benchmark_min_time=0.1s \
+  --benchmark_repetitions=15 \
+  --benchmark_enable_random_interleaving=true
+```
 
 ## M9 CPU transformer-primitive baseline — 2026-08-20
 

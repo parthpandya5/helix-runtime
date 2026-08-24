@@ -2,18 +2,21 @@
 
 ## Validation status
 
-The allocator metadata and generic deferred-reclamation layers are **implemented,
-CPU-validated, sanitizer-validated, and host-resource benchmarked**. Eighteen
-focused allocator/deferred tests and the full 76-test CPU suite pass under normal
-and ASan/UBSan builds. A CUDA 12.6 warnings-as-errors build compiles
-`CudaMemoryResource`, `StreamOrderedAllocator`, three hardware-gated allocator
-tests, and native-CUDA comparison benchmarks, but no CUDA allocator code has run on
-a physical GPU.
+The allocator metadata, generic deferred-reclamation layer, and opt-in CPU Tensor
+ownership bridge are **implemented, CPU-validated, sanitizer-validated, and host-
+resource benchmarked**. Twenty-one focused allocator/deferred/bridge tests and the
+full 184-test CPU suite pass in Debug, Release, and ASan/UBSan builds. A CUDA 12.6
+warnings-as-errors build compiles `CudaMemoryResource`, `StreamOrderedAllocator`,
+three hardware-gated allocator tests, the CPU bridge, and native-CUDA comparison
+benchmarks. It passes 183 hardware-independent tests and skips 57 GPU tests without
+a driver/device (240 registered), so no CUDA allocator code has run on a physical
+GPU.
 
 The event-backed adapter is therefore compile-validated rather than hardware-
-validated. It is deliberately not wired into Tensor storage: Tensor does not yet
-track all streams that use an allocation, so it cannot satisfy the release-stream
-contract automatically. CPU completion tests do not prove CUDA event semantics.
+validated. The CPU bridge does not generalize to CUDA: Tensor does not yet track
+all streams that use an allocation, so it cannot satisfy the release-stream
+contract automatically. CPU ownership/completion tests do not prove CUDA event
+semantics.
 
 ## Why cache device allocations?
 
@@ -29,7 +32,9 @@ GPU latency.
 
 ```mermaid
 flowchart TD
-    Client[Tensor / workspace owner] -->|bytes + alignment| Allocator[HelixAllocator]
+    Tensor[CPU Tensor owner] --> Bridge[allocate_cpu_tensor]
+    Bridge -->|bytes + alignment| Allocator[HelixAllocator]
+    Workspace[Explicit workspace owner] -->|bytes + alignment| Allocator
     Allocator --> Scan[Best-fit metadata scan]
     Scan -->|cache hit| Segment[Existing segment]
     Scan -->|cache miss| Resource[MemoryResource]
@@ -101,6 +106,46 @@ double-free error, an old handle cannot free a newer allocation at the same addr
 and even two allocator instances deliberately backed by the same address cannot
 accept one another's handles. `Allocation` is not independently RAII because its
 valid lifetime depends on the owning allocator.
+
+## CPU Tensor ownership bridge
+
+`memory::allocate_cpu_tensor(shape, dtype, shared_allocator, alignment)` is the
+explicit bridge between the non-RAII allocation descriptor and Tensor's shared
+RAII Storage. It is deliberately opt-in and CPU-only:
+
+1. validate the allocator, checked logical byte count, alignment, and CPU device;
+2. return a null, zero-capacity Tensor without touching the pool for zero work;
+3. allocate exactly the logical byte request through `HelixAllocator`;
+4. wrap the pointer and rounded block capacity as mutable external CPU Storage;
+5. retain both the exact generation-tagged descriptor and a `shared_ptr` to its
+   allocator in a private lifetime token;
+6. return the block to the allocator when the final Tensor/view releases Storage.
+
+```mermaid
+flowchart LR
+    Tensor[Tensor] -->|shares| Storage[mutable external Storage]
+    Views[shallow copies / views] -->|share| Storage
+    Storage -->|retains| Owner[Allocation lifetime token]
+    Owner -->|owns exact| Handle[Allocation descriptor]
+    Owner -->|retains| Allocator[shared HelixAllocator]
+    Owner -->|validated deallocate| Allocator
+```
+
+The allocator reference prevents its segments from disappearing while the Tensor
+pointer is live. All views share one Storage object, so the descriptor is returned
+exactly once. `Tensor::nbytes()` remains the logical byte count while
+`Tensor::allocated_bytes()` reports the rounded block capacity. Construction
+failure after allocation is transactional: either local cleanup or the lifetime
+token returns the handle. Destruction cannot throw; an unexpected metadata failure
+is logged, after which the retained allocator still performs non-throwing segment
+cleanup during its own destruction.
+
+The bridge does not change default `Tensor::empty`, `zeros`, `clone`, or transfer
+behavior. In particular, a clone of a pooled Tensor owns ordinary direct Storage.
+Callers must not destroy the last Tensor concurrently with unsynchronized access to
+its data; allocator metadata itself remains protected by the allocator mutex.
+Supplying a CUDA resource is rejected before an upstream allocation because this
+simple owner has no stream-use ledger or release event.
 
 ## Coalescing and explicit release
 
@@ -217,6 +262,15 @@ vector rebuild, and active-map update. Reusing a 1 MiB block was lower latency t
 repeated aligned host allocation. The default 64 MiB segment also over-reserved
 the small mixed trace. These are useful design observations, not CUDA claims.
 
+The allocator-backed Tensor follow-up measures the complete pre-warmed Tensor
+allocation/destruction ownership path. Median CPU time was 238 ns versus 117 ns
+direct for one Float32 element, 239 ns versus 117 ns for 1,024 elements, and 239 ns
+versus 459 ns direct for 1,048,576 elements (4 MiB logical). Thus the bridge was
+about 2.04x slower for the two small cases but 47.9% lower latency for the large
+case. It retained one 64 MiB default segment. Payload bytes were not touched and no
+bandwidth counter is reported. The result supports an opt-in host policy; it does
+not predict native CUDA behavior.
+
 CUDA builds contain fixed and mixed-trace comparisons between direct
 `cudaMalloc/cudaFree` and `HelixAllocator(CudaMemoryResource)`. They time the full
 host allocation workload with Google Benchmark real time; CUDA events are not used
@@ -227,7 +281,8 @@ published result.
 ## Current limitations
 
 - CUDA event-backed reclamation is not hardware-validated,
-- Tensor storage has no record-stream/use-tracking integration,
+- CPU Tensor pooling is opt-in and not wired into model/runtime allocations,
+- CUDA Tensor storage has no record-stream/use-tracking integration,
 - correctness across multiple use streams depends on an explicit caller-created
   dependency chain into the release stream,
 - CUDA runtime correctness and allocation latency unvalidated,

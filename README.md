@@ -28,6 +28,10 @@ cache decoding exactly; this is not broad model or tokenizer compatibility. Its
 native loader also has an opt-in, read-only POSIX memory-mapped path with shared
 mapping lifetime and enforced immutable Tensor views; the portable copied loader
 remains available.
+An independent opt-in CPU storage bridge now gives allocator-backed Tensors RAII
+ownership: every shallow copy/view retains the exact pool allocation and the
+allocator itself until the last shared Storage handle expires. CUDA pooling remains
+gated on complete stream-use tracking.
 M22 now includes the measured block-aligned sharing primitive, a bounded exact-
 content prefix index, persistent LRU anchors, and opt-in reuse in the CPU runtime.
 The repository
@@ -43,7 +47,7 @@ weight format, performs greedy generation through a contiguous KV cache, and
 executes scheduler batches against a shared paged KV pool with optional prompt-
 prefix reuse. On
 2026-08-24, Apple Clang 17 built the project on macOS arm64 with warnings as
-errors; 177/177 CPU tests passed in Debug, Release, and ASan/UBSan configurations.
+errors; 184/184 CPU tests passed in Debug, Release, and ASan/UBSan configurations.
 
 CUDA is optional at configure time. The current Apple Silicon development host has
 no NVIDIA GPU or native CUDA toolkit, so no CUDA execution or performance claim is
@@ -53,8 +57,8 @@ compile-validated in an ARM64 CUDA 12.6 development container without a
 driver/device. The M8 stream-ordered allocator and M9 block-reduced RMSNorm,
 grid-stride SwiGLU, adjacent-pair RoPE, and projection adapter are also
 compile-validated, as is the M10 three-stage contiguous attention baseline. None is
-runtime-validated on a GPU. The CUDA-on build passes 176 C++ hardware-independent
-tests and explicitly skips 57 GPU tests without a driver/device (233 registered
+runtime-validated on a GPU. The CUDA-on build passes 183 hardware-independent
+tests and explicitly skips 57 GPU tests without a driver/device (240 registered
 tests total). Its container lacks Python/NumPy, so the separate converter
 integration test is not registered there; it passes in all three native CPU
 configurations.
@@ -137,7 +141,7 @@ cmake --build build --target format-check
 Helix targets. `HELIX_BUILD_TOOLS=OFF` omits the model pack/inspection utilities;
 it does not affect the runtime libraries. The one Python converter integration
 test auto-registers only when the selected Python 3 interpreter can import NumPy;
-otherwise the 176-test C++/benchmark suite remains available.
+otherwise the 183-test C++/benchmark suite remains available.
 
 ## Benchmarks
 
@@ -178,6 +182,14 @@ mapped median CPU time was 20.96%, 15.14%, and 12.78% lower. File generation is
 outside timing and each path is warmed once; these are not cold-disk, RSS, model-
 execution, or GPU results.
 
+The allocator-backed CPU Tensor bridge retains a direct `Tensor::empty` baseline.
+In a pre-warmed allocation/destruction fixture, its median CPU time was 238 ns
+versus 117 ns direct for one Float32 value and 239 ns versus 117 ns for 1,024
+values, but 239 ns versus 459 ns direct for 1,048,576 values (4 MiB logical
+storage). The first two cases are about 2.04x slower; the large case is 47.9% lower
+latency. The pool retained one default 64 MiB segment. These host results motivate
+an opt-in policy and do not predict `cudaMalloc` behavior.
+
 A separate M22 fixture compares copying an already-computed aligned prefix into a
 new sequence with aliasing its physical page table. Across 32 KiB, 93,240 B, and
 1 MiB prefixes, shared lifecycle medians were 11.02x, 34.08x, and 320.67x faster
@@ -201,10 +213,11 @@ signed 64-bit shape and canonical row-major strides, dtype, device, logical byte
 storage bytes, and byte offset. Size multiplication is checked before allocation.
 `reshape`/`view` share storage only when safe; `clone` and same-device `to` create
 independent storage. CPU storage may also wrap an externally owned, aligned,
-read-only buffer with an explicit shared lifetime token. Views preserve
-immutability, mutable pointer access and in-place operations fail, and `clone`
-produces ordinary writable storage. Float32 is executable, while Float16 currently
-supports only metadata, allocation, zeroing, and bytewise copy.
+read-only or mutable buffer with an explicit shared lifetime token. Read-only views
+preserve immutability, mutable pointer access and in-place operations fail, and
+`clone` produces ordinary writable storage. Mutable external storage reports its
+full capacity separately from logical Tensor bytes. Float32 is executable, while
+Float16 currently supports only metadata, allocation, zeroing, and bytewise copy.
 
 ```bash
 cmake --build build --target helix_tensor_demo
@@ -237,13 +250,20 @@ trimming, and internal/external fragmentation statistics. `DeferredAllocator`
 keeps logically freed allocations active until a completion object reports ready;
 `StreamOrderedAllocator` implements that completion with timing-disabled CUDA
 events recorded on an explicit release stream. The allocator/deferred metadata
-passes 18 focused CPU and sanitizer tests. CUDA adapters and native-CUDA comparison
-fixtures compile, but have not run on a GPU.
+plus the CPU Tensor ownership bridge pass 21 focused CPU and sanitizer tests. CUDA
+adapters and native-CUDA comparison fixtures compile, but have not run on a GPU.
 
-The allocator is not yet used by Tensor CUDA storage. Tensor does not yet record
-every stream that uses its storage, so it cannot prove that a chosen release event
-orders after all outstanding work. Design, measured host baselines, stream-ordering
-contract, and limitations are in
+`allocate_cpu_tensor` is an explicit pooled factory. It stores the rounded block
+capacity in `Tensor::allocated_bytes()`, retains a shared allocator plus the exact
+generation-tagged handle, and returns the block only after the final Tensor/view
+releases Storage. Zero-sized tensors create no pool allocation, and invalid shape,
+alignment, OOM, or device requests leave no active handle. Default CPU Tensor
+factories and deep clones continue to use direct Storage allocation.
+
+Allocator-backed CUDA Tensor storage remains unavailable. Tensor does not yet
+record every stream that uses its storage, so it cannot prove that a chosen release
+event orders after all outstanding work. Design, measured host baselines, stream-
+ordering contract, and limitations are in
 [`docs/MEMORY_ALLOCATOR.md`](docs/MEMORY_ALLOCATOR.md).
 
 ## Attention
@@ -481,8 +501,9 @@ validation/roadmap work. CPU prefix reuse is exact-content, block-aligned, bound
 and opt-in; it stores only one maximum reusable prefix per completed prompt, uses
 an engine-local namespace, and does not cache next-token logits or run on the GPU.
 Partial-page sharing, model-global cache namespaces, and request preemption remain
-future work. Tensor
-allocator integration is also pending. Float16 has no arithmetic path yet. Tensor
+future work. CPU Tensor allocator ownership is opt-in and is not wired into the
+runtime; CUDA Tensor pooling remains pending complete stream-use tracking. Float16
+has no arithmetic path yet. Tensor
 execution is contiguous-only; broadcasting, slicing, and general strided kernels are intentionally
 deferred. The mapped model path is POSIX/little-endian/IEEE-754 only, requires the
 source inode not be modified while a model lives, and has no cold-storage or RSS

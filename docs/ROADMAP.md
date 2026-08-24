@@ -237,8 +237,26 @@ benchmarks also compile, but have not run. CPU-resource baselines were executed 
 honestly show workload-dependent overhead/reuse behavior in
 `docs/PERFORMANCE.md`; they are not CUDA evidence. The broader randomized,
 small/large-heavy, bursty, and LLM-shaped GPU study remains pending. Immediate
-reuse is deliberately not integrated into Tensor storage because stream safety is
-an M8 correctness dependency. See `docs/MEMORY_ALLOCATOR.md`.
+CUDA reuse is deliberately not integrated into Tensor storage because stream
+safety is an M8 correctness dependency. See `docs/MEMORY_ALLOCATOR.md`.
+
+CPU Tensor-ownership follow-up (2026-08-24, commit `4f6fc7f`): mutable external
+Storage now validates pointer/capacity/alignment/owner invariants, and the opt-in
+`allocate_cpu_tensor` bridge retains both a shared allocator and exact allocation
+descriptor until the final Tensor/view releases Storage. Logical and rounded bytes
+remain distinct; zero work bypasses the pool; invalid shape/alignment/device/OOM
+requests create no active handle; and CUDA resources are rejected before upstream
+allocation. Three bridge tests plus three mutable Storage/Tensor tests cover reuse,
+view and allocator lifetime, overflow, capacity, alignment, and failure
+transactionality. Debug, Release, and ASan/UBSan suites pass 184/184; a CUDA 12.6
+warnings-as-errors build passes 183 hardware-independent tests and skips 57 GPU
+tests (240 total) without a driver/device.
+
+A paired pre-warmed host Tensor lifecycle benchmark retains the direct factory.
+The bridge was about 2.04x slower for one and 1,024 Float32 elements, but its 239 ns
+median was 47.9% below the 459 ns direct median for 1,048,576 elements (4 MiB
+logical). The default pool retained 64 MiB. This is an opt-in CPU ownership result,
+not evidence about `cudaMalloc`; full methodology is in `docs/PERFORMANCE.md`.
 
 ### M8 — Implemented and CPU/compile-validated; GPU runtime validation pending
 
@@ -265,8 +283,8 @@ NVCC 12.6.85 compiles this adapter and test with warnings as errors; all 68
 hardware-independent tests pass in that build and 47 GPU tests are registered.
 There is no CUDA driver/device in the container, so the event test, GPU allocation
 latency, synchronized comparison, and `cudaMallocAsync` comparison remain pending.
-Tensor integration also remains pending a complete multi-stream use-recording
-contract; the adapter alone cannot infer outstanding work on other streams.
+CUDA Tensor integration remains pending a complete multi-stream use-recording
+contract; the event adapter alone cannot infer outstanding work on other streams.
 
 ## Phase D: transformer primitives and memory
 
@@ -613,9 +631,10 @@ of truncated, trailing, corrupted, non-finite, and missing inputs. A randomized
 paired warm-page benchmark measured 20.96%, 15.14%, and 12.78% lower median CPU
 load time across the three disclosed 117,184 B–3,153,600 B synthetic files. It is
 not a cold-disk, RSS, inference, or GPU result. Debug, Release, and ASan/UBSan
-native suites pass 177/177. The CUDA 12.6 compile container passes 176 C++ host
-tests and explicitly skips 57 GPU tests without a device (233 total); its separate
-converter integration test remains unavailable because Python/NumPy is absent.
+native suites pass 184/184. The CUDA 12.6 compile container passes 183 hardware-
+independent tests and explicitly skips 57 GPU tests without a device (240 total);
+its separate converter integration test remains unavailable because Python/NumPy
+is absent.
 
 Public-checkpoint validation follow-up (2026-08-24, commit `d433760`): a bounded
 offline validator independently parses source-layout safetensors, evaluates the

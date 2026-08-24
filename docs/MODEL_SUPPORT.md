@@ -520,12 +520,12 @@ above; tokenizer/text-prompt behavior remains untested.
 
 Validation on 2026-08-24 through generation-validation test commit `09fd7aa`:
 
-- Debug, Release, and Apple Clang ASan/UBSan CPU suites: 177/177 tests passed;
+- Debug, Release, and Apple Clang ASan/UBSan CPU suites: 184/184 tests passed;
 - all Release tests and benchmark smoke workloads passed;
 - CUDA 12.6.85/GCC 13.2 warnings-as-errors build: all targets compiled and all
-  176 C++ hardware-independent tests passed;
+  183 hardware-independent tests passed;
 - 57 GPU runtime tests remained explicitly skipped because the compile container
-  has no NVIDIA driver or device (233 registered tests total);
+  has no NVIDIA driver or device (240 registered tests total);
 - the CUDA container lacks Python/NumPy, so its converter integration test was not
   registered; that test passed in every native CPU configuration.
 

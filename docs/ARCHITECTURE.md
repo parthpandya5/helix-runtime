@@ -59,11 +59,13 @@ flowchart TB
     Attention[Attention]
     Cache[KV + Prefix Cache]
     Ops[Tensor Operations]
+    Memory[Allocator + Tensor-storage bridge]
     Tensor[Tensor + Storage]
     Backend[CPU Backend | Optional CUDA Backend]
     Core[Core: errors, logging, dtype, device, checked sizes]
 
     App --> Runtime
+    App --> Memory
     Runtime --> Model
     Runtime --> Schedule
     Runtime --> Cache
@@ -74,6 +76,8 @@ flowchart TB
     Cache --> Tensor
     Attention --> Tensor
     Ops --> Tensor
+    Memory --> Tensor
+    Memory --> Backend
     Tensor --> Backend
     Backend --> Core
     Tensor --> Core
@@ -135,7 +139,7 @@ A `Tensor` is a small handle with:
 - logical element count,
 - visible byte count,
 - byte offset into storage,
-- shared ownership of a `Storage` allocation or immutable external range.
+- shared ownership of a `Storage` allocation or aligned external range.
 
 ```mermaid
 classDiagram
@@ -166,11 +170,14 @@ classDiagram
 
 Storage owns memory or an explicit shared lifetime token; Tensor owns metadata. A
 view shares storage and changes only metadata/offset after validating bounds.
-Externally owned CPU ranges are read-only: non-const raw access and in-place
-operations reject them, views preserve the flag, and a deep clone returns ordinary
-writable owned storage. The initial implementation supports contiguous row-major
-tensors. General strided execution is deferred until kernels need it; APIs reject
-unsupported non-contiguous inputs rather than silently producing wrong results.
+Externally owned CPU ranges may be explicitly immutable or mutable. Immutable
+ranges reject non-const raw access and in-place operations, views preserve the
+flag, and a deep clone returns ordinary writable owned storage. Mutable ranges
+validate pointer/capacity/alignment/owner consistency and expose storage capacity
+separately from logical bytes. The initial implementation supports contiguous
+row-major tensors. General strided execution is deferred until kernels need it;
+APIs reject unsupported non-contiguous inputs rather than silently producing wrong
+results.
 
 ### Ownership
 
@@ -180,14 +187,22 @@ unsupported non-contiguous inputs rather than silently producing wrong results.
 - A read-only external-buffer Tensor requires a non-null shared lifetime owner for
   non-empty storage, validates its declared alignment, and never exposes a mutable
   pointer. The owner—not Tensor—defines how the backing resource is released.
+- A mutable external-buffer Tensor applies the same pointer, owner, and alignment
+  checks and additionally requires backing capacity to cover checked logical bytes.
+- `memory::allocate_cpu_tensor` wraps one generation-tagged `HelixAllocator`
+  handle in such mutable Storage. The lifetime token retains the allocator, views
+  retain Storage, and the final release returns the block to the cache exactly once.
+  Zero-sized tensors bypass the pool. This bridge is opt-in; ordinary factories and
+  deep clones retain direct Storage allocation.
 - Copies are shallow handle copies. `clone` performs a deep copy.
 - Device transfer returns new storage on the target device.
 
 ## Device abstraction and backends
 
-Backend-neutral code dispatches using the tensor's `DeviceType`. CPU storage uses
-aligned host allocation. CUDA storage eventually uses the active allocator rather
-than direct `cudaMalloc` per tensor.
+Backend-neutral code dispatches using the tensor's `DeviceType`. Default CPU
+storage uses aligned host allocation; clients may opt into the CPU allocator bridge
+at an explicit ownership boundary. CUDA storage eventually uses the active
+stream-aware allocator rather than direct `cudaMalloc` per tensor.
 
 ```mermaid
 flowchart LR
@@ -293,10 +308,17 @@ explicit same-device release stream. Reclamation is nonblocking when polling and
 blocking during explicit drain/destruction. This adapter is compile-validated, not
 GPU-runtime-validated.
 
-Tensor storage is not wired into the cache yet. A release event is safe only when
+The CPU-only `allocate_cpu_tensor` bridge connects mutable Tensor Storage to the
+base pool without asynchronous work. Its shared lifetime token owns the exact
+allocation descriptor and a `shared_ptr` to the allocator; the final Storage owner
+returns the block, while allocator segments remain cached until explicit trim or
+allocator destruction. Cleanup errors are logged from a non-throwing destructor.
+
+CUDA Tensor storage is not wired into the cache. A release event is safe only when
 all prior uses happen-before that event. Tensor currently has no per-storage stream
-ledger and therefore cannot construct the required dependency chain for
-multi-stream use automatically. CPU completion tests are not presented as proof of
+ledger and therefore cannot construct the required dependency chain for multi-
+stream use automatically. `allocate_cpu_tensor` rejects a CUDA resource before any
+upstream allocation. CPU ownership/completion tests are not presented as proof of
 CUDA event behavior.
 
 ## Attention
