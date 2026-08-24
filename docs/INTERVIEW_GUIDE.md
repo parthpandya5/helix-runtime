@@ -126,7 +126,9 @@ points and cross-stream dependencies. Helix wraps streams/events in move-only RA
 checks device matching and CUDA errors, and times GPU work with same-stream events
 rather than host launch duration. Its `PinnedHostBuffer` makes the host side
 eligible for genuine asynchronous transfer; pageable host pointers remain a valid
-copy path but generally cannot establish the same overlap behavior.
+copy path but generally cannot establish the same overlap behavior. Helix retains
+a one-stream H2D/SiLU/D2H baseline beside a double-buffered event graph; neither is
+called faster until both execute on disclosed hardware.
 
 ## Explain global memory versus shared memory versus registers
 

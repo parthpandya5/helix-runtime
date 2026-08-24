@@ -34,8 +34,9 @@ allocator itself until the last shared Storage handle expires. CUDA builds also
 provide an opt-in single-stream bridge whose final Storage owner records a release
 event; automatic arbitrary multi-stream use tracking remains pending.
 The CUDA runtime also has move-only portable pinned-host storage plus
-pageable-versus-pinned event-timed copy fixtures. They are compile-validated only
-and do not establish transfer overlap.
+pageable-versus-pinned copy fixtures and a retained sequential-versus-double-
+buffered H2D/SiLU/D2H experiment. They are compile-validated only and do not
+establish transfer overlap.
 M22 now includes the measured block-aligned sharing primitive, a bounded exact-
 content prefix index, persistent LRU anchors, and opt-in reuse in the CPU runtime.
 The repository
@@ -62,8 +63,8 @@ driver/device. The M8 stream-ordered allocator and M9 block-reduced RMSNorm,
 grid-stride SwiGLU, adjacent-pair RoPE, and projection adapter are also
 compile-validated, as are the M10 contiguous and M13 paged three-stage attention
 baselines. None is runtime-validated on a GPU. The CUDA-on build passes 185
-hardware-independent tests and explicitly skips 65 GPU tests without a
-driver/device (250 registered tests total). Its container lacks Python/NumPy, so
+hardware-independent tests and explicitly skips 66 GPU tests without a
+driver/device (251 registered tests total). Its container lacks Python/NumPy, so
 the separate converter integration test is not registered there; it passes in all
 three native CPU configurations.
 

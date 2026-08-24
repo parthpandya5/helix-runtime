@@ -457,7 +457,7 @@ cost? It does not measure asynchronous throughput, a multi-stream allocator, or
 payload bandwidth. The fixture has not executed here, so there is no result row or
 optimization claim.
 
-## M20 pageable-versus-pinned transfer gate — pending NVIDIA hardware
+## M20 transfer and overlap gates — pending NVIDIA hardware
 
 CUDA builds register event-timed H2D and D2H copies from both ordinary pageable
 host vectors and move-only `PinnedHostBuffer` storage. Each direction covers 4
@@ -466,7 +466,7 @@ initializes host/device buffers outside measurement. Each measured iteration
 records start/stop events on the transfer stream, enqueues one copy, waits for the
 stop event, and reports only same-stream transfer duration plus bytes processed.
 The host API call's blocking/enqueue cost is not included; it must be measured
-separately in a future overlap experiment.
+separately before drawing host-overhead conclusions.
 
 ```bash
 ./build-cuda/benchmarks/helix_benchmarks \
@@ -478,6 +478,33 @@ separately in a future overlap experiment.
 Pinned memory is a prerequisite, not evidence that overlap occurs. No fixture ran
 without an NVIDIA device, so Helix currently makes no transfer-bandwidth,
 pageable-versus-pinned, or concurrency claim.
+
+The paired M20 pipeline uses the same eight chunks, two device input/output slots,
+pinned host input/output, and custom Float32 SiLU kernel in both modes. `Sequential`
+places H2D, SiLU, and D2H for every chunk on one nonblocking stream.
+`DoubleBuffered` alternates two transfer streams, gates one serialized compute
+stream with input-ready events, gates each D2H with a compute-ready event, and
+joins the final slot-done events on a coordinator stream. Start and stop timing
+events bracket that complete cross-stream dependency graph, so manual time is the
+GPU timeline for all transfers, kernels, and waits—not host launch duration.
+
+Cases use eight chunks of 16,384, 262,144, or 1,048,576 Float32 elements. Device
+and pinned allocations, deterministic input generation, and a CPU SiLU oracle are
+outside timing; ten full pipelines warm each mode, and output is checked before
+and after measurement. Counters expose transfer bytes, chunk geometry, async copy-
+engine count, and the device overlap capability. The sequential path remains in
+the binary regardless of any future outcome.
+
+```bash
+./build-cuda/benchmarks/helix_benchmarks \
+  --benchmark_filter='BM_CudaSiluTransferPipeline/(Sequential|DoubleBuffered)' \
+  --benchmark_repetitions=15 \
+  --benchmark_enable_random_interleaving=true
+```
+
+This experiment is compile-validated only. Helix does not claim that the event
+graph overlaps on a particular device, or that overlap improves latency, until
+both variants run under the disclosed methodology.
 
 ## M9 CPU transformer-primitive baseline — 2026-08-20
 

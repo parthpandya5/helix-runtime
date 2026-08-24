@@ -9,7 +9,7 @@ sanitizer-validated, and benchmarked**. Ten focused attention tests and the full
 and paged CUDA baselines, eight attention GPU tests, and CUDA-event benchmark
 fixtures compile with NVCC 12.6.85 and warnings as errors, but have not run without
 an NVIDIA driver/device. The CUDA-on build passes 185 hardware-independent tests
-and explicitly skips 65 hardware-gated GPU tests (250 total); the Python converter
+and explicitly skips 66 hardware-gated GPU tests (251 total); the Python converter
 test is unavailable in that container. No GPU correctness or performance claim is
 made.
 

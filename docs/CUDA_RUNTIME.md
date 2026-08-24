@@ -10,7 +10,7 @@ built and then skipped because the container had no NVIDIA driver/device.
 
 As later subsystems were added, the macOS CPU-only Debug, Release, and ASan/UBSan
 configurations reached 186 passing tests. The current CUDA-on build passes 185
-hardware-independent tests and registers 65 GPU tests (250 total), all skipped
+hardware-independent tests and registers 66 GPU tests (251 total), all skipped
 without a device; its container omits the separate Python converter test. CUDA
 correctness, resource-leak, and timing behavior remains pending a physical NVIDIA
 GPU.
@@ -52,6 +52,12 @@ synchronization. `elapsed_time_ms` rejects events created with
 `cudaEventDisableTiming`, requires both events on one device, and delegates timing
 to `cudaEventElapsedTime`. Callers must record events around warmed-up work on the
 same stream when producing benchmark results.
+
+The M20 double-buffered experiment exercises cross-stream waits explicitly: two
+transfer streams publish input-ready events to one compute stream, then wait on
+compute-ready events before D2H. A coordinator joins both final slot events before
+recording the timing stop. Its odd-size test and benchmark graph are compile-
+validated only; no concurrency result is inferred.
 
 Moved-from stream/event handles are explicitly rejected rather than accidentally
 being interpreted as CUDA's default stream or an invalid runtime handle.

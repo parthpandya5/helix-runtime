@@ -28,6 +28,7 @@ if(HELIX_ENABLE_CUDA)
       cuda_elementwise_benchmarks.cpp
       cuda_allocator_benchmarks.cpp
       cuda_matmul_benchmarks.cpp
+      cuda_overlap_benchmarks.cpp
       cuda_reduction_benchmarks.cpp
       cuda_transfer_benchmarks.cpp
       cuda_transformer_benchmarks.cpp)

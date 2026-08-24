@@ -241,6 +241,28 @@ the toolkit. Pinned buffers have explicit transfer-completion lifetime and are a
 prerequisite for testing actual host/device overlap; their presence alone is not
 an overlap claim.
 
+The M20 experiment makes the intended dependency graph concrete without wiring it
+into the runtime: two transfer streams alternate two device slots, one compute
+stream waits on input-ready events, transfer work waits on compute-ready events,
+and a coordinator joins final slot events for cross-stream timing. The one-stream
+baseline is retained, and only real measurements can justify adopting the graph.
+
+```mermaid
+flowchart LR
+    H0[Host chunk N] -->|H2D| T0[Transfer stream / slot 0]
+    H1[Host chunk N+1] -->|H2D| T1[Transfer stream / slot 1]
+    T0 --> I0[input-ready event]
+    T1 --> I1[input-ready event]
+    I0 --> C[Serialized compute stream / SiLU]
+    I1 --> C
+    C --> R0[compute-ready event / slot 0]
+    C --> R1[compute-ready event / slot 1]
+    R0 -->|D2H on T0| D0[Host output N]
+    R1 -->|D2H on T1| D1[Host output N+1]
+    D0 --> J[Coordinator waits on final slot events]
+    D1 --> J
+```
+
 ### Kernel progression
 
 Educational kernels remain separately selectable and benchmarkable:

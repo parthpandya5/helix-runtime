@@ -1,12 +1,15 @@
 #include "helix/kernels/cpu/reference.hpp"
 #include "helix/kernels/cuda/elementwise.hpp"
 #include "helix/runtime/cuda/device.hpp"
+#include "helix/runtime/cuda/event.hpp"
+#include "helix/runtime/cuda/memory.hpp"
 
 #include <array>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <gtest/gtest.h>
+#include <span>
 
 namespace helix::cuda::kernels {
 namespace {
@@ -127,6 +130,70 @@ TEST_F(CudaElementwiseContractTest, RejectsShapeAndDTypeMismatches) {
 
   EXPECT_THROW(add_out(lhs, wrong_shape, output, stream), Error);
   EXPECT_THROW(relu_out(half, output, stream), Error);
+}
+
+TEST_F(CudaElementwiseContractTest, DoubleBufferedPinnedPipelineHonorsEventDependencies) {
+  constexpr std::size_t kChunkCount = 5;
+  constexpr Dimension kElementsPerChunk = 257;
+  constexpr std::size_t kChunkElements = static_cast<std::size_t>(kElementsPerChunk);
+  constexpr std::size_t kChunkBytes = kChunkElements * sizeof(float);
+  constexpr std::size_t kTotalElements = kChunkCount * kChunkElements;
+  constexpr std::size_t kTotalBytes = kTotalElements * sizeof(float);
+  PinnedHostBuffer host_input(kTotalBytes);
+  PinnedHostBuffer host_output(kTotalBytes);
+  auto* input_values = static_cast<float*>(host_input.data());
+  for (std::size_t index = 0; index < kTotalElements; ++index) {
+    input_values[index] = static_cast<float>(static_cast<int>(index % 257U) - 128) / 16.0F;
+  }
+  const Tensor expected =
+      cpu::silu(Tensor::from_values({static_cast<Dimension>(kTotalElements)},
+                                    std::span<const float>(input_values, kTotalElements)));
+
+  std::array<Tensor, 2> device_input{
+      Tensor::empty({kElementsPerChunk}, DType::kFloat32, Device::cuda(0)),
+      Tensor::empty({kElementsPerChunk}, DType::kFloat32, Device::cuda(0))};
+  std::array<Tensor, 2> device_output{
+      Tensor::empty({kElementsPerChunk}, DType::kFloat32, Device::cuda(0)),
+      Tensor::empty({kElementsPerChunk}, DType::kFloat32, Device::cuda(0))};
+  std::array<Stream, 2> transfer_streams;
+  Stream compute_stream;
+  Stream completion_stream;
+  Event start(cudaEventDisableTiming);
+  std::array<Event, 2> input_ready{Event(cudaEventDisableTiming), Event(cudaEventDisableTiming)};
+  std::array<Event, 2> compute_ready{Event(cudaEventDisableTiming), Event(cudaEventDisableTiming)};
+  std::array<Event, 2> slot_done{Event(cudaEventDisableTiming), Event(cudaEventDisableTiming)};
+
+  start.record(completion_stream);
+  for (Stream& stream : transfer_streams) {
+    stream.wait(start);
+  }
+  for (std::size_t chunk = 0; chunk < kChunkCount; ++chunk) {
+    const std::size_t slot = chunk % device_input.size();
+    const std::size_t byte_offset = chunk * kChunkBytes;
+    copy_host_to_device_async(
+        device_input[slot].data(),
+        static_cast<const void*>(static_cast<const std::byte*>(host_input.data()) + byte_offset),
+        kChunkBytes, transfer_streams[slot]);
+    input_ready[slot].record(transfer_streams[slot]);
+    compute_stream.wait(input_ready[slot]);
+    silu_out(device_input[slot], device_output[slot], compute_stream);
+    compute_ready[slot].record(compute_stream);
+    transfer_streams[slot].wait(compute_ready[slot]);
+    copy_device_to_host_async(
+        static_cast<void*>(static_cast<std::byte*>(host_output.data()) + byte_offset),
+        device_output[slot].data(), kChunkBytes, transfer_streams[slot]);
+    slot_done[slot].record(transfer_streams[slot]);
+  }
+  for (const Event& event : slot_done) {
+    completion_stream.wait(event);
+  }
+  completion_stream.synchronize();
+
+  const auto* actual = static_cast<const float*>(host_output.data());
+  const auto* reference = expected.data_as<float>();
+  for (std::size_t index = 0; index < kTotalElements; ++index) {
+    EXPECT_NEAR(actual[index], reference[index], 2.0e-6F) << "at index " << index;
+  }
 }
 
 } // namespace

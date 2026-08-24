@@ -318,7 +318,7 @@ allocator/generation-tagged handle identity, eliminating cross-pool ID collision
 Direct and pooled Tensor lifecycle benchmarks perform ten warmups and compare
 complete host lifecycle cost at 1, 1,024, and 1,048,576 Float32 elements. NVCC
 12.6.85 compiles all paths with warnings as errors; the CUDA suite passes 185 host
-tests and registers 65 GPU tests (250 total), all skipped without a driver/device.
+tests and registers 66 GPU tests (251 total), all skipped without a driver/device.
 No lifecycle latency or event-correctness result is claimed.
 
 CUDA Toolkit 11.2+ builds now also register a default-pool
@@ -518,7 +518,7 @@ workspace.
 
 NVCC 12.6.85 compiled the implementation, tests, and benchmarks with line
 information and warnings as errors. The CUDA-on suite passes 185 host tests and
-registers 65 GPU tests (250 total), all correctly skipped without a driver/device.
+registers 66 GPU tests (251 total), all correctly skipped without a driver/device.
 Static `sm_52` inspection reports 31/29 registers per thread for the paged
 score/value kernels with no shared/local memory or spills. These are compiler facts,
 not execution evidence. Runtime correctness, event timing, coalescing/occupancy
@@ -839,7 +839,7 @@ warnings as errors; no report was collected without NVIDIA hardware. Full usage
 and the rule excluding profiler-perturbed timings from benchmark claims are in
 `docs/PERFORMANCE.md`.
 
-### M20 — Pinned-transfer foundation compile-validated; overlap experiment pending
+### M20 — Transfer/overlap experiment compile-validated; measurement pending
 
 `cuda::PinnedHostBuffer` now provides move-only RAII around portable page-locked
 host memory, including zero-size and non-throwing cleanup semantics. One
@@ -848,12 +848,20 @@ trip on one nonblocking stream. Pageable-versus-pinned H2D and D2H fixtures cove
 4 KiB, 1 MiB, and 16 MiB, perform ten warmups, and use same-stream CUDA events for
 transfer duration. Host allocation and initialization are outside timing.
 
+The paired overlap fixture retains one exact eight-chunk pinned H2D → custom SiLU
+→ pinned D2H workload. Its baseline submits every operation to one stream. Its
+double-buffered variant alternates two device slots and two transfer streams, uses
+a serialized compute stream, and connects input-ready, compute-ready, slot-done,
+and common timing boundaries with CUDA events. A five-chunk, 257-element odd-size
+test compares the complete pipelined output with the CPU SiLU oracle. Benchmark
+cases use 16,384, 262,144, and 1,048,576 elements per chunk, run ten warmups, and
+self-check output before and after timing.
+
 CUDA 12.6.85 compiles the runtime, test, and benchmark with warnings as errors.
-The CUDA suite passes 185 host tests and registers 65 GPU tests (250 total), all
+The CUDA suite passes 185 host tests and registers 66 GPU tests (251 total), all
 skipped without a driver/device. Therefore neither pinned-copy bandwidth nor
-host/device overlap is validated. The next gate is a bounded two-stream workload
-with explicit event dependencies and paired sequential/overlapped measurement;
-only a measured improvement may become the default.
+host/device overlap is validated. Only a measured improvement on disclosed
+hardware may make the more complex pipeline a runtime default.
 
 ### M21 — Kernel fusion — Optional
 
