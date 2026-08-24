@@ -33,6 +33,9 @@ ownership: every shallow copy/view retains the exact pool allocation and the
 allocator itself until the last shared Storage handle expires. CUDA builds also
 provide an opt-in single-stream bridge whose final Storage owner records a release
 event; automatic arbitrary multi-stream use tracking remains pending.
+The CUDA runtime also has move-only portable pinned-host storage plus
+pageable-versus-pinned event-timed copy fixtures. They are compile-validated only
+and do not establish transfer overlap.
 M22 now includes the measured block-aligned sharing primitive, a bounded exact-
 content prefix index, persistent LRU anchors, and opt-in reuse in the CPU runtime.
 The repository
@@ -59,8 +62,8 @@ driver/device. The M8 stream-ordered allocator and M9 block-reduced RMSNorm,
 grid-stride SwiGLU, adjacent-pair RoPE, and projection adapter are also
 compile-validated, as are the M10 contiguous and M13 paged three-stage attention
 baselines. None is runtime-validated on a GPU. The CUDA-on build passes 185
-hardware-independent tests and explicitly skips 64 GPU tests without a
-driver/device (249 registered tests total). Its container lacks Python/NumPy, so
+hardware-independent tests and explicitly skips 65 GPU tests without a
+driver/device (250 registered tests total). Its container lacks Python/NumPy, so
 the separate converter integration test is not registered there; it passes in all
 three native CPU configurations.
 
@@ -117,9 +120,9 @@ cmake --build build-cuda -j
 ctest --test-dir build-cuda --output-on-failure
 ```
 
-The CUDA-on build contains checked device, stream, event, allocation, copy, and
-Tensor-storage paths, manual elementwise kernels, CUDA-event benchmarks, and
-hardware-gated correctness tests. Reduction includes naive, shared-memory, and
+The CUDA-on build contains checked device, stream, event, allocation, portable
+pinned-host buffer, copy, and Tensor-storage paths, manual elementwise kernels,
+CUDA-event benchmarks, and hardware-gated correctness tests. Reduction includes naive, shared-memory, and
 warp-shuffle paths; softmax includes naive and shared-memory paths; SGEMM includes
 one-output-per-thread and 16x16 tiled paths. Transformer primitives add custom
 RMSNorm, SwiGLU, and RoPE kernels while projection delegates to the selectable
@@ -551,7 +554,8 @@ an engine-local namespace, and does not cache next-token logits or run on the GP
 Partial-page sharing, model-global cache namespaces, and request preemption remain
 future work. CPU and single-stream CUDA Tensor allocator ownership are opt-in and
 not wired into the runtime; arbitrary multi-stream pooling remains pending use
-tracking. Float16 has no arithmetic path yet. Tensor
+tracking. Pinned host buffers allocate directly and no copy/compute overlap has
+been hardware-measured. Float16 has no arithmetic path yet. Tensor
 execution is contiguous-only; broadcasting, slicing, and general strided kernels are intentionally
 deferred. The mapped model path is POSIX/little-endian/IEEE-754 only, requires the
 source inode not be modified while a model lives, and has no cold-storage or RSS

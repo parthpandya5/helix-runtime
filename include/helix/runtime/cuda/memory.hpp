@@ -57,4 +57,34 @@ private:
   int device_index_{-1};
 };
 
+// Move-only page-locked host storage for genuinely asynchronous transfers.
+// Allocation is portable across CUDA contexts; callers must still keep the
+// buffer alive until every queued transfer using it has completed.
+class PinnedHostBuffer final {
+public:
+  explicit PinnedHostBuffer(std::size_t size_bytes);
+  ~PinnedHostBuffer();
+
+  PinnedHostBuffer(const PinnedHostBuffer&) = delete;
+  PinnedHostBuffer& operator=(const PinnedHostBuffer&) = delete;
+  PinnedHostBuffer(PinnedHostBuffer&& other) noexcept;
+  PinnedHostBuffer& operator=(PinnedHostBuffer&& other) noexcept;
+
+  [[nodiscard]] void* data() noexcept {
+    return pointer_;
+  }
+  [[nodiscard]] const void* data() const noexcept {
+    return pointer_;
+  }
+  [[nodiscard]] std::size_t size_bytes() const noexcept {
+    return size_bytes_;
+  }
+
+private:
+  void destroy() noexcept;
+
+  void* pointer_{nullptr};
+  std::size_t size_bytes_{0};
+};
+
 } // namespace helix::cuda

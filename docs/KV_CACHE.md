@@ -387,8 +387,8 @@ destructor reclamation, and concurrent lookup/fork/release lifecycles. Runtime
 tests compare reused-suffix output with full recomputation, verify cancellation
 ownership, and force anchor eviction in a three-page pool. The complete native
 Debug, Release, and ASan/UBSan suites pass 186/186. The CUDA-on compile-validation
-suite passes 185 hardware-independent tests and explicitly skips 64 GPU tests
-without a device (249 total); its missing Python/NumPy omits the separate converter
+suite passes 185 hardware-independent tests and explicitly skips 65 GPU tests
+without a device (250 total); its missing Python/NumPy omits the separate converter
 integration test.
 
 ## Direct block-table attention lease

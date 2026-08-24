@@ -457,6 +457,28 @@ cost? It does not measure asynchronous throughput, a multi-stream allocator, or
 payload bandwidth. The fixture has not executed here, so there is no result row or
 optimization claim.
 
+## M20 pageable-versus-pinned transfer gate — pending NVIDIA hardware
+
+CUDA builds register event-timed H2D and D2H copies from both ordinary pageable
+host vectors and move-only `PinnedHostBuffer` storage. Each direction covers 4
+KiB, 1 MiB, and 16 MiB, performs ten untimed warmup copies, and preallocates and
+initializes host/device buffers outside measurement. Each measured iteration
+records start/stop events on the transfer stream, enqueues one copy, waits for the
+stop event, and reports only same-stream transfer duration plus bytes processed.
+The host API call's blocking/enqueue cost is not included; it must be measured
+separately in a future overlap experiment.
+
+```bash
+./build-cuda/benchmarks/helix_benchmarks \
+  --benchmark_filter='BM_Cuda(HostToDevice|DeviceToHost)Transfer/(Pageable|Pinned)' \
+  --benchmark_repetitions=15 \
+  --benchmark_enable_random_interleaving=true
+```
+
+Pinned memory is a prerequisite, not evidence that overlap occurs. No fixture ran
+without an NVIDIA device, so Helix currently makes no transfer-bandwidth,
+pageable-versus-pinned, or concurrency claim.
+
 ## M9 CPU transformer-primitive baseline — 2026-08-20
 
 Environment:

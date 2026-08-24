@@ -233,10 +233,13 @@ and bias-free linear projection.
 
 ### Runtime layer
 
-The CUDA layer wraps device selection, streams, events, allocations, copies, and
-synchronization in move-only RAII types. Every CUDA API call produces contextual
-errors. Public headers either avoid CUDA types or hide them behind backend-specific
-headers so CPU clients do not require the toolkit.
+The CUDA layer wraps device selection, streams, events, device allocations,
+portable pinned-host buffers, copies, and synchronization in move-only RAII types.
+Every CUDA API call produces contextual errors. Public headers either avoid CUDA
+types or hide them behind backend-specific headers so CPU clients do not require
+the toolkit. Pinned buffers have explicit transfer-completion lifetime and are a
+prerequisite for testing actual host/device overlap; their presence alone is not
+an overlap claim.
 
 ### Kernel progression
 

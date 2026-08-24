@@ -124,7 +124,9 @@ issue order; different streams may overlap when dependencies and hardware permit
 Host launch return is normally asynchronous. Events create observable completion
 points and cross-stream dependencies. Helix wraps streams/events in move-only RAII,
 checks device matching and CUDA errors, and times GPU work with same-stream events
-rather than host launch duration.
+rather than host launch duration. Its `PinnedHostBuffer` makes the host side
+eligible for genuine asynchronous transfer; pageable host pointers remain a valid
+copy path but generally cannot establish the same overlap behavior.
 
 ## Explain global memory versus shared memory versus registers
 

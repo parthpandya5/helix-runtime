@@ -4,14 +4,21 @@
 #include "helix/runtime/cuda/stream.hpp"
 #include "helix/tensor/tensor.hpp"
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <gtest/gtest.h>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
 namespace helix::cuda {
 namespace {
+
+static_assert(!std::is_copy_constructible_v<PinnedHostBuffer>);
+static_assert(!std::is_copy_assignable_v<PinnedHostBuffer>);
+static_assert(std::is_nothrow_move_constructible_v<PinnedHostBuffer>);
+static_assert(std::is_nothrow_move_assignable_v<PinnedHostBuffer>);
 
 class CudaRuntimeTest : public ::testing::Test {
 protected:
@@ -83,6 +90,44 @@ TEST_F(CudaRuntimeTest, StreamAndEventsOrderAsynchronousCopies) {
   EXPECT_TRUE(stop.query());
   EXPECT_EQ(destination, source);
   EXPECT_GE(elapsed_time_ms(start, stop), 0.0F);
+}
+
+TEST_F(CudaRuntimeTest, PinnedHostBufferMovesAndCompletesOddSizedAsyncRoundTrip) {
+  constexpr std::size_t kBytes = 4099;
+  PinnedHostBuffer source(kBytes);
+  PinnedHostBuffer destination(kBytes);
+  ASSERT_NE(source.data(), nullptr);
+  ASSERT_NE(destination.data(), nullptr);
+  auto* source_bytes = static_cast<std::byte*>(source.data());
+  for (std::size_t index = 0; index < kBytes; ++index) {
+    source_bytes[index] = static_cast<std::byte>((index * 37U + 11U) & 0xFFU);
+  }
+
+  void* const source_pointer = source.data();
+  PinnedHostBuffer moved_source(std::move(source));
+  EXPECT_EQ(source.data(), nullptr);
+  EXPECT_EQ(source.size_bytes(), 0U);
+  EXPECT_EQ(moved_source.data(), source_pointer);
+  EXPECT_EQ(moved_source.size_bytes(), kBytes);
+
+  PinnedHostBuffer assigned_source(17);
+  assigned_source = std::move(moved_source);
+  EXPECT_EQ(moved_source.data(), nullptr);
+  EXPECT_EQ(moved_source.size_bytes(), 0U);
+  EXPECT_EQ(assigned_source.data(), source_pointer);
+
+  Buffer device(kBytes);
+  Stream stream;
+  copy_host_to_device_async(device.data(), assigned_source.data(), kBytes, stream);
+  copy_device_to_host_async(destination.data(), device.data(), kBytes, stream);
+  stream.synchronize();
+  EXPECT_TRUE(std::equal(static_cast<const std::byte*>(assigned_source.data()),
+                         static_cast<const std::byte*>(assigned_source.data()) + kBytes,
+                         static_cast<const std::byte*>(destination.data())));
+
+  PinnedHostBuffer empty(0);
+  EXPECT_EQ(empty.data(), nullptr);
+  EXPECT_EQ(empty.size_bytes(), 0U);
 }
 
 TEST_F(CudaRuntimeTest, MoveOnlyStreamsAndEventsRetainNativeResources) {

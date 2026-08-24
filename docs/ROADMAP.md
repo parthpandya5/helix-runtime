@@ -318,7 +318,7 @@ allocator/generation-tagged handle identity, eliminating cross-pool ID collision
 Direct and pooled Tensor lifecycle benchmarks perform ten warmups and compare
 complete host lifecycle cost at 1, 1,024, and 1,048,576 Float32 elements. NVCC
 12.6.85 compiles all paths with warnings as errors; the CUDA suite passes 185 host
-tests and registers 64 GPU tests (249 total), all skipped without a driver/device.
+tests and registers 65 GPU tests (250 total), all skipped without a driver/device.
 No lifecycle latency or event-correctness result is claimed.
 
 CUDA Toolkit 11.2+ builds now also register a default-pool
@@ -518,7 +518,7 @@ workspace.
 
 NVCC 12.6.85 compiled the implementation, tests, and benchmarks with line
 information and warnings as errors. The CUDA-on suite passes 185 host tests and
-registers 64 GPU tests (249 total), all correctly skipped without a driver/device.
+registers 65 GPU tests (250 total), all correctly skipped without a driver/device.
 Static `sm_52` inspection reports 31/29 registers per thread for the paged
 score/value kernels with no shared/local memory or spills. These are compiler facts,
 not execution evidence. Runtime correctness, event timing, coalescing/occupancy
@@ -839,10 +839,21 @@ warnings as errors; no report was collected without NVIDIA hardware. Full usage
 and the rule excluding profiler-perturbed timings from benchmark claims are in
 `docs/PERFORMANCE.md`.
 
-### M20 — Stream overlap — Optional
+### M20 — Pinned-transfer foundation compile-validated; overlap experiment pending
 
-Pinned memory, multiple streams, and event dependencies; retain only overlap that
-improves a measured workload.
+`cuda::PinnedHostBuffer` now provides move-only RAII around portable page-locked
+host memory, including zero-size and non-throwing cleanup semantics. One
+hardware-gated test moves ownership and performs an odd 4,099-byte H2D/D2H round
+trip on one nonblocking stream. Pageable-versus-pinned H2D and D2H fixtures cover
+4 KiB, 1 MiB, and 16 MiB, perform ten warmups, and use same-stream CUDA events for
+transfer duration. Host allocation and initialization are outside timing.
+
+CUDA 12.6.85 compiles the runtime, test, and benchmark with warnings as errors.
+The CUDA suite passes 185 host tests and registers 65 GPU tests (250 total), all
+skipped without a driver/device. Therefore neither pinned-copy bandwidth nor
+host/device overlap is validated. The next gate is a bounded two-stream workload
+with explicit event dependencies and paired sequential/overlapped measurement;
+only a measured improvement may become the default.
 
 ### M21 — Kernel fusion — Optional
 

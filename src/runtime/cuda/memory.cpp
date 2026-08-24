@@ -206,4 +206,39 @@ void Buffer::destroy() noexcept {
   free_device_bytes_noexcept(pointer, device_index);
 }
 
+PinnedHostBuffer::PinnedHostBuffer(std::size_t size_bytes) : size_bytes_(size_bytes) {
+  if (size_bytes_ == 0) {
+    return;
+  }
+  std::ostringstream context;
+  context << "allocating " << size_bytes_ << " bytes of portable pinned host memory";
+  HELIX_CUDA_CHECK_CONTEXT(cudaHostAlloc(&pointer_, size_bytes_, cudaHostAllocPortable),
+                           context.str());
+}
+
+PinnedHostBuffer::~PinnedHostBuffer() {
+  destroy();
+}
+
+PinnedHostBuffer::PinnedHostBuffer(PinnedHostBuffer&& other) noexcept
+    : pointer_(std::exchange(other.pointer_, nullptr)),
+      size_bytes_(std::exchange(other.size_bytes_, 0)) {}
+
+PinnedHostBuffer& PinnedHostBuffer::operator=(PinnedHostBuffer&& other) noexcept {
+  if (this != &other) {
+    destroy();
+    pointer_ = std::exchange(other.pointer_, nullptr);
+    size_bytes_ = std::exchange(other.size_bytes_, 0);
+  }
+  return *this;
+}
+
+void PinnedHostBuffer::destroy() noexcept {
+  void* pointer = std::exchange(pointer_, nullptr);
+  size_bytes_ = 0;
+  if (pointer != nullptr) {
+    report_cleanup_error(cudaFreeHost(pointer), "freeing portable pinned host memory");
+  }
+}
+
 } // namespace helix::cuda

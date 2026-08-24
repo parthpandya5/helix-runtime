@@ -10,7 +10,7 @@ built and then skipped because the container had no NVIDIA driver/device.
 
 As later subsystems were added, the macOS CPU-only Debug, Release, and ASan/UBSan
 configurations reached 186 passing tests. The current CUDA-on build passes 185
-hardware-independent tests and registers 64 GPU tests (249 total), all skipped
+hardware-independent tests and registers 65 GPU tests (250 total), all skipped
 without a device; its container omits the separate Python converter test. CUDA
 correctness, resource-leak, and timing behavior remains pending a physical NVIDIA
 GPU.
@@ -65,7 +65,11 @@ replaces per-allocation runtime calls.
 The memory API provides checked synchronous and stream-ordered asynchronous H2D,
 D2H, D2D, peer-copy, and memset operations. Asynchronous copies accept ordinary
 host pointers for correctness, but actual host/device overlap generally requires
-pinned host memory; pinned staging is deferred to the overlap milestone.
+pinned host memory. `PinnedHostBuffer` is a move-only owner over portable
+`cudaHostAlloc` storage; zero bytes need no sentinel allocation, cleanup is
+non-throwing, and callers must retain it until queued transfers complete. Its
+odd-sized async round-trip test and transfer benchmarks are compile-validated but
+have not run on a GPU.
 
 Tensor `Storage` is backend-aware:
 
@@ -115,7 +119,8 @@ compute-sanitizer --tool memcheck ./build-cuda/tests/helix_cuda_runtime_tests
 ## Known limitations
 
 - No GPU runtime test has run in the current environment.
-- No pinned host allocator exists yet.
+- Pinned host storage is direct per-buffer allocation; it has no cache or automatic
+  staging policy.
 - An opt-in allocator-backed Tensor bridge exists for an explicit single retained
   stream; automatic multi-stream storage-use tracking is not implemented, and the
   event path is compile-only validated.
