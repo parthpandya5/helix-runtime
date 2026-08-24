@@ -582,6 +582,14 @@ class ConverterIntegrationTest(unittest.TestCase):
             self.assertIn("generation_stop_reason=max_new_tokens", generated.stdout)
             self.assertIn("generation_cached_token_count=6", generated.stdout)
 
+            zero_generation = run_validator(
+                checkpoint, output, tokens, "--generate", "0"
+            )
+            self.assertEqual(zero_generation.returncode, 0, zero_generation.stderr)
+            self.assertIn("generation_validation=passed", zero_generation.stdout)
+            self.assertIn("generated_token_ids=\n", zero_generation.stdout)
+            self.assertIn("generation_cached_token_count=3", zero_generation.stdout)
+
             context_limited = run_validator(
                 checkpoint, output, tokens, "--generate", "20"
             )
