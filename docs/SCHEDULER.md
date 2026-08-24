@@ -6,8 +6,8 @@ Milestones 14–16 are implemented and integrated by the M19 CPU engine: the
 host-only request state machine feeds a single-thread-owned FIFO/token/KV-budget
 scheduler, finished slots are refilled between iterations, and deterministic
 metric aggregation exposes lifecycle distributions and rates. Normal, Release,
-and ASan/UBSan-applicable paths pass in the current 177-test CPU suite. The CUDA
-build passes 183 hardware-independent tests and explicitly skips 57 GPU tests (240
+and ASan/UBSan-applicable paths pass in the current 185-test CPU suite. The CUDA
+build passes 184 hardware-independent tests and explicitly skips 57 GPU tests (241
 total); its
 container omits the Python converter test. This scheduler is host policy and
 requires no GPU.

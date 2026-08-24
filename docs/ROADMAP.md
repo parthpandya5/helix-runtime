@@ -232,13 +232,14 @@ concurrent callers. A deliberately aliased-resource test proves two pools with t
 same address and local allocation ID reject each other's handles.
 
 `CudaMemoryResource` and three hardware-gated allocator tests compile in the CUDA
-12.6 warnings-as-errors build. Direct `cudaMalloc` versus Helix fixed/mixed trace
-benchmarks also compile, but have not run. CPU-resource baselines were executed and
-honestly show workload-dependent overhead/reuse behavior in
-`docs/PERFORMANCE.md`; they are not CUDA evidence. The broader randomized,
-small/large-heavy, bursty, and LLM-shaped GPU study remains pending. Immediate
-CUDA reuse is deliberately not integrated into Tensor storage because stream
-safety is an M8 correctness dependency. See `docs/MEMORY_ALLOCATOR.md`.
+12.6 warnings-as-errors build. Direct `cudaMalloc` versus Helix fixed, random-size,
+small-heavy, large-heavy, bursty, and LLM-like trace benchmarks also compile, but
+have not run. CPU and CUDA paths reuse exact deterministic trace definitions.
+CPU-resource baselines were executed and honestly show workload-dependent overhead/
+reuse behavior in `docs/PERFORMANCE.md`; they are not CUDA evidence. The complete
+GPU study remains pending. Immediate CUDA reuse is deliberately not integrated into
+Tensor storage because stream safety is an M8 correctness dependency. See
+`docs/MEMORY_ALLOCATOR.md`.
 
 CPU Tensor-ownership follow-up (2026-08-24, commit `4f6fc7f`): mutable external
 Storage now validates pointer/capacity/alignment/owner invariants, and the opt-in
@@ -257,6 +258,19 @@ The bridge was about 2.04x slower for one and 1,024 Float32 elements, but its 23
 median was 47.9% below the 459 ns direct median for 1,048,576 elements (4 MiB
 logical). The default pool retained 64 MiB. This is an opt-in CPU ownership result,
 not evidence about `cudaMalloc`; full methodology is in `docs/PERFORMANCE.md`.
+
+Allocator workload/metadata follow-up (2026-08-24, commit `32184e7`): five
+self-validating traces cover randomized sizes, small-heavy and large-heavy churn,
+bursts, and an LLM-like mix of persistent weights, rolling KV pages, and temporary
+workspaces. A separate untimed replay samples peak rounded bytes and maximum
+internal/external fragmentation after every operation. The original pool rebuilt
+block vectors and churned hash nodes; capacity-planned in-place split/coalesce and
+a generation-checked reusable active-slot registry reduced median cached-trace CPU
+time by 53.1%–66.7%. Final host results retain both outcomes: random/large/LLM-like
+traces were 3.13x–9.41x faster than direct aligned allocation, while small-heavy/
+bursty remained 2.34x–2.45x slower. Debug, Release, and ASan/UBSan suites pass
+185/185; the CUDA-on build passes 184 host tests and explicitly skips all 57 GPU
+tests (241 total) without a driver/device.
 
 ### M8 — Implemented and CPU/compile-validated; GPU runtime validation pending
 

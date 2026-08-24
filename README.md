@@ -47,7 +47,7 @@ weight format, performs greedy generation through a contiguous KV cache, and
 executes scheduler batches against a shared paged KV pool with optional prompt-
 prefix reuse. On
 2026-08-24, Apple Clang 17 built the project on macOS arm64 with warnings as
-errors; 184/184 CPU tests passed in Debug, Release, and ASan/UBSan configurations.
+errors; 185/185 CPU tests passed in Debug, Release, and ASan/UBSan configurations.
 
 CUDA is optional at configure time. The current Apple Silicon development host has
 no NVIDIA GPU or native CUDA toolkit, so no CUDA execution or performance claim is
@@ -57,8 +57,8 @@ compile-validated in an ARM64 CUDA 12.6 development container without a
 driver/device. The M8 stream-ordered allocator and M9 block-reduced RMSNorm,
 grid-stride SwiGLU, adjacent-pair RoPE, and projection adapter are also
 compile-validated, as is the M10 three-stage contiguous attention baseline. None is
-runtime-validated on a GPU. The CUDA-on build passes 183 hardware-independent
-tests and explicitly skips 57 GPU tests without a driver/device (240 registered
+runtime-validated on a GPU. The CUDA-on build passes 184 hardware-independent
+tests and explicitly skips 57 GPU tests without a driver/device (241 registered
 tests total). Its container lacks Python/NumPy, so the separate converter
 integration test is not registered there; it passes in all three native CPU
 configurations.
@@ -141,7 +141,7 @@ cmake --build build --target format-check
 Helix targets. `HELIX_BUILD_TOOLS=OFF` omits the model pack/inspection utilities;
 it does not affect the runtime libraries. The one Python converter integration
 test auto-registers only when the selected Python 3 interpreter can import NumPy;
-otherwise the 183-test C++/benchmark suite remains available.
+otherwise the 184-test C++/benchmark suite remains available.
 
 ## Benchmarks
 
@@ -174,6 +174,14 @@ compaction: direct block-table attention reduced isolated layer median CPU time 
 13.3%–27.7% while eliminating 2 KiB–1 MiB of combined-K/V temporaries; complete
 trace medians improved by only 0.08%–6.23%. Methodology and measurements live in
 [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md).
+
+Allocator workload fixtures now replay identical deterministic randomized,
+small-heavy, large-heavy, bursty, and LLM-like traces through direct host/CUDA
+resources and the cache. On the executable host path, replacing per-operation
+block-vector rebuilds and hash-node churn with in-place metadata updates and a
+reusable active-slot registry reduced median cached-trace CPU time by 53.1%–66.7%.
+The final cache was 3.13x–9.41x faster on random/large/LLM-like traces but remained
+2.34x–2.45x slower on small-heavy/bursty traces; no CUDA result is inferred.
 
 A paired warm-page model-loader fixture retains the copied path and compares it
 with the immutable mapped path while preserving all checksum, padding, shape, and
@@ -246,7 +254,8 @@ cmake --build build --target helix_cpu_kernels_demo
 `helix::memory::HelixAllocator` is a backend-neutral, mutex-protected best-fit
 segment cache with alignment rounding, exact block splitting, adjacent coalescing,
 allocator-instance and generation-tagged handles, reservation limits, explicit
-trimming, and internal/external fragmentation statistics. `DeferredAllocator`
+trimming, a reusable O(1) active-allocation registry, and internal/external
+fragmentation statistics. `DeferredAllocator`
 keeps logically freed allocations active until a completion object reports ready;
 `StreamOrderedAllocator` implements that completion with timing-disabled CUDA
 events recorded on an explicit release stream. The allocator/deferred metadata

@@ -271,9 +271,10 @@ all free blocks linearly, including alignment padding, then selects the candidat
 with the smallest remainder and deterministic segment/address tie breaking. This
 is intentionally simpler and easier to audit than a second size index; profiling
 must justify a more complex index. Requested sizes round to the effective power-of-
-two alignment, and allocation splits exact prefix/suffix remainders. Freeing
-rebuilds the affected address-ordered list and merges every adjacent free block in
-the same segment.
+two alignment. Allocation reserves metadata capacity and then splits exact prefix/
+suffix remainders in place. Freeing marks the selected block inactive, shifts only
+the necessary vector suffix, and coalesces its immediate free neighbors; free-block
+adjacency is forbidden by invariant, so no wider scan is needed.
 
 ```mermaid
 flowchart LR
@@ -295,11 +296,15 @@ bytes are nonzero. Internal fragmentation is
 nonzero. Both are otherwise zero.
 
 Allocation handles carry a process-unique allocator ID and monotonic local
-allocation ID as well as pointer/size/alignment/device. Deallocation validates all
-fields and both identities, so neither a stale copy nor a colliding handle from
-another pool can free an allocation (the raw-pointer ABA/cross-pool problem). A mutex
-serializes metadata and upstream calls. Debug builds re-derive segment coverage,
-block adjacency, counters, active mappings, and alignment after every mutation.
+allocation ID as well as pointer/size/alignment/device. A private index resolves an
+active record in O(1); released record slots are linked into a reusable free list.
+The monotonic ID is checked as a generation when a slot is recycled. Deallocation
+validates all fields and both identities, so neither a stale copy nor a colliding
+handle from another pool can free an allocation (the raw-pointer ABA/cross-pool
+problem). This flat registry avoids one host hash-node allocation per logical
+allocation. A mutex serializes metadata and upstream calls. Debug builds re-derive
+segment coverage, block adjacency, counters, one-to-one active mappings, registry
+free-list coverage, and alignment after every mutation without scratch allocation.
 
 `DeferredAllocator` prevents immediate free-list reuse by holding an allocation in
 a pending state behind a `Completion`; pending blocks remain active in the base

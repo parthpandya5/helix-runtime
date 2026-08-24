@@ -5,11 +5,11 @@
 The allocator metadata, generic deferred-reclamation layer, and opt-in CPU Tensor
 ownership bridge are **implemented, CPU-validated, sanitizer-validated, and host-
 resource benchmarked**. Twenty-one focused allocator/deferred/bridge tests and the
-full 184-test CPU suite pass in Debug, Release, and ASan/UBSan builds. A CUDA 12.6
+full 185-test CPU suite pass in Debug, Release, and ASan/UBSan builds. A CUDA 12.6
 warnings-as-errors build compiles `CudaMemoryResource`, `StreamOrderedAllocator`,
 three hardware-gated allocator tests, the CPU bridge, and native-CUDA comparison
-benchmarks. It passes 183 hardware-independent tests and skips 57 GPU tests without
-a driver/device (240 registered), so no CUDA allocator code has run on a physical
+benchmarks. It passes 184 hardware-independent tests and skips 57 GPU tests without
+a driver/device (241 registered), so no CUDA allocator code has run on a physical
 GPU.
 
 The event-backed adapter is therefore compile-validated rather than hardware-
@@ -66,8 +66,9 @@ alignment (256 B), and maximum reserved bytes. A request:
 5. selects the candidate leaving the least unused remainder,
 6. breaks ties by stable segment ID and then lower address,
 7. acquires a new aligned segment only on a cache miss,
-8. transactionally replaces the selected block with optional prefix, allocated
-   block, and optional suffix metadata.
+8. reserves any required block-table and active-registry capacity before mutation,
+9. updates the selected block in place with optional prefix, allocated block, and
+   optional suffix metadata.
 
 The linear scan is `O(number_of_blocks)`. It was chosen as an auditable baseline;
 a size-indexed tree/bin structure adds update complexity and should follow only if
@@ -84,8 +85,10 @@ flowchart LR
 ```
 
 Every nonempty remainder is retained; there is no hidden minimum-split threshold.
-Address-ordered blocks always cover their segment exactly. A free rebuild merges
-all adjacent free neighbors but never merges across upstream segments.
+Address-ordered blocks always cover their segment exactly. A free marks one block
+inactive and coalesces its immediate free neighbors in place; the invariant that
+free neighbors are never adjacent makes that sufficient. Blocks never merge across
+upstream segments.
 
 ## Ownership and stale-pointer defense
 
@@ -100,12 +103,14 @@ accidentally free stale A
 
 Helix therefore returns an `Allocation` descriptor containing a monotonic 64-bit
 allocation ID, a process-unique allocator-instance ID, pointer, requested/rounded
-bytes, alignment, and device. Deallocation validates the allocator identity, active
-allocation ID, and every descriptor field. A copied handle can trigger a clean
-double-free error, an old handle cannot free a newer allocation at the same address,
-and even two allocator instances deliberately backed by the same address cannot
-accept one another's handles. `Allocation` is not independently RAII because its
-valid lifetime depends on the owning allocator.
+bytes, alignment, and device. A private slot index gives O(1) access to an active
+record. Freed slots form an intrusive free list and are reused, while the monotonic
+ID serves as the generation: a stale descriptor that names a recycled slot fails
+the ID check. This avoids allocating and destroying a hash node for every logical
+allocation without weakening cross-pool, double-free, or ABA protection.
+Deallocation validates the allocator identity, active generation, and every
+descriptor field. `Allocation` is not independently RAII because its valid lifetime
+depends on the owning allocator.
 
 ## CPU Tensor ownership bridge
 
@@ -157,9 +162,12 @@ retry. Destructor cleanup cannot throw and logs upstream failures.
 
 The reservation limit is checked before an upstream call. Upstream allocation
 failure, size/alignment overflow, and metadata allocation failure leave active
-allocations unchanged. Debug builds re-scan the entire structure after mutations
-to verify contiguous coverage, nonadjacent free blocks, counter sums, active IDs,
-pointer alignment, and requested-versus-rounded bounds.
+allocations unchanged. A commit grows block/slot vectors before publishing an
+active record; subsequent block moves are statically required to be non-throwing.
+Debug builds re-scan the entire structure after mutations to verify contiguous
+coverage, nonadjacent free blocks, counter sums, one-to-one active-slot mappings,
+free-list coverage, generation IDs, pointer alignment, and requested-versus-rounded
+bounds. Those invariant scans allocate no scratch memory after a commit.
 
 ## Statistics and fragmentation
 
@@ -255,12 +263,16 @@ require the caller to have completed all device uses.
 
 ## Benchmarks
 
-Host-resource results are recorded in `docs/PERFORMANCE.md`. On this Apple M3 Pro,
-the cache was slower for 256 B, 4 KiB, and the 16-allocation mixed trace because
-the host allocator already caches those blocks and Helix adds a mutex, linear scan,
-vector rebuild, and active-map update. Reusing a 1 MiB block was lower latency than
-repeated aligned host allocation. The default 64 MiB segment also over-reserved
-the small mixed trace. These are useful design observations, not CUDA claims.
+Host-resource results are recorded in `docs/PERFORMANCE.md`. The original baseline
+showed that block-vector rebuilding and hash-node churn dominated small allocation
+traces. Capacity-planned in-place split/coalesce plus reusable active slots reduced
+median cached-trace CPU time by 53.1%–66.7% across deterministic random-size,
+small-heavy, large-heavy, bursty, and LLM-like workloads. On this Apple M3 Pro, the
+final cache was 3.13x–9.41x faster than direct aligned host allocation for the
+random/large/LLM-like traces, but 2.34x–2.45x slower for small-heavy/bursty traces.
+The host allocator already caches small blocks, Helix retains a 64 MiB minimum
+segment, and best-fit still scans linearly. These are useful design observations,
+not CUDA claims.
 
 The allocator-backed Tensor follow-up measures the complete pre-warmed Tensor
 allocation/destruction ownership path. Median CPU time was 238 ns versus 117 ns
@@ -271,12 +283,13 @@ case. It retained one 64 MiB default segment. Payload bytes were not touched and
 bandwidth counter is reported. The result supports an opt-in host policy; it does
 not predict native CUDA behavior.
 
-CUDA builds contain fixed and mixed-trace comparisons between direct
-`cudaMalloc/cudaFree` and `HelixAllocator(CudaMemoryResource)`. They time the full
-host allocation workload with Google Benchmark real time; CUDA events are not used
-to time host APIs. GPU model, driver, toolkit, warmup, iteration count, trace,
-reserved/peak bytes, underlying calls, and fragmentation must accompany any future
-published result.
+CUDA builds contain fixed, random-size, small-heavy, large-heavy, bursty, and
+LLM-like comparisons between direct `cudaMalloc/cudaFree` and
+`HelixAllocator(CudaMemoryResource)`. CPU and CUDA fixtures consume the same
+deterministic trace definitions. They time the full host allocation workload with
+Google Benchmark real time; CUDA events are not used to time host APIs. GPU model,
+driver, toolkit, warmup, iteration count, trace, reserved/peak bytes, underlying
+calls, and fragmentation must accompany any future published result.
 
 ## Current limitations
 
@@ -287,7 +300,8 @@ published result.
   dependency chain into the release stream,
 - CUDA runtime correctness and allocation latency unvalidated,
 - CUDA alignments above 256 bytes unsupported by the direct resource,
-- linear best-fit scan and vector rebuild may scale poorly with many blocks,
+- linear best-fit scan and address-ordered vector shifts may scale poorly with many
+  fragmented blocks,
 - no memory-pressure callback or automatic trim policy,
 - no `cudaMallocAsync` baseline yet,
 - no per-stream, per-size, or per-device sharding within one allocator.

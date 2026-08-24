@@ -25,6 +25,7 @@ Every recorded experiment must include:
 | M1 `Tensor::zeros` baseline | No earlier implementation | Allocate 64-byte-aligned CPU storage and zero it | Median CPU time: 191 ns (1 float), 240 ns (1,024 floats), 23.589 us (1,048,576 floats) | This measures allocation, tensor metadata construction, and zeroing together. It is a starting point, not evidence of an optimization or a standalone memory-bandwidth result. |
 | M2 CPU reference kernels | No earlier implementation | Clear single-threaded Float32 correctness paths with preallocated output | Representative median CPU times: add 1,048,576 values 121.685 us; softmax 32x128 21.172 us; matmul 128x128x128 1.521 ms (2.758 GFLOP/s); RMSNorm 32x4096 132.403 us | These establish correctness-oracle baselines. They are not optimized CPU-library comparisons, and allocation is excluded through `_out` APIs. |
 | M7 host-resource allocator baseline | Direct aligned C++ allocation/free | Route identical fixed and 16-allocation mixed traces through the best-fit cache | Median CPU time per fixed pair: direct/Helix 22.6/87.1 ns (256 B), 22.0/88.6 ns (4 KiB), 548/88.2 ns (1 MiB); mixed trace 1.657/2.016 us | Host allocation already caches small blocks, so Helix metadata loses on small/mixed traces but avoids repeated upstream work for 1 MiB. This does not predict `cudaMalloc` behavior. |
+| M7 allocator metadata and workload traces | Original full-vector rebuild plus active hash-map nodes | Add deterministic random/small/large/bursty/LLM-like traces, mutate block metadata in place, and recycle generation-checked active slots | Original/final cached medians fell by 53.1%–66.7% across all five traces. Final direct/cache medians were 262.342/83.728 us (random), 36.106/84.525 us (small), 93.975/11.018 us (large), 21.458/52.583 us (bursty), and 53.702/5.707 us (LLM-like). | The metadata changes consistently helped. Cache reuse wins for costly large/mixed lifetimes but still loses on small host allocations; identical CUDA fixtures are compile-only validated. |
 | M7 allocator-backed CPU Tensor ownership | Direct `Tensor::empty` allocation/destruction | Retain one pool allocation and allocator through shared Tensor Storage, then return it on final release | Direct/pooled median CPU time: 117/238 ns (1 element), 117/239 ns (1,024), and 459/239 ns (1,048,576) | Shared-owner plus allocator metadata was about 2.04x slower for small Tensors, while cached 4 MiB lifecycle latency was 47.9% lower. The 64 MiB retained host segment and untouched payload make this an ownership/cache result, not bandwidth or CUDA evidence. |
 | M9 CPU transformer primitives | No earlier RoPE fixture; M2 provided scalar SiLU only | Add preallocated SwiGLU and adjacent-pair RoPE reference paths | Median CPU time: SwiGLU 4,096 values 44.602 us and 131,072 values 1.512 ms; RoPE 1x32x128 1.904 us and 128x32x128 187.894 us | These are single-threaded correctness baselines, not optimized CPU or GPU comparisons. High host load makes wall-time variation substantial. |
 | M10 contiguous CPU attention | No earlier attention path | Materialize scaled/masked scores, stable softmax in place, then probabilities x V with reusable output/workspace | Median CPU time: 8x1x128x64x64 76.371 us; 8x1x1,024x64x64 825.128 us; 3x17x29x37x41 46.284 us; 8x128x128x64x64 8.164 ms | Workspace is exactly `4*H*Q*K` bytes. These single-threaded results include softmax but the reported dot FLOP/s numerator does not; they are correctness baselines. |
@@ -174,6 +175,109 @@ Command:
 The relevant production question is native `cudaMalloc/cudaFree` versus the CUDA-
 backed cache under GPU allocation traces. Those fixtures compile, but the current
 machine cannot execute them; no CUDA allocation latency or speedup is reported.
+
+## M7 allocator metadata and workload traces — 2026-08-24
+
+Hypothesis: the original allocator's per-operation block-vector rebuild and
+`unordered_map` node allocation dominate the cache-hit path. Replace them in two
+measured steps while preserving best-fit selection, split/coalesce semantics,
+generation checks, and the direct-resource baseline.
+
+Environment and timing boundary:
+
+- source: commit `32184e7`;
+- host: Apple M3 Pro, 12 CPU cores (6 performance, 6 efficiency), 18 GB RAM;
+- OS/compiler/build: macOS 26.0.1 arm64, Apple Clang 17.0.0, Release,
+  `HELIX_ENABLE_CUDA=OFF`, warnings as errors;
+- CMake 4.2.3 and Google Benchmark 1.9.1;
+- one benchmark thread; process CPU time; payload bytes are never initialized,
+  read, or copied, so this is allocator/control-path latency rather than bandwidth;
+- both paths use 256-byte alignment. The direct path invokes aligned C++
+  `operator new/delete` for every allocation; the pool uses 64 MiB default
+  segments and remains alive across all iterations in one repetition;
+- trace construction and slot-vector setup are outside timing. The first timed
+  pool iteration acquires its one or two upstream segments; later iterations reuse
+  them. There is no separate manual warmup beyond Google Benchmark calibration;
+- final measurement: 0.05-second minimum, 15 randomly interleaved repetitions.
+  Google Benchmark calibrated one fixed iteration count per case: direct/pool
+  random 266/834, small 1,972/838, large 726/6,492, bursty 3,261/1,343, and
+  LLM-like 1,396/12,032 traces per repetition;
+- final-run load averages: 5.35/5.27/5.54. CPU-frequency metadata and affinity were
+  unavailable on this Apple Silicon host.
+
+Every deterministic trace validates that slots cannot be double-allocated or
+double-freed, byte accounting cannot overflow, and all allocations are reclaimed:
+
+| Trace | Definition | Allocations / operations | Peak live requested bytes |
+|---|---|---:|---:|
+| Random-size | 64 slots; fixed-seed churn; each request uniformly selected from 64 B through 1 MiB | 512 / 1,024 | 39,578,311 |
+| Small-heavy | 64 slots; 85% from 64 B–4 KiB choices, 15% from 8–64 KiB choices | 768 / 1,536 | 630,080 |
+| Large-heavy | 16 slots; 75% from 512 KiB/1/2/4 MiB, 25% from 64/128/256/384 KiB | 192 / 384 | 42,729,472 |
+| Bursty | Twelve waves of 64 allocations from 128 B–32 KiB, then even-slot and odd-slot frees | 768 / 1,536 | 490,624 |
+| LLM-like | Four persistent 8 MiB weights, sixteen rolling 256 KiB KV pages, and 1/3/4/8/16 MiB workspaces over 12 rounds | 112 / 224 | 71,303,168 |
+
+Final paired results:
+
+| Trace | Direct median / CPU CV | Final cache median / CPU CV | Observed outcome |
+|---|---:|---:|---|
+| Random-size | 262.342 us / 0.99% | 83.728 us / 1.11% | Cache is 68.1% lower latency (3.13x). |
+| Small-heavy | 36.106 us / 1.41% | 84.525 us / 2.54% | Cache is 2.34x slower. |
+| Large-heavy | 93.975 us / 1.67% | 11.018 us / 1.58% | Cache is 88.3% lower latency (8.53x). |
+| Bursty | 21.458 us / 1.62% | 52.583 us / 1.96% | Cache is 2.45x slower. |
+| LLM-like | 53.702 us / 2.14% | 5.707 us / 2.02% | Cache is 89.4% lower latency (9.41x). |
+
+The optimization sequence used the same trace definitions, Release configuration,
+0.05-second minimum, 15 randomized repetitions, and median CPU time. The first
+change reserves geometric block-table capacity before commit and edits split/free
+metadata in place. The second replaces per-allocation hash nodes with a reusable
+flat slot registry; the monotonic allocation ID remains the generation check.
+
+| Trace | Original rebuild + map | In-place blocks | Final reusable slots | Original-to-final reduction |
+|---|---:|---:|---:|---:|
+| Random-size | 178.359 us | 98.087 us | 83.728 us | 53.1% |
+| Small-heavy | 227.609 us | 110.557 us | 84.525 us | 62.9% |
+| Large-heavy | 32.216 us | 15.551 us | 11.018 us | 65.8% |
+| Bursty | 145.506 us | 68.882 us | 52.583 us | 63.9% |
+| LLM-like | 17.124 us | 8.367 us | 5.707 us | 66.7% |
+
+The direct baselines stayed within a few percent across the three runs. The
+improvement is therefore consistent and large enough to accept both changes. The
+remaining small-heavy/bursty loss is also real: aligned host allocation is already
+cheap, while Helix still takes a mutex, performs best-fit scans, validates a richer
+handle, and shifts ordered metadata. No machine-specific size cutoff was added.
+
+Fragmentation and reservation counters come from one separate, untimed replay that
+samples `AllocatorStats` after every operation; they are maxima, not averages:
+
+| Trace | Reserved / segments | Peak rounded active | Max external | Max internal |
+|---|---:|---:|---:|---:|
+| Random-size | 67,108,864 B / 1 | 39,586,560 B | 65.11% | 0.226% |
+| Small-heavy | 67,108,864 B / 1 | 631,808 B | 0.504% | 75.0% |
+| Large-heavy | 67,108,864 B / 1 | 42,729,472 B | 38.97% | 0% |
+| Bursty | 67,108,864 B / 1 | 491,520 B | 0.684% | 50.0% |
+| LLM-like | 134,217,728 B / 2 | 71,303,168 B | 50.0% | 0% |
+
+The high maximum internal ratios occur at trace instants where a small live request
+is rounded to 256 bytes; they do not mean 50%–75% of the segment is permanently
+lost. External fragmentation includes free regions in distinct upstream segments,
+which cannot coalesce. The 64 MiB minimum visibly over-reserves small host traces.
+
+Command:
+
+```bash
+./build-release/benchmarks/helix_benchmarks \
+  '--benchmark_filter=BM_(SystemResource|HelixAllocator)WorkloadTrace/(RandomSize|SmallHeavy|LargeHeavy|Bursty|LlmLike)$' \
+  --benchmark_min_time=0.05s \
+  --benchmark_repetitions=15 \
+  --benchmark_enable_random_interleaving=true \
+  --benchmark_out=allocator-traces.json \
+  --benchmark_out_format=json
+```
+
+The same trace definitions feed hardware-gated raw `cudaMalloc/cudaFree` and
+`HelixAllocator(CudaMemoryResource)` benchmarks, timed with real host time because
+these are host API workloads. NVCC 12.6.85 compiles them, but no CUDA driver/device
+is available. No GPU latency, reuse speedup, or fragmentation conclusion is claimed.
 
 ## M7 allocator-backed CPU Tensor ownership — 2026-08-24
 

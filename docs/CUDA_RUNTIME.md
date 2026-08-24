@@ -8,9 +8,10 @@ the ARM64 `nvidia/cuda:12.6.3-devel-ubuntu24.04` container with warnings as erro
 All 49 hardware-independent tests passed in that CUDA-on build. Six GPU tests were
 built and then skipped because the container had no NVIDIA driver/device.
 
-As later subsystems were added, the macOS CPU-only Debug and ASan/UBSan
-configurations reached 76 passing tests. The current CUDA-on build passes the same
-76 hardware-independent tests and registers 57 GPU tests. CUDA correctness,
+As later subsystems were added, the macOS CPU-only Debug, Release, and ASan/UBSan
+configurations reached 185 passing tests. The current CUDA-on build passes 184
+hardware-independent tests and registers 57 GPU tests, all skipped without a
+device; its container omits the separate Python converter test. CUDA correctness,
 resource-leak, and timing behavior remains pending a physical NVIDIA GPU.
 
 ## Error handling

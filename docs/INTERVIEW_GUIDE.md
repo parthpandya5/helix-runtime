@@ -65,6 +65,16 @@ ABA-style reuse. A mutex protects the metadata boundary. Statistics include
 reserved, requested, rounded-active, free, peak, largest-free-block, reuse, and
 upstream-call counts.
 
+The first implementation rebuilt a complete block vector and allocated an active
+hash-map node on each operation. Deterministic traces showed that metadata dominated
+small workloads. Helix now reserves capacity before mutation, edits the ordered
+block vector in place, and resolves active records through reusable indexed slots;
+the monotonic allocation ID remains the generation check when a slot is recycled.
+Those two measured changes reduced median cache-trace CPU time by 53.1%–66.7% across
+five workloads. The final cache still lost 2.34x–2.45x to direct host allocation on
+small-heavy/bursty traces, so best-fit caching is not presented as universally
+faster or as evidence about CUDA.
+
 `allocate_cpu_tensor` supplies the RAII boundary missing from a raw `Allocation`:
 its private shared lifetime token captures both the exact descriptor and a
 `shared_ptr` to the allocator, and final Storage release returns the block once.
@@ -72,8 +82,8 @@ Zero-sized requests bypass the pool, and invalid requests are transactional. Thi
 bridge is CPU-only; ordinary Tensor factories and clones still allocate directly.
 
 Best fit was selected as an auditable baseline for mixed lifetimes, not assumed to
-be universally optimal. Its linear scan and metadata cost remain visible in host
-benchmarks.
+be universally optimal. Its linear scan and ordered-vector shifts remain visible
+in host benchmarks.
 
 ## What causes memory fragmentation?
 
