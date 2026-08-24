@@ -22,10 +22,12 @@ The narrow M17 model path now has an offline Hugging Face Llama safetensors
 converter with an independent source-layout logits oracle. A revision-pinned
 public tiny-random Llama checkpoint has been converted and all 128,000 logits from
 four raw-token sequences agree with both that oracle and a local CPU Float32
-Transformers reference at the documented tolerances; this is not broad model or
-tokenizer compatibility. Its native loader also has an opt-in, read-only POSIX
-memory-mapped path with shared mapping lifetime and enforced immutable Tensor
-views; the portable copied loader remains available.
+Transformers reference at the documented tolerances. One eight-token Helix cached-
+decode trace also matches full-prefix source recomputation and Transformers KV-
+cache decoding exactly; this is not broad model or tokenizer compatibility. Its
+native loader also has an opt-in, read-only POSIX memory-mapped path with shared
+mapping lifetime and enforced immutable Tensor views; the portable copied loader
+remains available.
 M22 now includes the measured block-aligned sharing primitive, a bounded exact-
 content prefix index, persistent LRU anchors, and opt-in reuse in the CPU runtime.
 The repository
@@ -375,7 +377,8 @@ cmake --build build --target helix_model_pack helix_model_inspect
   --checkpoint ./models/hf-llama \
   --model ./models/model.helix \
   --inspector ./build/tools/helix_model_inspect \
-  --tokens 1,42,7
+  --tokens 1,42,7 \
+  --generate 8
 ```
 
 Compatibility is rejected rather than guessed: the converter currently requires
@@ -396,6 +399,10 @@ two layers, hidden size 16, four Q/K/V heads, and F16 source weights promoted to
 Float32. Across four one-to-seven-token sequences, all 128,000 logits passed at
 `rtol=2e-5`, `atol=2e-6`; maximum absolute error was `2.98e-8` versus the
 independent NumPy oracle and `8.94e-8` versus PyTorch 2.0.1 / Transformers 4.32.0.
+For prompt IDs `1,42,7`, cached greedy decode emits
+`9555,23124,30954,4355,14017,25190,6074,6566`; the complete trace, stop reason,
+and cache length match both full-prefix source recomputation and Transformers
+`past_key_values` decoding.
 Exact source hashes, commands, and limitations are in
 [`docs/MODEL_SUPPORT.md`](docs/MODEL_SUPPORT.md).
 

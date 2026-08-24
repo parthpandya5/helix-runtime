@@ -55,8 +55,9 @@ that into a GPU performance claim.
   projection transposition, RoPE coordinate remapping, atomic output replacement,
   and an independent bounded source-layout logits oracle; validated all 128,000
   logits from four raw-token sequences on one revision-pinned public checkpoint
-  against both Helix and a CPU Float32 Transformers reference, while explicitly
-  rejecting broader compatibility claims.
+  against both Helix and a CPU Float32 Transformers reference, then matched one
+  eight-token cached greedy trace across Helix, full-prefix recomputation, and
+  Transformers KV-cache decoding while rejecting broader compatibility claims.
 - Built transactional single-sequence prefill/decode and greedy generation over a
   contiguous KV cache; matched cached logits/tokens against full-prefix
   recomputation and measured 3.69x–56.79x next-position CPU speedups across

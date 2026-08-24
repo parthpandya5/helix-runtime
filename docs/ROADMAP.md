@@ -680,6 +680,20 @@ disclosed Apple M3 Pro CPU fixtures, cached next-position decode measured 3.69x,
 are in `docs/PERFORMANCE.md`; these are tiny single-threaded CPU reference results,
 not production or GPU inference claims.
 
+Public-generation validation follow-up (2026-08-24, commits `f2f8ea5` and
+`09fd7aa`): the C++
+inspector exposes the existing contiguous-KV session as a machine-readable greedy
+trace. The bounded Python harness compares that cached path against repeated full-
+prefix evaluation in the independent source layout and can additionally compare
+with Transformers `past_key_values`. Synthetic integration covers normal decode,
+invalid length, and context exhaustion; existing C++ tests retain EOS, tie,
+failure-atomicity, and per-step logit coverage. On the revision-pinned public
+checkpoint, prompt `1,42,7` produced the identical eight-token trace
+`9555,23124,30954,4355,14017,25190,6074,6566` through all three paths, with the
+same maximum-token stop and cached count of 10. This is raw-token parity for one
+random model, not tokenizer, text-generation quality, intermediate-logit parity
+at every public decode step, or CUDA execution.
+
 ### M19 — CPU runtime execution engine — Implemented, CPU-validated, sanitized, and benchmarked
 
 - single owner connecting scheduler, CPU model executor, and paged KV cache;

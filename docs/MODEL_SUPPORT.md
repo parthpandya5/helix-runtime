@@ -244,13 +244,16 @@ cmake --build build --target helix_model_pack helix_model_inspect
   --checkpoint ./models/hf-llama \
   --model ./models/model.helix \
   --inspector ./build/tools/helix_model_inspect \
-  --tokens 1,42,7
+  --tokens 1,42,7 \
+  --generate 8
 ```
 
 `helix_model_inspect` loads and validates every payload, reports geometry and
 parameter count, and can run a one-token CPU smoke forward. Its
 `--last-logits TOKEN[,TOKEN...]` mode prints exact hexadecimal Float32 values for
-validation tooling; it is not the user-facing generation CLI.
+validation tooling; `--greedy-tokens TOKEN[,TOKEN...] N` emits a machine-readable
+cached-decode trace, stop reason, and cache count. It is not the user-facing
+generation CLI.
 
 To register the converter integration test in a fresh build, point CMake at the
 conversion environment before configuring:
@@ -333,6 +336,22 @@ host; maximum absolute Helix/framework error was
 `8.94069672e-8`. Relative maxima are less informative near logits that round close
 to zero, so pass/fail uses the disclosed combined relative/absolute tolerance.
 
+Commit `f2f8ea5` extends the same harness across autoregressive execution. For
+prompt IDs `1,42,7` and eight greedy steps, Helix's contiguous-KV session emits:
+
+```text
+9555,23124,30954,4355,14017,25190,6074,6566
+```
+
+The token sequence, `max_new_tokens` stop reason, and final cached-token count of
+10 exactly match both independent full-prefix source recomputation and
+Transformers `past_key_values` decoding. The harness separately tests zero/invalid
+lengths and context-limit accounting; C++ generator tests cover EOS termination,
+lowest-ID ties, cache capacity, failure atomicity, and cached logits versus full
+recomputation. Token equality is not a claim that every intermediate public-model
+logit was compared during decode—the complete 128,000-element comparisons above
+cover the four initial contexts.
+
 The core validation is reproducible with the NumPy-only conversion environment.
 `--transformers` is optional and imports external packages only when requested:
 
@@ -341,7 +360,8 @@ The core validation is reproducible with the NumPy-only conversion environment.
   --checkpoint /tmp/helix-public-checkpoint \
   --model /tmp/helix-public-checkpoint/model.helix \
   --inspector ./build-release/tools/helix_model_inspect \
-  --tokens 1,42,7
+  --tokens 1,42,7 \
+  --generate 8
 
 # Exact optional external-reference environment used for the recorded run:
 python3.11 -m venv .venv-hf-validation
@@ -353,6 +373,7 @@ HF_HOME=/tmp/helix-hf-cache \
   --model /tmp/helix-public-checkpoint/model.helix \
   --inspector ./build-release/tools/helix_model_inspect \
   --tokens 1,42,7 \
+  --generate 8 \
   --transformers
 ```
 
@@ -497,7 +518,7 @@ evidence. The separate bounded validator then exercises the exact source-layout
 math, failure detection, and the revision-pinned public checkpoint described
 above; tokenizer/text-prompt behavior remains untested.
 
-Validation on 2026-08-24 through checkpoint-validator commit `d433760`:
+Validation on 2026-08-24 through generation-validation test commit `09fd7aa`:
 
 - Debug, Release, and Apple Clang ASan/UBSan CPU suites: 177/177 tests passed;
 - all Release tests and benchmark smoke workloads passed;

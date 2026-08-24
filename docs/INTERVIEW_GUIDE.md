@@ -352,9 +352,11 @@ A bounded offline version of that oracle also validates one revision-pinned publ
 tiny-random checkpoint. Four raw-token sequences produced 128,000 checked logits;
 maximum absolute error was `2.98e-8` versus the source-layout oracle and `8.94e-8`
 versus an optional CPU Float32 PyTorch/Transformers reference at `rtol=2e-5`,
-`atol=2e-6`. This still does not justify claiming every Llama-family checkpoint:
-GQA/MQA, biases, scaled/partial RoPE, quantization, adapters, tokenization, and
-other model layouts remain outside the supported boundary.
+`atol=2e-6`. For one prompt, its eight greedy tokens also match Helix contiguous-
+KV decode, repeated full-prefix source evaluation, and Transformers KV-cache
+decode exactly. This still does not justify claiming every Llama-family
+checkpoint: GQA/MQA, biases, scaled/partial RoPE, quantization, adapters,
+tokenization, and other model layouts remain outside the supported boundary.
 
 ## What did Helix implement itself versus delegate to libraries?
 

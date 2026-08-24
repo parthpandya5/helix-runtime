@@ -639,10 +639,12 @@ Python dependency.
 
 The bounded validation tool is a correctness harness rather than another runtime:
 it independently reads source-layout tensors, evaluates the supported equations,
-and compares the complete final logit row emitted by the C++ inspector. An opt-in
-external Transformers comparison is isolated to validation. One revision-pinned
-public tiny-random checkpoint passes both paths; exact artifact hashes, tolerances,
-and exclusions are recorded in `docs/MODEL_SUPPORT.md`.
+and compares the complete final logit row emitted by the C++ inspector. Its
+generation mode compares Helix contiguous-KV greedy decode with repeated full-
+prefix source evaluation; the opt-in external path additionally uses Transformers
+`past_key_values`. One revision-pinned public tiny-random checkpoint passes the
+logit checks and one eight-token generation trace. Exact artifact hashes,
+tolerances, and exclusions are recorded in `docs/MODEL_SUPPORT.md`.
 
 Both native load paths share header/directory validation and scan every payload
 for checksum and finite-value correctness. The portable path decodes into aligned
