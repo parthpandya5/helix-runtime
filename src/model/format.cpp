@@ -240,6 +240,59 @@ std::uint64_t tensor_checksum(const Tensor& tensor, TensorRole role) {
   return hash;
 }
 
+void read_bytes(std::istream& input, std::span<std::uint8_t> bytes, std::string_view context);
+
+std::size_t file_size(const std::filesystem::path& path, std::string_view context) {
+  std::error_code error;
+  const std::uintmax_t bytes = std::filesystem::file_size(path, error);
+  if (error) {
+    io_error(std::string(context) + " could not inspect '" + path.string() +
+             "': " + error.message());
+  }
+  if (bytes > std::numeric_limits<std::size_t>::max()) {
+    throw_error(ErrorCode::kOutOfRange,
+                "model::format: " + std::string(context) + " exceeds this host's size range");
+  }
+  return static_cast<std::size_t>(bytes);
+}
+
+std::uint64_t raw_tensor_checksum(const std::filesystem::path& path, const TensorSpec& spec) {
+  const std::size_t expected_bytes = checked_nbytes(spec.shape, DType::kFloat32);
+  const std::size_t actual_bytes = file_size(path, "raw tensor payload");
+  if (actual_bytes != expected_bytes) {
+    invalid_format("raw " + std::string(role_name(spec.role)) + " payload '" + path.string() +
+                   "' has " + std::to_string(actual_bytes) + " bytes; expected " +
+                   std::to_string(expected_bytes));
+  }
+
+  std::ifstream input(path, std::ios::binary);
+  if (!input) {
+    io_error("could not open raw tensor payload '" + path.string() + "' for reading");
+  }
+  std::vector<std::uint8_t> bytes(kIoChunkBytes);
+  std::size_t remaining = expected_bytes;
+  std::uint64_t checksum = kFnvOffset;
+  while (remaining != 0) {
+    const std::size_t byte_count = std::min(remaining, bytes.size());
+    HELIX_ASSERT(byte_count % sizeof(float) == 0,
+                 "raw Float32 checksum chunk must contain complete values");
+    read_bytes(input, std::span<std::uint8_t>(bytes.data(), byte_count), "raw tensor payload");
+    checksum = fnv_bytes(std::span<const std::uint8_t>(bytes.data(), byte_count), checksum);
+    for (std::size_t offset = 0; offset < byte_count; offset += sizeof(float)) {
+      std::uint32_t bits = 0;
+      for (std::size_t shift = 0; shift < 32; shift += 8) {
+        bits |= static_cast<std::uint32_t>(bytes[offset + shift / 8]) << shift;
+      }
+      if (!std::isfinite(std::bit_cast<float>(bits))) {
+        invalid_format("raw " + std::string(role_name(spec.role)) + " payload '" + path.string() +
+                       "' contains a non-finite value");
+      }
+    }
+    remaining -= byte_count;
+  }
+  return checksum;
+}
+
 std::vector<TensorSpec> make_specs(const LlamaConfig& config, const LlamaWeights* weights) {
   config.validate();
   if (config.layer_count > kGlobalLayer) {
@@ -292,27 +345,31 @@ std::vector<TensorSpec> make_specs(const LlamaConfig& config, const LlamaWeights
 }
 
 std::vector<DirectoryRecord> make_records(std::span<const TensorSpec> specs,
+                                          std::span<const std::uint64_t> checksums,
                                           std::size_t data_offset, std::size_t& file_size) {
+  HELIX_ASSERT(specs.size() == checksums.size(),
+               "model tensor specs and checksums must have equal sizes");
   std::vector<DirectoryRecord> records;
   records.reserve(specs.size());
   std::size_t cursor = data_offset;
-  for (const TensorSpec& spec : specs) {
-    HELIX_ASSERT(spec.tensor != nullptr, "write tensor specification must contain a tensor");
+  for (std::size_t index = 0; index < specs.size(); ++index) {
+    const TensorSpec& spec = specs[index];
     cursor = aligned_size(cursor, kPayloadAlignment, "tensor payload alignment");
+    const std::size_t payload_bytes = checked_nbytes(spec.shape, DType::kFloat32);
     DirectoryRecord record{spec.role,
                            spec.layer,
                            kFloat32Code,
                            static_cast<std::uint32_t>(spec.shape.size()),
                            {},
                            to_u64(cursor),
-                           to_u64(spec.tensor->nbytes()),
+                           to_u64(payload_bytes),
                            kPayloadAlignment,
-                           tensor_checksum(*spec.tensor, spec.role)};
-    for (std::size_t index = 0; index < spec.shape.size(); ++index) {
-      record.dimensions[index] = static_cast<std::uint64_t>(spec.shape[index]);
+                           checksums[index]};
+    for (std::size_t dimension_index = 0; dimension_index < spec.shape.size(); ++dimension_index) {
+      record.dimensions[dimension_index] = static_cast<std::uint64_t>(spec.shape[dimension_index]);
     }
     records.push_back(record);
-    cursor = checked_add(cursor, spec.tensor->nbytes(), "model file payload");
+    cursor = checked_add(cursor, payload_bytes, "model file payload");
   }
   file_size = cursor;
   return records;
@@ -404,6 +461,68 @@ void write_tensor_payload(std::ostream& output, const Tensor& tensor) {
     write_bytes(output, std::span<const std::uint8_t>(bytes.data(), value_count * sizeof(float)),
                 "tensor payload");
     value_offset += value_count;
+  }
+}
+
+void write_raw_tensor_payload(std::ostream& output, const std::filesystem::path& path,
+                              std::size_t byte_count, std::uint64_t expected_checksum) {
+  std::ifstream input(path, std::ios::binary);
+  if (!input) {
+    io_error("could not reopen raw tensor payload '" + path.string() + "' for reading");
+  }
+  std::vector<std::uint8_t> bytes(kIoChunkBytes);
+  std::size_t remaining = byte_count;
+  std::uint64_t checksum = kFnvOffset;
+  while (remaining != 0) {
+    const std::size_t chunk = std::min(remaining, bytes.size());
+    read_bytes(input, std::span<std::uint8_t>(bytes.data(), chunk), "raw tensor payload");
+    checksum = fnv_bytes(std::span<const std::uint8_t>(bytes.data(), chunk), checksum);
+    write_bytes(output, std::span<const std::uint8_t>(bytes.data(), chunk), "raw tensor payload");
+    remaining -= chunk;
+  }
+  if (checksum != expected_checksum || input.peek() != std::char_traits<char>::eof()) {
+    invalid_format("raw tensor payload '" + path.string() +
+                   "' changed while the model was being written");
+  }
+}
+
+template <typename PayloadWriter>
+void write_llama_model_stream(std::ostream& output, const LlamaConfig& config,
+                              std::span<const TensorSpec> specs,
+                              std::span<const std::uint64_t> checksums,
+                              PayloadWriter&& write_payload) {
+  if (output.tellp() != std::streampos(0)) {
+    invalid_format("output stream must be seekable and positioned at offset zero");
+  }
+  const std::size_t directory_bytes = checked_multiply(
+      specs.size(), static_cast<std::size_t>(kDirectoryEntryBytes), "model directory");
+  const std::size_t metadata_end = checked_add(kHeaderBytes, directory_bytes, "model metadata");
+  const std::size_t data_offset =
+      aligned_size(metadata_end, kPayloadAlignment, "model payload start");
+  std::size_t model_file_size = 0;
+  const std::vector<DirectoryRecord> records =
+      make_records(specs, checksums, data_offset, model_file_size);
+  const std::streamoff expected_stream_size = to_streamoff(model_file_size, "model file size");
+  const std::vector<std::uint8_t> directory = encode_directory(records);
+  std::vector<std::uint8_t> header =
+      encode_header(config, specs.size(), data_offset, model_file_size);
+  std::uint64_t metadata_checksum = fnv_bytes(header);
+  metadata_checksum = fnv_bytes(directory, metadata_checksum);
+  set_u64(header, kHeaderBytes - sizeof(std::uint64_t), metadata_checksum);
+
+  write_bytes(output, header, "model header");
+  write_bytes(output, directory, "tensor directory");
+  std::size_t cursor = metadata_end;
+  for (std::size_t index = 0; index < specs.size(); ++index) {
+    const std::size_t offset = to_size(records[index].offset, "tensor offset");
+    write_padding(output, offset - cursor);
+    write_payload(output, index, to_size(records[index].byte_length, "tensor byte length"));
+    cursor = checked_add(offset, to_size(records[index].byte_length, "tensor byte length"),
+                         "model payload cursor");
+  }
+  HELIX_ASSERT(cursor == model_file_size, "written model byte count must match header");
+  if (output.tellp() != std::streampos(expected_stream_size)) {
+    io_error("written stream length does not match the model header");
   }
 }
 
@@ -558,39 +677,22 @@ LlamaWeights assemble_weights(const LlamaConfig& config, std::vector<Tensor> ten
 
 void write_llama_model_file(std::ostream& output, const LlamaConfig& config,
                             const LlamaWeights& weights) {
-  if (output.tellp() != std::streampos(0)) {
-    invalid_format("output stream must be seekable and positioned at offset zero");
-  }
   config.validate();
   weights.validate(config);
   const std::vector<TensorSpec> specs = make_specs(config, &weights);
-  const std::size_t directory_bytes = checked_multiply(
-      specs.size(), static_cast<std::size_t>(kDirectoryEntryBytes), "model directory");
-  const std::size_t metadata_end = checked_add(kHeaderBytes, directory_bytes, "model metadata");
-  const std::size_t data_offset =
-      aligned_size(metadata_end, kPayloadAlignment, "model payload start");
-  std::size_t file_size = 0;
-  const std::vector<DirectoryRecord> records = make_records(specs, data_offset, file_size);
-  const std::streamoff expected_stream_size = to_streamoff(file_size, "model file size");
-  const std::vector<std::uint8_t> directory = encode_directory(records);
-  std::vector<std::uint8_t> header = encode_header(config, specs.size(), data_offset, file_size);
-  std::uint64_t metadata_checksum = fnv_bytes(header);
-  metadata_checksum = fnv_bytes(directory, metadata_checksum);
-  set_u64(header, kHeaderBytes - sizeof(std::uint64_t), metadata_checksum);
-
-  write_bytes(output, header, "model header");
-  write_bytes(output, directory, "tensor directory");
-  std::size_t cursor = metadata_end;
-  for (std::size_t index = 0; index < specs.size(); ++index) {
-    const std::size_t offset = to_size(records[index].offset, "tensor offset");
-    write_padding(output, offset - cursor);
-    write_tensor_payload(output, *specs[index].tensor);
-    cursor = checked_add(offset, specs[index].tensor->nbytes(), "model payload cursor");
+  std::vector<std::uint64_t> checksums;
+  checksums.reserve(specs.size());
+  for (const TensorSpec& spec : specs) {
+    HELIX_ASSERT(spec.tensor != nullptr, "write tensor specification must contain a tensor");
+    checksums.push_back(tensor_checksum(*spec.tensor, spec.role));
   }
-  HELIX_ASSERT(cursor == file_size, "written model byte count must match header");
-  if (output.tellp() != std::streampos(expected_stream_size)) {
-    io_error("written stream length does not match the model header");
-  }
+  write_llama_model_stream(
+      output, config, specs, checksums,
+      [&specs](std::ostream& payload_output, std::size_t index, std::size_t byte_length) {
+        HELIX_ASSERT(specs[index].tensor->nbytes() == byte_length,
+                     "tensor payload byte length must match its record");
+        write_tensor_payload(payload_output, *specs[index].tensor);
+      });
 }
 
 void write_llama_model_file(const std::filesystem::path& path, const LlamaConfig& config,
@@ -600,6 +702,74 @@ void write_llama_model_file(const std::filesystem::path& path, const LlamaConfig
     io_error("could not open '" + path.string() + "' for writing");
   }
   write_llama_model_file(output, config, weights);
+  output.flush();
+  if (!output) {
+    io_error("could not finish writing '" + path.string() + "'");
+  }
+}
+
+void write_llama_model_file_from_raw_float32_files(
+    const std::filesystem::path& path, const LlamaConfig& config,
+    std::span<const std::filesystem::path> tensor_paths) {
+  config.validate();
+  const std::vector<TensorSpec> specs = make_specs(config, nullptr);
+  if (tensor_paths.size() != specs.size()) {
+    invalid_format("raw tensor file count " + std::to_string(tensor_paths.size()) +
+                   " does not match expected count " + std::to_string(specs.size()));
+  }
+
+  std::error_code path_error;
+  const bool output_exists = std::filesystem::exists(path, path_error);
+  if (path_error) {
+    io_error("could not inspect output path '" + path.string() + "': " + path_error.message());
+  }
+  std::filesystem::path normalized_output;
+  if (output_exists) {
+    normalized_output = std::filesystem::weakly_canonical(path, path_error);
+  } else {
+    const std::filesystem::path output_parent = std::filesystem::weakly_canonical(
+        path.parent_path().empty() ? std::filesystem::path(".") : path.parent_path(), path_error);
+    normalized_output = output_parent / path.filename();
+  }
+  if (path_error) {
+    io_error("could not resolve output path '" + path.string() + "': " + path_error.message());
+  }
+
+  std::vector<std::uint64_t> checksums;
+  checksums.reserve(specs.size());
+  for (std::size_t index = 0; index < specs.size(); ++index) {
+    path_error.clear();
+    const std::filesystem::path normalized_input =
+        std::filesystem::weakly_canonical(tensor_paths[index], path_error);
+    if (path_error) {
+      io_error("could not resolve raw tensor payload '" + tensor_paths[index].string() +
+               "': " + path_error.message());
+    }
+    bool equivalent = false;
+    if (output_exists) {
+      equivalent = std::filesystem::equivalent(path, tensor_paths[index], path_error);
+      if (path_error) {
+        io_error("could not compare output path with raw tensor payload '" +
+                 tensor_paths[index].string() + "': " + path_error.message());
+      }
+    }
+    if (normalized_input == normalized_output || equivalent) {
+      invalid_format("output path aliases raw tensor payload '" + tensor_paths[index].string() +
+                     "'");
+    }
+    checksums.push_back(raw_tensor_checksum(tensor_paths[index], specs[index]));
+  }
+
+  std::ofstream output(path, std::ios::binary | std::ios::trunc);
+  if (!output) {
+    io_error("could not open '" + path.string() + "' for writing");
+  }
+  write_llama_model_stream(output, config, specs, checksums,
+                           [&tensor_paths, &checksums](std::ostream& payload_output,
+                                                       std::size_t index, std::size_t byte_length) {
+                             write_raw_tensor_payload(payload_output, tensor_paths[index],
+                                                      byte_length, checksums[index]);
+                           });
   output.flush();
   if (!output) {
     io_error("could not finish writing '" + path.string() + "'");

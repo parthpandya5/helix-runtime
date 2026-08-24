@@ -8,6 +8,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <fstream>
 #include <gtest/gtest.h>
 #include <limits>
 #include <sstream>
@@ -99,6 +100,72 @@ std::string serialize(const LlamaConfig& config, const LlamaWeights& weights) {
   std::ostringstream output(std::ios::out | std::ios::binary);
   write_llama_model_file(output, config, weights);
   return output.str();
+}
+
+std::vector<const Tensor*> canonical_tensors(const LlamaWeights& weights) {
+  std::vector<const Tensor*> tensors{&weights.token_embedding()};
+  tensors.reserve(3 + weights.layers().size() * 9);
+  for (const LlamaLayerWeights& layer : weights.layers()) {
+    tensors.push_back(&layer.attention_norm_weight);
+    tensors.push_back(&layer.query_weight);
+    tensors.push_back(&layer.key_weight);
+    tensors.push_back(&layer.value_weight);
+    tensors.push_back(&layer.attention_output_weight);
+    tensors.push_back(&layer.ffn_norm_weight);
+    tensors.push_back(&layer.gate_weight);
+    tensors.push_back(&layer.up_weight);
+    tensors.push_back(&layer.down_weight);
+  }
+  tensors.push_back(&weights.final_norm_weight());
+  tensors.push_back(&weights.lm_head_weight());
+  return tensors;
+}
+
+void write_raw_tensor(const std::filesystem::path& path, const Tensor& tensor) {
+  std::ofstream output(path, std::ios::binary | std::ios::trunc);
+  ASSERT_TRUE(output) << path;
+  for (std::size_t index = 0; index < tensor.numel(); ++index) {
+    const std::uint32_t bits = std::bit_cast<std::uint32_t>(tensor.data_as<float>()[index]);
+    for (std::size_t shift = 0; shift < 32; shift += 8) {
+      output.put(static_cast<char>((bits >> shift) & 0xffU));
+    }
+  }
+  ASSERT_TRUE(output) << path;
+}
+
+std::string read_file(const std::filesystem::path& path) {
+  std::ifstream input(path, std::ios::binary);
+  EXPECT_TRUE(input) << path;
+  return std::string(std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>());
+}
+
+struct TemporaryDirectory final {
+  explicit TemporaryDirectory(std::string_view prefix) {
+    const auto nonce = std::chrono::steady_clock::now().time_since_epoch().count();
+    path = std::filesystem::temp_directory_path() /
+           (std::string(prefix) + "-" + std::to_string(nonce));
+    std::filesystem::create_directory(path);
+  }
+
+  ~TemporaryDirectory() {
+    std::error_code ignored;
+    std::filesystem::remove_all(path, ignored);
+  }
+
+  std::filesystem::path path;
+};
+
+std::vector<std::filesystem::path> write_raw_tensors(const std::filesystem::path& directory,
+                                                     const LlamaWeights& weights) {
+  const std::vector<const Tensor*> tensors = canonical_tensors(weights);
+  std::vector<std::filesystem::path> paths;
+  paths.reserve(tensors.size());
+  for (std::size_t index = 0; index < tensors.size(); ++index) {
+    const std::filesystem::path path = directory / (std::to_string(index) + ".f32");
+    write_raw_tensor(path, *tensors[index]);
+    paths.push_back(path);
+  }
+  return paths;
 }
 
 LoadedLlamaModel deserialize(const std::string& bytes) {
@@ -272,6 +339,63 @@ TEST(ModelFormatTest, FilesystemOverloadsRoundTripAndReportMissingFileContext) {
     EXPECT_EQ(error.code(), ErrorCode::kRuntime);
     EXPECT_NE(error.message().find(missing.string()), std::string::npos);
   }
+}
+
+TEST(ModelFormatTest, RawFloat32FilesProduceCanonicalContainer) {
+  const LlamaConfig config = test_config();
+  const LlamaWeights weights = make_weights(config);
+  TemporaryDirectory temporary("helix-model-raw");
+  const std::vector<std::filesystem::path> paths = write_raw_tensors(temporary.path, weights);
+  const std::filesystem::path output_path = temporary.path / "converted.helix";
+
+  write_llama_model_file_from_raw_float32_files(output_path, config, paths);
+  EXPECT_EQ(read_file(output_path), serialize(config, weights));
+  LoadedLlamaModel loaded = read_llama_model_file(output_path);
+  expect_weights_equal(loaded.weights, weights);
+}
+
+TEST(ModelFormatTest, RawFloat32FilesRejectInvalidInputsBeforeOpeningOutput) {
+  const LlamaConfig config = test_config();
+  const LlamaWeights weights = make_weights(config);
+  TemporaryDirectory temporary("helix-model-raw-invalid");
+  std::vector<std::filesystem::path> paths = write_raw_tensors(temporary.path, weights);
+  const std::filesystem::path output_path = temporary.path / "converted.helix";
+
+  const std::span<const std::filesystem::path> too_few(paths.data(), paths.size() - 1);
+  EXPECT_THROW(write_llama_model_file_from_raw_float32_files(output_path, config, too_few), Error);
+  EXPECT_FALSE(std::filesystem::exists(output_path));
+
+  const std::string first_bytes = read_file(paths.front());
+  ASSERT_GT(first_bytes.size(), sizeof(float));
+  std::filesystem::resize_file(paths.front(), first_bytes.size() - sizeof(float));
+  EXPECT_THROW(write_llama_model_file_from_raw_float32_files(output_path, config, paths), Error);
+  EXPECT_FALSE(std::filesystem::exists(output_path));
+
+  {
+    std::ofstream restore(paths.front(), std::ios::binary | std::ios::trunc);
+    restore.write(first_bytes.data(), static_cast<std::streamsize>(first_bytes.size()));
+  }
+  std::string non_finite = first_bytes;
+  const std::uint32_t infinity =
+      std::bit_cast<std::uint32_t>(std::numeric_limits<float>::infinity());
+  for (std::size_t shift = 0; shift < 32; shift += 8) {
+    non_finite[shift / 8] = static_cast<char>((infinity >> shift) & 0xffU);
+  }
+  {
+    std::ofstream corrupt(paths.front(), std::ios::binary | std::ios::trunc);
+    corrupt.write(non_finite.data(), static_cast<std::streamsize>(non_finite.size()));
+  }
+  EXPECT_THROW(write_llama_model_file_from_raw_float32_files(output_path, config, paths), Error);
+  EXPECT_FALSE(std::filesystem::exists(output_path));
+
+  write_raw_tensor(paths.front(), weights.token_embedding());
+  EXPECT_THROW(write_llama_model_file_from_raw_float32_files(paths.front(), config, paths), Error);
+  EXPECT_EQ(read_file(paths.front()), first_bytes);
+
+  const std::filesystem::path hard_link = temporary.path / "payload-hard-link.helix";
+  std::filesystem::create_hard_link(paths.front(), hard_link);
+  EXPECT_THROW(write_llama_model_file_from_raw_float32_files(hard_link, config, paths), Error);
+  EXPECT_EQ(read_file(paths.front()), first_bytes);
 }
 
 } // namespace

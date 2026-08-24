@@ -21,7 +21,7 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install --yes ninja-build libgtest-dev libbenchmark-dev
+          sudo apt-get install --yes ninja-build libgtest-dev libbenchmark-dev python3-numpy
       - name: Configure
         run: >-
           cmake -S . -B build -G Ninja
@@ -42,7 +42,7 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install --yes ninja-build clang libgtest-dev libbenchmark-dev
+          sudo apt-get install --yes ninja-build clang libgtest-dev libbenchmark-dev python3-numpy
       - name: Configure
         run: >-
           cmake -S . -B build-sanitize -G Ninja
@@ -64,7 +64,7 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install --yes ninja-build clang clang-format clang-tidy libgtest-dev libbenchmark-dev
+          sudo apt-get install --yes ninja-build clang clang-format clang-tidy libgtest-dev libbenchmark-dev python3-numpy
       - name: Configure
         run: >-
           cmake -S . -B build-quality -G Ninja

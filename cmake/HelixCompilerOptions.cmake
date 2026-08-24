@@ -82,7 +82,8 @@ function(helix_add_format_targets)
     "${PROJECT_SOURCE_DIR}/src/*.cu"
     "${PROJECT_SOURCE_DIR}/tests/*.cpp"
     "${PROJECT_SOURCE_DIR}/benchmarks/*.cpp"
-    "${PROJECT_SOURCE_DIR}/examples/*.cpp")
+    "${PROJECT_SOURCE_DIR}/examples/*.cpp"
+    "${PROJECT_SOURCE_DIR}/tools/*.cpp")
 
   if(HELIX_CLANG_FORMAT_EXECUTABLE)
     add_custom_target(

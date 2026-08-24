@@ -16,11 +16,14 @@ option(HELIX_ENABLE_CUDA "Build the optional CUDA backend" OFF)
 option(HELIX_BUILD_TESTS "Build Helix unit tests" ${BUILD_TESTING})
 option(HELIX_BUILD_BENCHMARKS "Build Helix microbenchmarks" ON)
 option(HELIX_BUILD_EXAMPLES "Build Helix examples" ON)
+option(HELIX_BUILD_TOOLS "Build Helix model and validation tools" ON)
 option(HELIX_ENABLE_NCCL "Enable the future NCCL distributed backend" OFF)
 option(HELIX_ENABLE_SANITIZERS "Enable AddressSanitizer and UndefinedBehaviorSanitizer" OFF)
 option(HELIX_ENABLE_CLANG_TIDY "Run clang-tidy while compiling Helix targets" OFF)
 option(HELIX_WARNINGS_AS_ERRORS "Treat Helix compiler warnings as errors" OFF)
 option(HELIX_FETCH_DEPENDENCIES "Fetch missing test/benchmark dependencies" ON)
+set(HELIX_CONVERTER_PYTHONPATH "" CACHE PATH
+    "Optional Python module directory used only by checkpoint-converter tests")
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -259,6 +262,10 @@ if(HELIX_BUILD_EXAMPLES)
   add_subdirectory(examples EXCLUDE_FROM_ALL)
 endif()
 
+if(HELIX_BUILD_TOOLS)
+  add_subdirectory(tools)
+endif()
+
 set(HELIX_INSTALL_TARGETS
   helix_core
   helix_tensor
@@ -287,5 +294,6 @@ message(STATUS "Helix ${PROJECT_VERSION}")
 message(STATUS "  CUDA backend:       ${HELIX_ENABLE_CUDA}")
 message(STATUS "  Tests:              ${HELIX_BUILD_TESTS}")
 message(STATUS "  Benchmarks:         ${HELIX_BUILD_BENCHMARKS}")
+message(STATUS "  Tools:              ${HELIX_BUILD_TOOLS}")
 message(STATUS "  Sanitizers:         ${HELIX_ENABLE_SANITIZERS}")
 message(STATUS "  clang-tidy:         ${HELIX_ENABLE_CLANG_TIDY}")
