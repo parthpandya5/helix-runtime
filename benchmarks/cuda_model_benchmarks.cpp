@@ -13,7 +13,8 @@ namespace helix::model {
 namespace {
 
 constexpr int kWarmupIterations = 10;
-constexpr float kOracleTolerance = 2.0e-3F;
+constexpr float kAbsoluteTolerance = 2.0e-4F;
+constexpr float kRelativeTolerance = 2.0e-3F;
 
 Tensor random_tensor(Shape shape, std::uint64_t seed, bool normalization = false) {
   return Tensor::random_uniform(std::move(shape), seed, normalization ? 0.8F : -0.08F,
@@ -90,8 +91,8 @@ bool output_matches(benchmark::State& state, const Tensor& actual_device,
   for (std::size_t index = 0; index < actual.numel(); ++index) {
     const float actual_value = actual.data_as<float>()[index];
     const float expected_value = expected_host.data_as<float>()[index];
-    if (!std::isfinite(actual_value) ||
-        std::abs(actual_value - expected_value) > kOracleTolerance) {
+    const float allowed_error = kAbsoluteTolerance + kRelativeTolerance * std::abs(expected_value);
+    if (!std::isfinite(actual_value) || std::abs(actual_value - expected_value) > allowed_error) {
       state.SkipWithError("CUDA Llama output does not match the CPU oracle");
       return false;
     }

@@ -9,9 +9,10 @@
 namespace helix::model {
 
 // Synchronous Float32 CUDA correctness baseline for full causal prefill. The
-// model owns a deep CUDA copy of all weights. Every operation is submitted to
-// the caller's stream, and forward synchronizes that stream before returning so
-// temporary tensor storage cannot be reclaimed while kernels still use it.
+// model owns a deep CUDA copy of all weights. Every kernel issued by
+// forward_device uses the caller's stream, and that path synchronizes before
+// returning so temporary tensor storage cannot be reclaimed while kernels still
+// use it. The host-input overload performs blocking input/cache transfers first.
 //
 // This baseline intentionally does not provide KV-backed decode, batching,
 // allocator integration, graph capture, or overlap. Those require explicit

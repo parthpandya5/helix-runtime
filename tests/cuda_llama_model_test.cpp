@@ -14,6 +14,9 @@
 namespace helix::model {
 namespace {
 
+constexpr float kAbsoluteTolerance = 2.0e-4F;
+constexpr float kRelativeTolerance = 2.0e-3F;
+
 LlamaConfig tiny_config() {
   return LlamaConfig{11, 8, 12, 2, 2, 8, 1.0e-5F, 10'000.0F};
 }
@@ -61,13 +64,15 @@ std::pair<Tensor, Tensor> make_rope_cache(const LlamaConfig& config, std::size_t
           Tensor::from_values(shape, sine, Device::cuda(0))};
 }
 
-void expect_close(const Tensor& actual_device, const Tensor& expected_host, float tolerance) {
+void expect_close(const Tensor& actual_device, const Tensor& expected_host) {
   const Tensor actual = actual_device.to(Device::cpu());
   ASSERT_EQ(actual.shape(), expected_host.shape());
   ASSERT_EQ(actual.dtype(), DType::kFloat32);
   for (std::size_t index = 0; index < actual.numel(); ++index) {
-    EXPECT_NEAR(actual.data_as<float>()[index], expected_host.data_as<float>()[index], tolerance)
-        << "at index " << index;
+    const float actual_value = actual.data_as<float>()[index];
+    const float expected_value = expected_host.data_as<float>()[index];
+    const float allowed_error = kAbsoluteTolerance + kRelativeTolerance * std::abs(expected_value);
+    EXPECT_LE(std::abs(actual_value - expected_value), allowed_error) << "at index " << index;
   }
 }
 
@@ -84,8 +89,10 @@ protected:
 TEST_F(CudaLlamaModelTest, FullPrefillMatchesCpuForSingleAndOddTokenCounts) {
   const LlamaConfig config = tiny_config();
   CpuLlamaModel cpu_model(config, make_weights(config));
-  const LlamaWeights cuda_source = make_weights(config);
-  CudaLlamaModel cuda_model(config, cuda_source);
+  CudaLlamaModel cuda_model = [&config] {
+    const LlamaWeights source = make_weights(config);
+    return CudaLlamaModel(config, source);
+  }();
   helix::cuda::Stream stream;
 
   cuda_model.weights().validate(config, Device::cuda(0));
@@ -95,7 +102,7 @@ TEST_F(CudaLlamaModelTest, FullPrefillMatchesCpuForSingleAndOddTokenCounts) {
     const Tensor expected = cpu_model.forward(prompt);
     const Tensor actual = cuda_model.forward(prompt, stream);
     EXPECT_EQ(actual.device(), Device::cuda(0));
-    expect_close(actual, expected, 2.0e-3F);
+    expect_close(actual, expected);
   }
 }
 
@@ -114,10 +121,27 @@ TEST_F(CudaLlamaModelTest, RejectsInvalidHostAndDeviceMetadataBeforeExecution) {
   const std::array<std::uint32_t, 1> valid_id{2};
   const Tensor device_ids = Tensor::from_values({1}, valid_id, Device::cuda(0));
   const auto [cosine, sine] = make_rope_cache(config, 1);
+  EXPECT_THROW(model.forward_device(Tensor::zeros({1}, DType::kUInt32), cosine, sine, stream),
+               Error);
   EXPECT_THROW(model.forward_device(Tensor::zeros({1}, DType::kFloat32, Device::cuda(0)), cosine,
                                     sine, stream),
                Error);
+  EXPECT_THROW(model.forward_device(Tensor::zeros({1, 1}, DType::kUInt32, Device::cuda(0)), cosine,
+                                    sine, stream),
+               Error);
+  EXPECT_THROW(model.forward_device(Tensor::zeros({0}, DType::kUInt32, Device::cuda(0)), cosine,
+                                    sine, stream),
+               Error);
+  EXPECT_THROW(
+      model.forward_device(Tensor::zeros({static_cast<Dimension>(config.max_sequence_length + 1)},
+                                         DType::kUInt32, Device::cuda(0)),
+                           cosine, sine, stream),
+      Error);
   EXPECT_THROW(model.forward_device(device_ids, Tensor::zeros(cosine.shape()), sine, stream),
+               Error);
+  EXPECT_THROW(model.forward_device(device_ids,
+                                    Tensor::zeros(cosine.shape(), DType::kUInt32, Device::cuda(0)),
+                                    sine, stream),
                Error);
   EXPECT_THROW(model.forward_device(device_ids, cosine,
                                     Tensor::zeros({1, 1}, DType::kFloat32, Device::cuda(0)),
