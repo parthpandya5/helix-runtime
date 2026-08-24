@@ -20,7 +20,9 @@ CPU prefill runtime, the M18 single-sequence cached generation path, and the M19
 synchronous multi-request CPU execution engine are implemented and CPU-validated.
 The narrow M17 model path now has an offline Hugging Face Llama safetensors
 converter with an independent source-layout logits oracle; no downloaded public
-checkpoint result is claimed yet.
+checkpoint result is claimed yet. Its native loader now also has an opt-in,
+read-only POSIX memory-mapped path with shared mapping lifetime and enforced
+immutable Tensor views; the portable copied loader remains available.
 M22 now includes the measured block-aligned sharing primitive, a bounded exact-
 content prefix index, persistent LRU anchors, and opt-in reuse in the CPU runtime.
 The repository
@@ -36,7 +38,7 @@ weight format, performs greedy generation through a contiguous KV cache, and
 executes scheduler batches against a shared paged KV pool with optional prompt-
 prefix reuse. On
 2026-08-24, Apple Clang 17 built the project on macOS arm64 with warnings as
-errors; 172/172 CPU tests passed in Debug, Release, and ASan/UBSan configurations.
+errors; 177/177 CPU tests passed in Debug, Release, and ASan/UBSan configurations.
 
 CUDA is optional at configure time. The current Apple Silicon development host has
 no NVIDIA GPU or native CUDA toolkit, so no CUDA execution or performance claim is
@@ -46,8 +48,8 @@ compile-validated in an ARM64 CUDA 12.6 development container without a
 driver/device. The M8 stream-ordered allocator and M9 block-reduced RMSNorm,
 grid-stride SwiGLU, adjacent-pair RoPE, and projection adapter are also
 compile-validated, as is the M10 three-stage contiguous attention baseline. None is
-runtime-validated on a GPU. The CUDA-on build passes 171 C++ hardware-independent
-tests and explicitly skips 57 GPU tests without a driver/device (228 registered
+runtime-validated on a GPU. The CUDA-on build passes 176 C++ hardware-independent
+tests and explicitly skips 57 GPU tests without a driver/device (233 registered
 tests total). Its container lacks Python/NumPy, so the separate converter
 integration test is not registered there; it passes in all three native CPU
 configurations.
@@ -130,7 +132,7 @@ cmake --build build --target format-check
 Helix targets. `HELIX_BUILD_TOOLS=OFF` omits the model pack/inspection utilities;
 it does not affect the runtime libraries. The one Python converter integration
 test auto-registers only when the selected Python 3 interpreter can import NumPy;
-otherwise the 171-test C++/benchmark suite remains available.
+otherwise the 176-test C++/benchmark suite remains available.
 
 ## Benchmarks
 
@@ -164,6 +166,13 @@ compaction: direct block-table attention reduced isolated layer median CPU time 
 trace medians improved by only 0.08%–6.23%. Methodology and measurements live in
 [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md).
 
+A paired warm-page model-loader fixture retains the copied path and compares it
+with the immutable mapped path while preserving all checksum, padding, shape, and
+finite-value validation. Across 117,184 B, 461,888 B, and 3,153,600 B files,
+mapped median CPU time was 20.96%, 15.14%, and 12.78% lower. File generation is
+outside timing and each path is warmed once; these are not cold-disk, RSS, model-
+execution, or GPU results.
+
 A separate M22 fixture compares copying an already-computed aligned prefix into a
 new sequence with aliasing its physical page table. Across 32 KiB, 93,240 B, and
 1 MiB prefixes, shared lifecycle medians were 11.02x, 34.08x, and 320.67x faster
@@ -186,8 +195,11 @@ was 68.7% slower for an 8-token prompt, but 1.80x and 6.04x faster for 16- and
 signed 64-bit shape and canonical row-major strides, dtype, device, logical bytes,
 storage bytes, and byte offset. Size multiplication is checked before allocation.
 `reshape`/`view` share storage only when safe; `clone` and same-device `to` create
-independent storage. Float32 is executable, while Float16 currently supports only
-metadata, allocation, zeroing, and bytewise copy.
+independent storage. CPU storage may also wrap an externally owned, aligned,
+read-only buffer with an explicit shared lifetime token. Views preserve
+immutability, mutable pointer access and in-place operations fail, and `clone`
+produces ordinary writable storage. Float32 is executable, while Float16 currently
+supports only metadata, allocation, zeroing, and bytewise copy.
 
 ```bash
 cmake --build build --target helix_tensor_demo
@@ -328,8 +340,10 @@ tensor-role/shape directory, 64-byte payload alignment, checked nonoverlapping
 offsets, zero padding, finite Float32 validation, and metadata/per-payload FNV-1a
 checksums. FNV is corruption detection, not authentication. The loader rejects
 truncated, trailing, corrupted, noncanonical, or incompatible files before
-returning a model. Exact layouts, ownership, validation, measured CPU baselines,
-and compatibility boundaries are in
+returning a model. `read_llama_model_file` decodes into owned portable storage;
+`read_llama_model_file_mapped` instead validates in place and exposes immutable
+payload views on supported POSIX little-endian IEEE-754 hosts. Exact layouts,
+ownership, validation, measured CPU baselines, and compatibility boundaries are in
 [`docs/MODEL_SUPPORT.md`](docs/MODEL_SUPPORT.md).
 
 ### Checkpoint conversion
@@ -440,8 +454,10 @@ Partial-page sharing, model-global cache namespaces, and request preemption rema
 future work. Tensor
 allocator integration is also pending. Float16 has no arithmetic path yet. Tensor
 execution is contiguous-only; broadcasting, slicing, and general strided kernels are intentionally
-deferred. CPU kernels are reference implementations, not optimized BLAS
-replacements.
+deferred. The mapped model path is POSIX/little-endian/IEEE-754 only, requires the
+source inode not be modified while a model lives, and has no cold-storage or RSS
+benchmark; callers on other hosts must select the copied loader. CPU kernels are reference
+implementations, not optimized BLAS replacements.
 
 ## Engineering notes
 

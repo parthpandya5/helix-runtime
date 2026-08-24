@@ -5,11 +5,11 @@
 The Milestone 10 contiguous CPU reference, Milestone 13 direct paged CPU path, and
 post-M19 paged-history-plus-tail decode path are **implemented, CPU-validated,
 sanitizer-validated, and benchmarked**. Ten focused attention tests and the full
-172-test CPU suite pass in Debug, Release, and ASan/UBSan builds. The contiguous
+177-test CPU suite pass in Debug, Release, and ASan/UBSan builds. The contiguous
 CUDA baseline, four GPU tests, and CUDA-event benchmark fixtures compile with NVCC
 12.6.85 and warnings as errors, but have not run without an NVIDIA driver/device.
-The CUDA-on build passes 171 C++ host tests and explicitly skips 57 hardware-gated
-GPU tests (228 total); the Python converter test is unavailable in that container.
+The CUDA-on build passes 176 C++ host tests and explicitly skips 57 hardware-gated
+GPU tests (233 total); the Python converter test is unavailable in that container.
 Paged attention is CPU-only. No GPU correctness or performance claim is made.
 
 ## Tensor contract

@@ -39,6 +39,12 @@ device transfer allocate independent storage; reshape/view retain shared storage
 after checked bounds and element-count validation. Shape and byte multiplications
 reject negative values and overflow before pointer arithmetic or allocation.
 
+Storage can also wrap an aligned externally owned CPU range with an explicit
+shared lifetime. That path is read-only: mutable `data()` access and in-place
+operations fail, views preserve immutability, and `clone` returns writable owned
+storage. Helix uses this contract for mapped model weights so a shallow alias
+cannot silently mutate parameters.
+
 ## Why is GPU memory allocation expensive?
 
 Direct device allocation can enter the CUDA runtime/driver, update global device
@@ -316,8 +322,19 @@ enable NCCL or claim multi-GPU support.
 Runtime loading uses the C++ `HELIXLM1` format only: a fixed little-endian header,
 canonical tensor directory, 64-byte payload alignment, exact file coverage,
 finite Float32 values, and FNV-1a metadata/payload checksums. FNV is accidental-
-corruption detection, not authentication. The loader constructs local RAII
-tensors and returns no partial model after an error.
+corruption detection, not authentication. Both native loaders share the same
+metadata parser and return no partial model after an error. The portable path
+decodes into aligned owned Tensors. The opt-in POSIX path maps a regular file
+read-only and exposes payload-sized immutable Tensor views that share one RAII
+mapping lifetime; it still scans every byte for checksum and finite-value
+validation.
+
+Memory mapping is not a snapshot or a universal portability layer. It requires a
+little-endian IEEE-754 POSIX host, and the source inode must not be modified or
+truncated while the model lives. Rename/unlink is safe after mapping. The copied
+loader remains the fallback for streams and other hosts. In a paired warm-page
+fixture, mapping reduced median CPU load time by 12.78%–20.96% across three
+disclosed synthetic files; that is not cold-disk latency or an RSS result.
 
 The optional offline converter accepts one narrow Hugging Face Llama safetensors
 layout. Python/NumPy strictly parses single or indexed shards, validates the exact
@@ -342,10 +359,11 @@ softmax/GEMM/transformer/attention kernels, allocator metadata and deferred reus
 KV layouts, paged attention, requests, scheduling/metrics, the CPU transformer,
 cached generation session, exact bounded prefix index/LRU, paged multi-request CPU
 engine with suffix reuse, greedy selection, native file parser/packer, and the
-narrow safetensors metadata/layout converter. It delegates numerical array
-transposition in the one-time converter to NumPy, CUDA driver/runtime operations
-to the CUDA Runtime API, and testing/benchmark harnesses to GoogleTest/Google
-Benchmark.
+narrow safetensors metadata/layout converter. It also implements read-only
+external Tensor ownership and the checked POSIX model-mapping path. It delegates
+numerical array transposition in the one-time converter to NumPy, CUDA driver/
+runtime operations to the CUDA Runtime API, and testing/benchmark harnesses to
+GoogleTest/Google Benchmark.
 No PyTorch runtime, BLAS, cuBLAS, NCCL, or external model graph executes Helix
 inference today. cuBLAS and NCCL remain explicitly labeled future library paths.
 
@@ -380,6 +398,13 @@ runtime traces improved by only 0.08%–6.23%; the largest case was effectively 
 tie relative to variation. That taught me to distinguish a verified local
 bottleneck from overall model throughput. Helix keeps `kCompactCopy` selectable so
 the comparison remains reproducible.
+
+Mapped model loading was a bounded win rather than “zero-copy means instant.” It
+removed owned payload allocation and copying, but retained full checksum and
+finite-value scans. Warm-page median CPU time improved 20.96%, 15.14%, and 12.78%
+as file size grew. The narrowing result makes the remaining linear validation cost
+visible and is why I do not describe mapping as constant-time loading, cold-disk
+speed, or a measured memory reduction.
 
 Prefix reuse produced the clearest negative result. It cut executed prompt tokens
 in half for the eight-token fixture but made the complete trace 68.7% slower:

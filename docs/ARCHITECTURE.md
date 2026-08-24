@@ -135,7 +135,7 @@ A `Tensor` is a small handle with:
 - logical element count,
 - visible byte count,
 - byte offset into storage,
-- shared ownership of a `Storage` allocation.
+- shared ownership of a `Storage` allocation or immutable external range.
 
 ```mermaid
 classDiagram
@@ -146,30 +146,40 @@ classDiagram
       +Device device
       +numel() size_t
       +nbytes() size_t
-      +data() void*
+      +is_read_only() bool
+      +data() const void*
       +reshape(Shape) Tensor
     }
     class Storage {
       +Device device
       +size_bytes size_t
-      +data() void*
+      +is_read_only bool
+      +data() const void*
+      +mutable_data() void*
     }
-    Tensor "many views" --> "1 shared allocation" Storage
+    class ExternalOwner {
+      +shared lifetime token
+    }
+    Tensor "many views" --> "1 shared range" Storage
+    Storage o-- ExternalOwner : optional
 ```
 
-Storage owns memory; Tensor owns metadata. A view shares storage and changes only
-metadata/offset after validating bounds. The initial implementation supports
-contiguous row-major tensors. General strided execution is deferred until kernels
-need it; APIs reject unsupported non-contiguous inputs rather than silently
-producing wrong results.
+Storage owns memory or an explicit shared lifetime token; Tensor owns metadata. A
+view shares storage and changes only metadata/offset after validating bounds.
+Externally owned CPU ranges are read-only: non-const raw access and in-place
+operations reject them, views preserve the flag, and a deep clone returns ordinary
+writable owned storage. The initial implementation supports contiguous row-major
+tensors. General strided execution is deferred until kernels need it; APIs reject
+unsupported non-contiguous inputs rather than silently producing wrong results.
 
 ### Ownership
 
 - Owning factory operations allocate `Storage` through a backend-specific storage
   routine. CUDA storage remains direct until the cache is stream-safe.
 - Views retain shared storage ownership.
-- A non-owning external-buffer tensor, if added, requires an explicit lifetime
-  token/deleter; it will not masquerade as owning memory.
+- A read-only external-buffer Tensor requires a non-null shared lifetime owner for
+  non-empty storage, validates its declared alignment, and never exposes a mutable
+  pointer. The owner—not Tensor—defines how the backing resource is released.
 - Copies are shallow handle copies. `clone` performs a deep copy.
 - Device transfer returns new storage on the target device.
 
@@ -550,10 +560,12 @@ flowchart LR
 
 `CpuLlamaModel` moves a validated `LlamaWeights` bundle into one model owner. Its
 const forward path allocates independent activations and has no shared mutable
-state. Because Tensor storage is reference-counted, thread safety still requires
-that a caller not mutate a shallow weight alias retained before construction. The
-optional diagnostic path preserves post-layer Tensor handles and the final
-normalized state; ordinary execution does not retain those intermediates.
+state. Ordinary caller-created Tensor weights remain shallow-copyable, so thread
+safety requires that retained writable aliases not be mutated. The mapped loader
+instead constructs immutable Tensor views, making that condition enforceable for
+file-backed weights. The optional diagnostic path preserves post-layer Tensor
+handles and the final normalized state; ordinary execution does not retain those
+intermediates.
 
 `CpuLlamaGenerator` is the single-sequence session owner. It contains the model,
 one `ContiguousKvCache`, and one sequence handle and is deliberately noncopyable,
@@ -603,8 +615,11 @@ flowchart LR
     Py --> Raw[Canonical staged Float32 payloads]
     Raw --> Packer[C++ model packer]
     Packer --> File[HELIXLM1]
-    File --> Loader[C++ checked loader]
-    Loader --> Model[CpuLlamaModel]
+    File --> Loader{C++ checked loaders}
+    Loader -->|portable decode / copy| Owned[Owned Tensor weights]
+    Loader -->|POSIX read-only map| Mapped[Immutable Tensor views]
+    Owned --> Model[CpuLlamaModel]
+    Mapped --> Model
 ```
 
 Python owns only strict safetensors/index parsing and chunked dtype/layout
@@ -615,6 +630,14 @@ shape-derived sizes, finite little-endian Float32 values, aliasing, and checksum
 Packing occurs in a private same-filesystem temporary directory, and the final
 path changes only through atomic replacement after success. The runtime has no
 Python dependency.
+
+Both native load paths share header/directory validation and scan every payload
+for checksum and finite-value correctness. The portable path decodes into aligned
+owned allocations. On POSIX little-endian IEEE-754 hosts, the explicit mapped path
+creates one private read-only file mapping and payload-sized Tensor storage views
+that share its RAII lifetime. It avoids parameter allocation/copy but does not
+avoid page faults or validation scans. Rename/unlink is safe after load; modifying
+or truncating the live source inode violates the mapping contract.
 
 The current CPU path performs full causal prefill and single-token decode against
 either contiguous or paged K/V storage, repacking token-major Q/K/V tensors around

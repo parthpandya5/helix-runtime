@@ -599,6 +599,24 @@ converter integration test is not registered there. No downloaded public
 checkpoint or tokenizer has been validated, so broad compatibility is not
 claimed. Details are in `docs/MODEL_SUPPORT.md`.
 
+Immutable-loading follow-up (2026-08-24, commit `fc7fff5`): Tensor/Storage now
+supports aligned externally owned CPU ranges with an enforced read-only contract.
+The opt-in `read_llama_model_file_mapped` path uses a private POSIX mapping on
+little-endian IEEE-754 hosts, shares one RAII mapping lifetime across payload-sized
+Tensor views, and retains the copied stream/filesystem loader as the portable
+baseline. Both paths use the same metadata parser and verify exact coverage,
+padding, payload checksums, finite values, and final weight geometry before return.
+
+Tests prove bit-exact copied equivalence, mutation rejection, clone/view semantics,
+64-byte alignment, executable logits, mapping survival after unlink, and rejection
+of truncated, trailing, corrupted, non-finite, and missing inputs. A randomized
+paired warm-page benchmark measured 20.96%, 15.14%, and 12.78% lower median CPU
+load time across the three disclosed 117,184 B–3,153,600 B synthetic files. It is
+not a cold-disk, RSS, inference, or GPU result. Debug, Release, and ASan/UBSan
+native suites pass 177/177. The CUDA 12.6 compile container passes 176 C++ host
+tests and explicitly skips 57 GPU tests without a device (233 total); its separate
+converter integration test remains unavailable because Python/NumPy is absent.
+
 ### M18 — Autoregressive generation — Implemented, CPU-validated, sanitized, and benchmarked
 
 - prefill, cached decode, greedy token selection, and stop conditions

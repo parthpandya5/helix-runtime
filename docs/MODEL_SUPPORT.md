@@ -9,8 +9,10 @@ KV decode, not a claim
 of compatibility with every model whose configuration contains the word “Llama.”
 The implementation, native weight container, unit tests, sanitizer suite, CPU
 benchmarks, and a narrowly checked Hugging Face Llama safetensors conversion path
-are complete. CUDA model execution, fused tensor batching, tokenizer integration,
-and validation against a downloaded public checkpoint remain later gates.
+are complete. Native files can be loaded through either portable owned copies or
+an opt-in immutable POSIX mapping. CUDA model execution, fused tensor batching,
+tokenizer integration, and validation against a downloaded public checkpoint
+remain later gates.
 
 ## Exact architecture contract
 
@@ -139,11 +141,14 @@ The runtime requires exactly `3 + 9*L` tensors in this order:
 
 `LlamaWeights` is move-only and validates every tensor's device, dtype,
 contiguity, and exact shape. `CpuLlamaModel` moves the weight bundle into one
-owner. Tensor storage itself is reference-counted, so a caller that retained a
-shallow alias before model construction could still mutate the same bytes. Const
-model APIs never mutate weights, and concurrent forward calls are safe only while
-no external alias mutates backing storage. A future immutable weight-storage type
-would enforce this boundary rather than merely documenting it.
+owner. Ordinary Tensor storage is reference-counted, so a caller that retained a
+shallow writable alias before model construction could still mutate the same
+bytes. The mapped loader closes that boundary: each payload is an externally owned
+read-only Tensor, views retain the mapping and immutability, mutable pointer access
+and in-place operations fail, and `clone` makes an independent writable copy.
+Const model APIs never mutate weights. Concurrent forward calls over mapped
+weights therefore share immutable parameters and allocate independent activations;
+the source inode must not be modified while those mappings live.
 
 ## Offline Hugging Face Llama conversion
 
@@ -255,9 +260,10 @@ the C++ runtime, tools, or the remaining test suite.
 
 ## Native model file v1
 
-`write_llama_model_file` and `read_llama_model_file` implement a deterministic,
-little-endian container. Streams must be seekable and start at offset zero. The
-runtime does not require Python to read it.
+`write_llama_model_file`, `read_llama_model_file`, and
+`read_llama_model_file_mapped` implement a deterministic, little-endian container.
+Streams must be seekable and start at offset zero. The runtime does not require
+Python to read it.
 
 ### Header
 
@@ -299,11 +305,49 @@ The loader checks, before exposing a model:
 - zero alignment padding, every payload checksum, and finite Float32 values;
 - the assembled `LlamaWeights` contract once more before return.
 
-Payload tensors are materialized into local RAII objects while checksums are
-verified. An error destroys those locals; a partially loaded `LoadedLlamaModel` is
-never returned. FNV-1a detects accidental corruption but is not cryptographic
-authentication. Treat model files as untrusted structured input, not as signed
-artifacts.
+Both loaders use the same header/directory parser and perform every check above
+before returning. An error destroys all local Tensor/mapping owners, so a partially
+loaded `LoadedLlamaModel` never escapes. FNV-1a detects accidental corruption but
+is not cryptographic authentication. Treat model files as untrusted structured
+input, not as signed artifacts.
+
+### Copied and mapped load paths
+
+```mermaid
+flowchart LR
+    File[HELIXLM1 file] --> Common[Shared metadata / padding / payload validation]
+    Common --> Copy[Portable copied loader]
+    Copy --> Owned[Owned aligned Tensor payloads]
+    Common --> Map[POSIX read-only mapping]
+    Map --> Views[Immutable Tensor payload views]
+    Views --> Owner[Shared mapping lifetime]
+```
+
+The portable filesystem/stream loader reads chunks, decodes little-endian
+Float32 values, and allocates one aligned owning Tensor per payload. The mapped
+path is deliberately explicit rather than silently replacing it. On a POSIX,
+little-endian IEEE-754 host it opens a regular file read-only, obtains the exact
+size from that descriptor, creates a private read-only mapping, and closes the
+descriptor. Canonical 64-byte file offsets plus the page-aligned mapping base make
+every Tensor pointer aligned; both assumptions are checked at runtime. Each Tensor
+wraps only its payload range while sharing one RAII mapping owner, so
+`allocated_bytes()` remains the tensor's payload size and the final view keeps the
+mapping alive.
+
+Mapping does not skip validation or make loading constant-time. Helix still scans
+all metadata, padding, and payload bytes, verifies every checksum, decodes every
+Float32 representation for finite-value validation, and revalidates the assembled
+weight shapes. It removes payload heap allocation, endian-copy loops, and owned
+parameter copies on a compatible host. Callers can query
+`mapped_model_loading_supported()`; stream inputs and unsupported hosts must
+explicitly select the copied loader instead.
+
+The mapping owns an inode, not an immutable snapshot. Rename or unlink after a
+successful load is safe and tested because the mapping retains the pages. In-place
+modification or truncation by another process while the model lives violates the
+API contract and can change bytes or fault future accesses; Helix cannot enforce
+cooperation from an external writer. Model deployment must publish complete files
+by replacement and leave live inodes unchanged.
 
 ## Correctness and validation
 
@@ -332,6 +376,12 @@ but checksum-consistent ranks/offsets, invalid weights, non-finite weights, and
 nonzero stream origins. Two additional C++ tests prove that canonical raw Float32
 files produce byte-identical containers and reject wrong counts/sizes, non-finite
 values, direct aliases, and hard-link aliases before destructive output access.
+Mapped-loader tests additionally compare every payload bit with copied/expected
+weights, execute identical logits, enforce read-only mutation failures, verify
+64-byte alignment and payload-sized storage accounting, and prove mapping lifetime
+after the pathname is unlinked. Truncation, trailing bytes, metadata corruption,
+nonzero padding, checksum-consistent non-finite payloads, and missing paths are
+rejected with the same format/error boundary.
 
 The converter integration test synthesizes a two-layer sharded Hugging Face-style
 checkpoint containing F32, F16, and BF16 tensors. It independently parses the
@@ -344,14 +394,14 @@ non-finite inputs, and shard path escape are also covered. This is strong mappin
 evidence, but it is not a claim that a downloaded public checkpoint or tokenizer
 has been exercised.
 
-Validation on 2026-08-24 through converter commit `4c13d59`:
+Validation on 2026-08-24 through mapped-loader commit `fc7fff5`:
 
-- Debug, Release, and Apple Clang ASan/UBSan CPU suites: 172/172 tests passed;
+- Debug, Release, and Apple Clang ASan/UBSan CPU suites: 177/177 tests passed;
 - all Release tests and benchmark smoke workloads passed;
 - CUDA 12.6.85/GCC 13.2 warnings-as-errors build: all targets compiled and all
-  171 C++ hardware-independent tests passed;
+  176 C++ hardware-independent tests passed;
 - 57 GPU runtime tests remained explicitly skipped because the compile container
-  has no NVIDIA driver or device (228 registered tests total);
+  has no NVIDIA driver or device (233 registered tests total);
 - the CUDA container lacks Python/NumPy, so its converter integration test was not
   registered; that test passed in every native CPU configuration.
 
@@ -364,9 +414,14 @@ outside timing. The load fixture includes stream construction, metadata and
 payload validation/checksums, endian decoding, Tensor allocation, and final weight
 validation, but excludes filesystem I/O and serialization.
 
-These measurements establish the first implementation. They do not show an
-optimization, GPU behavior, production inference throughput, or comparison with
-BLAS/framework runtimes.
+Those measurements establish the first implementation. A separate paired
+filesystem fixture preserves the copied loader and compares it with the immutable
+mapping after one untimed load per path. Mapped median CPU time was 20.96%, 15.14%,
+and 12.78% lower for the three disclosed 117,184 B–3,153,600 B synthetic files.
+It includes open/map-or-read, full validation, Tensor/weight assembly, and
+destruction, but it is a warm-page experiment—not cold-storage latency, an RSS
+measurement, GPU behavior, model execution, production throughput, or a
+BLAS/framework comparison.
 
 The M18 next-position fixture compares one cached decode against recomputing the
 same complete prefix. Model/cache setup and prompt prefill are excluded; the cached
@@ -405,7 +460,9 @@ results, not evidence about a future CUDA paged-attention kernel.
   layout. No GQA/MQA, biases, partial/scaled RoPE, sliding windows, mixture-of-
   experts blocks, quantization, adapters, or arbitrary model graphs. Tied input
   embeddings are materialized as a separate explicit output payload.
-- No memory mapping or zero-copy file loading; each payload is decoded and copied
-  into owned aligned Tensor storage.
+- Immutable mapped loading requires a POSIX, little-endian IEEE-754 host and a
+  regular file whose inode remains unchanged for the model lifetime. The portable
+  stream/filesystem path still allocates and copies every payload. Cold-page
+  latency and resident-memory effects have not been measured.
 
 Those omissions are compatibility boundaries, not silently accepted variants.

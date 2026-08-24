@@ -8,7 +8,7 @@ that into a GPU performance claim.
 
 - Engineered a CPU-first C++20/CUDA inference runtime with checked Tensor/storage
   ownership, deterministic reference kernels, causal attention, contiguous and
-  paged KV caches, request scheduling, and continuous batching; maintained 172
+  paged KV caches, request scheduling, and continuous batching; maintained 177
   passing Debug, Release, and ASan/UBSan CPU tests.
 - Implemented manual CUDA elementwise, reduction, stable-softmax, naive/tiled
   SGEMM, RMSNorm, RoPE, SwiGLU, and attention paths with RAII streams/events and
@@ -45,9 +45,11 @@ that into a GPU performance claim.
   layer call and reducing isolated median CPU time by 13.3%–27.7%; complete trace
   gains were a more modest 0.08%–6.23%.
 - Composed the reference kernels into a narrow Float32 Llama-style full-prefill
-  model and created a deterministic versioned weight container with checked
-  tensor roles/shapes/offsets, 64-byte payload alignment, corruption checksums,
-  finite-value validation, and transactional RAII loading.
+  model whose layer states and logits match an independent deterministic oracle.
+- Designed a deterministic versioned weight container with checked tensor geometry,
+  aligned payloads, corruption checksums, and dual copied/memory-mapped loaders;
+  enforced immutable mapped Tensor lifetimes and reduced warm-page median CPU load
+  time by 12.78%–20.96% across three disclosed synthetic files.
 - Built a bounded-memory Hugging Face Llama safetensors converter for sharded
   F32/F16/BF16 checkpoints, including strict architecture/path validation,
   projection transposition, RoPE coordinate remapping, atomic output replacement,

@@ -33,6 +33,7 @@ Every recorded experiment must include:
 | M15 FIFO scheduler host trace | No earlier scheduler implementation | Schedule and complete deterministic mixed prefill/decode traces under token, running-request, and logical KV-block limits | Corrected median CPU time per complete trace: 48.777 us (16 requests/256 tokens) through 1.342 ms (128 requests/6,144 tokens) | A first fixture revision accidentally polled the O(N) statistics snapshot inside timing; those values were discarded. The corrected trace measures host policy and completion-vector work, not inference. |
 | M16 continuous batching policy | Static cohorts on the same mixed-length request sequence | Refill finished slots between iterations and aggregate lifecycle metrics | Under an explicit constant-1-ms iteration model, continuous/static makespans were 48/132 ms and 92/260 ms (2.75x and 2.83x modeled rates). Median host control CPU times differed by 1.3% and 4.1%. | Modeled results demonstrate policy utilization only; they are not measured model throughput. Host differences are small relative to local variation and do not establish a CPU optimization. |
 | M17 CPU Llama-style prefill and model load | No earlier complete model path | Compose the tested CPU kernels into full causal prefill and add checked `HELIXLM1` deserialization | Prefill medians: 97.942 us, 2.099 ms, and 34.104 ms for the three disclosed tiny configurations; checked in-memory load: 183.744 us, 640.046 us, and 3.967 ms | These establish single-threaded Float32 reference baselines, including forward temporaries or loader validation/allocation as specified. They do not demonstrate an optimization, GPU performance, disk-loading speed, or production model throughput. |
+| M17 immutable mapped model loading | Portable filesystem loader with owned aligned payload allocations and little-endian copies | Retain identical validation but expose payload-sized read-only Tensor views over one RAII POSIX mapping | Copied/mapped median CPU times: 203.835/161.110 us, 673.728/571.736 us, and 4.333277/3.779571 ms; reductions 20.96%, 15.14%, and 12.78% | This warm-page paired fixture includes open/map-or-read, full validation, assembly, and destruction. It is not cold-disk latency, an RSS result, model execution, or evidence for non-POSIX hosts. |
 | M18 cached CPU next-position execution | Full-prefix recomputation for the identical prompt plus one input token | Reuse prefill K/V and execute only the new position | Cached/full-recompute median CPU times: 32.100/118.420 us, 89.580 us/2.113 ms, and 646.960 us/36.741 ms (3.69x, 23.59x, and 56.79x) | The growing advantage demonstrates avoided prefix model work in three tiny single-sequence CPU fixtures. It is not a production model, batched-runtime, tokenizer, or GPU result. |
 | M18 contiguous-KV decode staging | Allocate a compact owning history snapshot, then copy it into the final history-plus-tail buffers | Copy the locked cache prefix directly into the final buffers | Two-stage/direct median CPU times: 858/466 ns, 1,161/634 ns, and 3,784/1,587 ns; reductions 45.7%, 45.4%, and 58.1% | Both paths include final-buffer allocation and current-tail writes. Direct copy removes two temporary tensors and one full history pass; the paired algorithm benchmark isolates this change from model math. |
 | M19 synchronous CPU runtime prefill | Execute every scheduled prompt token through the one-token paged decode path | Execute a complete newly admitted prompt once and bulk-append its layer-major K/V pages | Sequential/full-prompt median CPU trace times: 461.833/224.800 us, 2.616/1.675 ms, and 11.745/9.890 ms; reductions 51.3%, 36.0%, and 15.8% | Full prefill wins all paired tiny traces, but the benefit narrows as decode dominates. The timed region is real serial CPU model/scheduler/cache execution, not GPU or fused-batch throughput. |
@@ -635,8 +636,9 @@ validates the final model. Serialization and filesystem I/O are excluded.
 
 The loader values are memory-resident parsing/allocation baselines, not storage
 throughput. They intentionally include portable byte decoding and two FNV-1a
-passes (one metadata, one per payload during decoding). No alternate loader exists
-yet, so there is no optimization result or checksum-cost conclusion.
+passes (one metadata, one per payload during decoding). At this baseline commit no
+alternate loader existed, so these historical values make no optimization or
+checksum-cost claim.
 
 Command:
 
@@ -653,6 +655,65 @@ state iteration loop; its nonsensical uptime-scale real-time values were discard
 The recorded fixture enters the loop first, pauses only to initialize and warm up
 once, then resumes before its first measured operation. This correction is
 methodology repair, not a runtime speedup.
+
+## M17 immutable mapped model loading — 2026-08-24
+
+Hypothesis: after format validation is held constant, allocating one owned buffer
+per payload and copying decoded Float32 values consumes measurable loader CPU.
+An immutable mapping can remove those payload allocations/copies without weakening
+the format checks. Because FNV and finite-value validation still scan every byte,
+the expected improvement is bounded rather than proportional to model size alone.
+
+Environment:
+
+- source: implementation commit `fc7fff5`;
+- host: Apple M3 Pro, 12 CPU cores (6 performance, 6 efficiency), 18 GB RAM;
+- OS/compiler/build: macOS 26.0.1 arm64, Apple Clang 17.0.0, Release,
+  `HELIX_ENABLE_CUDA=OFF`, Float32;
+- CMake 4.2.3 and Google Benchmark 1.9.1;
+- concurrency: one benchmark thread;
+- fixture setup: deterministic weight generation and temporary `HELIXLM1` file
+  creation are outside timing;
+- warmup/page state: one complete untimed load per path and configuration; the
+  measured file is therefore expected to be resident in the OS page cache;
+- timed boundary: file open, seek/stat, map or buffered read, complete metadata,
+  padding, checksum and finite-value validation, Tensor/weight assembly, and
+  object destruction including `munmap`;
+- measurement: process CPU time, minimum 0.2 seconds per repetition, seven
+  randomly interleaved repetitions, median reported;
+- one-minute load average at start: 11.75; Google Benchmark could not set thread
+  affinity or read Apple Silicon frequency metadata.
+
+| H / I / L / heads / T / V | File bytes | Iterations per copied / mapped repetition | Copied median CPU | Mapped median CPU | Reduction | Copied / mapped CPU CV |
+|---|---:|---:|---:|---:|---:|---:|
+| 32 / 64 / 2 / 4 / 7 / 128 | 117,184 B | 1,000 / 1,555 | 203.835 us | 161.110 us | 20.96% | 1.99% / 1.42% |
+| 64 / 128 / 2 / 4 / 31 / 256 | 461,888 B | 415 / 507 | 673.728 us | 571.736 us | 15.14% | 3.39% / 2.52% |
+| 128 / 256 / 4 / 8 / 63 / 512 | 3,153,600 B | 65 / 70 | 4.333277 ms | 3.779571 ms | 12.78% | 0.97% / 0.90% |
+
+Command:
+
+```bash
+./build-release/benchmarks/helix_benchmarks \
+  '--benchmark_filter=BM_LlamaModelLoadFromFile/(Copied|ReadOnlyMapped)' \
+  --benchmark_min_time=0.2s \
+  --benchmark_repetitions=7 \
+  --benchmark_enable_random_interleaving=true \
+  --benchmark_report_aggregates_only=false \
+  --benchmark_display_aggregates_only=true \
+  --benchmark_out=/tmp/helix-mmap-loader-benchmark.json \
+  --benchmark_out_format=json
+```
+
+The hypothesis is supported for these three files: mapping lowers median CPU time
+while retaining the copied path in the same binary. The percentage narrows with
+file size because both implementations remain linear validation scans, and the
+experiment does not isolate individual allocation, copy, checksum, or page-fault
+costs. The implementation removes owned parameter payload buffers, but no resident-
+set measurement was taken; page-cache and private-mapping accounting must not be
+inferred from these timings. This is also not cold-storage latency: a cold-page
+experiment would require controlled cache eviction and storage metadata that this
+host run did not provide. The mapped API is limited to POSIX little-endian IEEE-754
+hosts and requires the live source inode not be modified or truncated.
 
 ## M18 CPU cached decode and staging optimization — 2026-08-23
 
