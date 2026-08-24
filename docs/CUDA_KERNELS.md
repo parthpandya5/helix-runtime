@@ -294,11 +294,11 @@ profiling identifies a limiting resource.
 ## Transformer primitives
 
 Milestone 9 adds UInt32/Float32 embedding lookup in
-`src/kernels/cuda/embedding.cu` and Float32 RMSNorm, SwiGLU, and RoPE kernels in
-`src/kernels/cuda/transformer.cu`. The bias-free linear API uses row-major weights
-shaped `[input_features, output_features]` and delegates to the explicitly
-selected M6 naive or tiled SGEMM. No cuBLAS or framework implementation is hidden
-behind these entry points.
+`src/kernels/cuda/embedding.cu` and Float32 head-layout, RMSNorm, SwiGLU, and RoPE
+kernels in `src/kernels/cuda/transformer.cu`. The bias-free linear API uses row-
+major weights shaped `[input_features, output_features]` and delegates to the
+explicitly selected M6 naive or tiled SGEMM. No cuBLAS or framework implementation
+is hidden behind these entry points.
 
 ### Embedding lookup
 
@@ -392,6 +392,37 @@ either, making exact in-place rotation race-free. The grid-stride launch support
 odd pair-task counts and caps the grid at 65,535 blocks. Static `sm_52` inspection
 reports 27 registers/thread, no shared memory, and no spills.
 
+### Token/head layout transform
+
+Attention consumes `[heads,tokens,head_dimension]`, while projection and RoPE
+produce `[tokens,heads,head_dimension]`. The two public transforms swap the first
+two axes and preserve each innermost vector exactly. One 256-thread block owns an
+output vector; blocks are capped at 65,535 and grid-stride over additional vectors.
+Threads stride over `head_dimension`, so active adjacent lanes read and write
+adjacent Float32 coordinates. No shared memory or barrier is used.
+
+This is a transparent copy baseline. Head dimensions below 256 leave lanes idle,
+and every block evaluates the source-vector index mapping. A tiled transpose or
+fusion with projection/attention may reduce standalone traffic, but that complexity
+is deferred until GPU timing and profiling show the copy is material. The `sm_52`
+compiler reports 18 registers/thread, no shared or local memory, and no spills;
+those resource counts do not establish occupancy or performance.
+
+The host boundary requires contiguous rank-three Float32 tensors, the same CUDA
+device, an output with its first two extents swapped, a live stream on that device,
+and nonoverlapping full logical byte ranges. Zero in any extent produces the exact
+swapped empty shape without a launch. `_out` is asynchronous: caller-owned input
+and output storage must outlive stream work. Since this is a byte-preserving
+reorder, GPU output is compared exactly rather than with a numerical tolerance.
+
+CPU tests cover a hand-derived 2x3x5 mapping, exact round-trip, every zero-extent
+position, invalid metadata, exact aliasing, and partial external-range overlap.
+Hardware-gated GPU tests compare shapes through 257x3x5 with the CPU oracle and
+exercise rank, dtype, shape, CPU-device, moved-stream, exact-alias, and partial-
+device-range failures. Matching event fixtures cover decode 1x32x128, prefill
+128x32x128, odd 7x3x37, and nonstandard 257x13x65 shapes in both directions. They
+perform ten warmup launches and pre/post oracle checks; no GPU result exists yet.
+
 ### Correctness and benchmark gate
 
 CPU tests cover known quarter-turn rotations, three tokens by three heads with an
@@ -399,15 +430,15 @@ odd 27-pair task count, exact in-place execution, empty tokens, invalid rank, od
 or zero head width, cache shape, and output shape. GPU tests compare RMSNorm widths
 1, 37, and 513; SwiGLU sizes 0, 1, 31, 257, and 4,099; RoPE shapes through 5x7x34;
 both linear GEMM variants; exact in-place paths; and invalid contracts. Embedding
-has the separate contract and oracle cases above. The GPU tests compile and are
-hardware-gated; they have not executed here.
+and layout transforms have the separate contract and oracle cases above. The GPU
+tests compile and are hardware-gated; they have not executed here.
 
 CUDA benchmarks preallocate all storage, perform ten warmup launches, then use
 same-stream CUDA events with stop-event synchronization. RMSNorm uses 1x4,096 and
 32x4,096 rows, SwiGLU uses 4,096 and 131,072 values, and RoPE uses decode-shaped
 1x32x128 and prefill-shaped 128x32x128 inputs. Projection uses the existing M6 GEMM
-fixtures; embedding uses the five matching CPU/GPU cases above. No result or
-optimization conclusion is recorded without hardware.
+fixtures; embedding and head-layout transforms use the matching CPU/GPU cases
+above. No result or optimization conclusion is recorded without hardware.
 
 ## Contiguous attention baseline
 

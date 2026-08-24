@@ -107,6 +107,7 @@ remains pending NVIDIA hardware.
 | M7 allocator-backed CPU Tensor ownership | Direct `Tensor::empty` allocation/destruction | Retain one pool allocation and allocator through shared Tensor Storage, then return it on final release | Direct/pooled median CPU time: 117/238 ns (1 element), 117/239 ns (1,024), and 459/239 ns (1,048,576) | Shared-owner plus allocator metadata was about 2.04x slower for small Tensors, while cached 4 MiB lifecycle latency was 47.9% lower. The 64 MiB retained host segment and untouched payload make this an ownership/cache result, not bandwidth or CUDA evidence. |
 | M9 CPU transformer primitives | No earlier RoPE fixture; M2 provided scalar SiLU only | Add preallocated SwiGLU and adjacent-pair RoPE reference paths | Median CPU time: SwiGLU 4,096 values 44.602 us and 131,072 values 1.512 ms; RoPE 1x32x128 1.904 us and 128x32x128 187.894 us | These are single-threaded correctness baselines, not optimized CPU or GPU comparisons. High host load makes wall-time variation substantial. |
 | M9 CPU embedding lookup | Private model-specific row copy; no reusable kernel fixture | Add a failure-atomic UInt32-to-Float32 gather with preallocated output and matching CUDA-event cases | Median CPU time: 157 ns (1x32 from V=128), 183 ns (7x32), 170 ns (1x256 from V=4,096), 1.936 us (128x256), and 205 ns (1x1,024 from V=32,000) | This is a warm-cache single-threaded row-copy baseline. The fixture rereads selected table rows and validates IDs on every call; its byte counter is logical traffic, not measured DRAM bandwidth. GPU timing remains pending hardware. |
+| M9 token/head layout copies | Unchecked model-private scalar loops with no isolated fixture | Add reusable checked vector-copy kernels in both directions, refactor the CPU model, and add matching CUDA-event cases | Forward/reverse median CPU times: 378/344 ns (1x32x128), 34.618/35.870 us (128x32x128), 189/200 ns (7x3x37), and 21.790/19.297 us (257x13x65) | These are warm-cache standalone copy baselines, not a measured optimization over the removed loops. Logical byte rates are not DRAM bandwidth; CUDA timing remains pending hardware. |
 | M10 contiguous CPU attention | No earlier attention path | Materialize scaled/masked scores, stable softmax in place, then probabilities x V with reusable output/workspace | Median CPU time: 8x1x128x64x64 76.371 us; 8x1x1,024x64x64 825.128 us; 3x17x29x37x41 46.284 us; 8x128x128x64x64 8.164 ms | Workspace is exactly `4*H*Q*K` bytes. These single-threaded results include softmax but the reported dot FLOP/s numerator does not; they are correctness baselines. |
 | M11 contiguous CPU KV cache | No earlier KV storage | Reserve per-sequence K/V tensors, append complete tokens, and copy a compact layer history into preallocated outputs | Lifecycle median CPU time: 26.898 us (2x2x64, capacity/append 128), 63.700 us (4x8x64, capacity 512/append 32), 7.853 us (odd 3x3x37, 29); layer-copy median: 1.595 us (128 KiB), 29.609 us (2 MiB), 613 ns (25,752 B) | Lifecycle includes sequence allocation, appends, and release. Layer copy excludes output allocation. This is a contiguous baseline under high host load, not evidence that paging or another layout is faster. |
 | M12 paged CPU KV cache | Same-run M11 contiguous fixtures | Use a long-lived fixed-token pool, allocate logical blocks on append boundaries, and compact through block tables | Paged/contiguous lifecycle medians: 25.784/28.485 us, 18.016/64.400 us, 6.869/8.074 us. Paged/contiguous layer-copy medians: 3.684/1.568 us (128 KiB), 57.690/33.032 us (2 MiB), 540/554 ns (25,752 B). | Pool construction is outside paged lifecycle timing while per-sequence contiguous storage is inside; the 72% lifecycle reduction also uses 16x less assigned capacity. Paged copying is 2.35x and 1.75x slower for the large histories because it traverses 8 and 32 blocks. |
@@ -594,6 +595,57 @@ as achieved DRAM bandwidth. The data establishes a CPU correctness-path baseline
 not an optimization or CPU/GPU crossover. Five shape-matched CUDA-event fixtures
 exist with ten explicit launch warmups and pre/post CPU-oracle checks, but they are
 compile-validated only and have no recorded timing.
+
+## M9 CPU token/head-layout baseline — 2026-08-24
+
+Environment:
+
+- source: commit `8e1c582`
+- host: Apple M3 Pro, 12 CPU cores (6 performance + 6 efficiency), 18 GB RAM
+- OS/compiler/build: macOS 26.0.1 arm64, Apple Clang 17.0.0, Release,
+  `HELIX_ENABLE_CUDA=OFF`, Float32
+- CMake 4.2.3 and Google Benchmark 1.9.1
+- one thread; Tensor construction, output allocation, and creation of the reverse-
+  direction input are excluded
+- warmup: ten explicit untimed transforms plus 0.1 seconds requested from Google
+  Benchmark
+- measurement: process CPU time, minimum 0.1 seconds, nine repetitions; median and
+  CPU-time coefficient of variation reported
+- one-minute load average at start: 10.92; affinity and CPU-frequency metadata
+  were unavailable
+
+| Tokens x heads x head dimension | Token-major to head-major | Head-major to token-major |
+|---|---:|---:|
+| 1 x 32 x 128 | 378 ns (5.59% CV) | 344 ns (4.42% CV) |
+| 128 x 32 x 128 | 34.618 us (1.11% CV) | 35.870 us (1.79% CV) |
+| 7 x 3 x 37 | 189 ns (4.46% CV) | 200 ns (3.71% CV) |
+| 257 x 13 x 65 | 21.790 us (1.36% CV) | 19.297 us (2.02% CV) |
+
+Command:
+
+```bash
+./build-release/benchmarks/helix_benchmarks \
+  --benchmark_filter='^BM_Cpu(TokenHeadsToHeadMajor|HeadMajorToTokenHeads)/' \
+  --benchmark_min_time=0.1s \
+  --benchmark_min_warmup_time=0.1 \
+  --benchmark_repetitions=9 \
+  --benchmark_report_aggregates_only=true
+```
+
+Both fixtures use preallocated output and include rank, dtype, shape, and logical-
+range alias validation in the timed `_out` call. The implementation copies each
+contiguous innermost vector with `std::copy_n`; deterministic inputs and repeated
+iterations make the working sets warm. Google Benchmark's byte counter describes
+one logical read plus one logical write per value and must not be presented as
+physical DRAM bandwidth.
+
+The removed model-private scalar loops had no isolated fixture, so these numbers
+establish a reusable baseline rather than a speedup claim. Existing independent-
+oracle model, cached-generation, and runtime tests pass after the refactor.
+Shape-matched CUDA fixtures use ten launch warmups, pre/post exact CPU-oracle
+checks, and same-stream events. An `sm_52` compile reports 18 registers/thread, no
+shared or local memory, and no spills. Neither static resource data nor successful
+NVCC compilation establishes GPU correctness, occupancy, latency, or bandwidth.
 
 ## M10 contiguous CPU attention baseline — 2026-08-20
 

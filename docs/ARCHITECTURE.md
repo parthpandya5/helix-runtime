@@ -229,9 +229,12 @@ after baselines are retained and measured.
 
 The reference set grows in dependency order: elementwise operations, activations,
 reduction, softmax, matrix multiplication, RMSNorm, SwiGLU, adjacent-pair RoPE,
-embedding lookup, and bias-free linear projection. CPU embedding first validates
-every UInt32 token ID, then copies selected Float32 rows, so an out-of-vocabulary
-failure cannot partially mutate caller output.
+embedding lookup, token/head layout transforms, and bias-free linear projection.
+CPU embedding first validates every UInt32 token ID, then copies selected Float32
+rows, so an out-of-vocabulary failure cannot partially mutate caller output. The
+layout transform swaps the first two axes of rank-three Float32 storage while
+copying each innermost head vector contiguously; overlapping logical ranges are
+rejected.
 
 ## CUDA backend
 
@@ -275,7 +278,8 @@ Educational kernels remain separately selectable and benchmarkable:
 - reductions: naive, shared-memory, then warp-assisted variants,
 - softmax: correct row-wise baseline, then reduced global traffic,
 - GEMM: naive, shared-memory tiled, then evidence-driven refinements,
-- transformer operations: embedding lookup, RMSNorm, RoPE, SwiGLU, and attention components.
+- transformer operations: embedding lookup, token/head layout transforms, RMSNorm,
+  RoPE, SwiGLU, and attention components.
 
 cuBLAS/cuBLASLt may later provide an optimized GEMM path. It will be labeled as a
 library backend and compared honestly with custom kernels.
@@ -297,6 +301,16 @@ kernel bounds-checks device-resident values before address formation and emits a
 NaN row for invalid IDs rather than reading outside the table. Runtime-owned host
 request IDs must still be range-validated before transfer because reporting a
 device value as a synchronous host exception would require synchronization.
+
+The attention-layout boundary is explicit rather than hidden in the model. Both
+backends reorder `[tokens,heads,head_dimension]` to
+`[heads,tokens,head_dimension]` and back. The CUDA baseline assigns one block to
+each complete head vector, caps the grid, and strides 256 threads across its last
+dimension. Adjacent active lanes therefore copy adjacent coordinates, while small
+head dimensions leave lanes idle. The asynchronous `_out` form rejects exact and
+partial range overlap and requires caller-owned input/output lifetime. Tiling or
+fusion is deferred until a physical profiler identifies whether the standalone
+copy is material.
 
 ## Memory allocator
 
@@ -732,9 +746,10 @@ avoid page faults or validation scans. Rename/unlink is safe after load; modifyi
 or truncating the live source inode violates the mapping contract.
 
 The current CPU path performs full causal prefill and single-token decode against
-either contiguous or paged K/V storage, repacking token-major Q/K/V tensors around
-the existing head-major attention API. Greedy selection, EOS/length/context stops,
-a token-ID CLI, and scheduler-driven multi-request paged decode are implemented.
+either contiguous or paged K/V storage, using the shared layout kernels to repack
+token-major Q/K/V tensors around the existing head-major attention API. Greedy
+selection, EOS/length/context stops, a token-ID CLI, and scheduler-driven multi-
+request paged decode are implemented.
 The runtime schedules several requests per iteration but executes their model work
 serially; a fused tensor batch, tokenizer integration, validation of additional
 checkpoint architectures, and CUDA model dispatch remain later work. The

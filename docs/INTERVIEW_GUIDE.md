@@ -151,7 +151,9 @@ always better” rule.
 Threads in a warp should access addresses that the memory system can serve with a
 small number of aligned transactions. Helix elementwise kernels use grid-stride
 loops over consecutive elements. Tiled GEMM loads adjacent matrix elements into
-shared memory. RoPE assigns threads to adjacent coordinate pairs. The CUDA paged-
+shared memory. RoPE assigns threads to adjacent coordinate pairs. The head-layout
+copy gives one block a complete innermost vector, so active adjacent lanes access
+adjacent coordinates, although dimensions below 256 leave lanes idle. The CUDA paged-
 attention baseline maps logical neighbors through an immutable device table. Its
 value threads read adjacent output dimensions, but score threads' inner-dimension
 loads are separated by a head width. That is a visible correctness baseline;

@@ -338,7 +338,8 @@ gap but not the M8 measurement gate.
 
 ### M9 — CPU-validated and CUDA compile-validated; GPU runtime validation pending
 
-- CPU and CUDA embedding, RMSNorm, RoPE, SwiGLU, and projection paths
+- CPU and CUDA embedding, token/head layout, RMSNorm, RoPE, SwiGLU, and projection
+  paths
 - custom educational GEMM remains selectable
 - cuBLAS production path is separately named and documented if added
 
@@ -385,6 +386,27 @@ warmups, validates against the CPU oracle before and after timing, and uses same
 stream CUDA events. CPU measurements are recorded in `docs/PERFORMANCE.md`. NVCC
 12.6.85/GCC 13.2 compile all paths with warnings as errors; GPU execution and
 timing remain pending.
+
+Head-layout follow-up (2026-08-24, commit `8e1c582`): the model-private Q/K/V and
+attention-context reorder loops are now checked shared kernels. Both directions
+swap the first two axes of contiguous rank-three Float32 storage, preserve the
+innermost head vector, return exact swapped empty shapes, and reject exact or
+partial logical-range overlap. `CpuLlamaModel` uses the shared operations for full
+prefill and both contiguous/paged decode paths; independent model, generation, and
+runtime tests remain exact within their existing tolerances.
+
+The asynchronous CUDA baseline assigns one 256-thread block to each head vector,
+caps and grid-strides the vector count, and strides threads across head dimension.
+Two hardware-gated tests compare both directions exactly with the CPU oracle over
+empty, tiny, odd, and non-block-aligned shapes, then validate rank, dtype, shape,
+device, moved-stream, exact-alias, and partial-buffer-overlap failures. Matching
+CPU/CUDA benchmarks cover decode, prefill, odd, and nonstandard geometry with ten
+explicit warmups; CUDA uses pre/post oracle checks and same-stream events. Static
+`sm_52` inspection reports 18 registers/thread and no shared/local memory or
+spills, which is compile evidence only. Measured CPU baselines are in
+`docs/PERFORMANCE.md`; no speedup over the unbenchmarked private loops is claimed.
+Debug, Release, and ASan/UBSan suites pass 195/195. The CUDA-on build passes 194
+host tests and skips 71 GPU tests without a driver/device (265 total).
 
 ### M10 — CPU-validated and CUDA compile-validated; GPU runtime validation pending
 

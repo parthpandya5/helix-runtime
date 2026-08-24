@@ -53,8 +53,12 @@ token_ids[T]
 
 Every linear weight uses `[input_features, output_features]` layout. Attention
 temporarily repacks token-major `[T,A,D]` projections into the existing
-head-major `[A,T,D]` attention contract, then repacks its result back to `[T,H]`.
-That copying is intentionally visible in this first baseline.
+head-major `[A,T,D]` attention contract, then repacks its result back through
+`[T,A,D]` and a zero-copy reshape to `[T,H]`. These copies now use shared checked
+CPU layout kernels rather than model-private loops. Matching asynchronous CUDA
+kernels are compile-validated, so the layout boundary no longer blocks a future
+CUDA executor; the standalone memory traffic remains intentionally visible and
+benchmarked.
 
 Embedding is implemented by the shared CPU kernel rather than a model-private
 loop. The span-based model API materializes a UInt32 `[T]` Tensor, validates every
