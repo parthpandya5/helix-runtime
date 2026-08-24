@@ -42,7 +42,8 @@ content prefix index, persistent LRU anchors, and opt-in reuse in the CPU runtim
 The repository
 contains the CPU-first build foundation, a checked contiguous tensor core,
 Float32 reference kernels for elementwise math, reductions, stable softmax,
-matrix multiplication, RMSNorm, SwiGLU, adjacent-pair RoPE, linear projection, and
+matrix multiplication, embedding lookup, RMSNorm, SwiGLU, adjacent-pair RoPE,
+linear projection, and
 causal scaled dot-product attention, plus a caching allocator, completion-aware deferred
 reclamation, and layer-aware contiguous/paged KV histories with checked capacity,
 reference-counted prefix pages, and copy-free block-table attention traversal. The model composes those
@@ -52,19 +53,19 @@ weight format, performs greedy generation through a contiguous KV cache, and
 executes scheduler batches against a shared paged KV pool with optional prompt-
 prefix reuse. On
 2026-08-24, Apple Clang 17 built the project on macOS arm64 with warnings as
-errors; 186/186 CPU tests passed in Debug, Release, and ASan/UBSan configurations.
+errors; 191/191 CPU tests passed in Debug, Release, and ASan/UBSan configurations.
 
 CUDA is optional at configure time. The current Apple Silicon development host has
 no NVIDIA GPU or native CUDA toolkit, so no CUDA execution or performance claim is
 made. The M3 runtime layer, M4 manual Float32 elementwise kernels, M5 selectable
 reduction/stable-softmax baselines, and M6 naive/tiled SGEMM are separately
 compile-validated in an ARM64 CUDA 12.6 development container without a
-driver/device. The M8 stream-ordered allocator and M9 block-reduced RMSNorm,
-grid-stride SwiGLU, adjacent-pair RoPE, and projection adapter are also
+driver/device. The M8 stream-ordered allocator and M9 UInt32/Float32 embedding,
+block-reduced RMSNorm, grid-stride SwiGLU, adjacent-pair RoPE, and projection adapter are also
 compile-validated, as are the M10 contiguous and M13 paged three-stage attention
-baselines. None is runtime-validated on a GPU. The CUDA-on build passes 185
-hardware-independent tests and explicitly skips 66 GPU tests without a
-driver/device (251 registered tests total). Its container lacks Python/NumPy, so
+baselines. None is runtime-validated on a GPU. The CUDA-on build passes 190
+hardware-independent tests and explicitly skips 69 GPU tests without a
+driver/device (259 registered tests total). Its container lacks Python/NumPy, so
 the separate converter integration test is not registered there; it passes in all
 three native CPU configurations.
 
@@ -126,7 +127,7 @@ pinned-host buffer, copy, and Tensor-storage paths, manual elementwise kernels,
 CUDA-event benchmarks, and hardware-gated correctness tests. Reduction includes naive, shared-memory, and
 warp-shuffle paths; softmax includes naive and shared-memory paths; SGEMM includes
 one-output-per-thread and 16x16 tiled paths. Transformer primitives add custom
-RMSNorm, SwiGLU, and RoPE kernels while projection delegates to the selectable
+embedding lookup, RMSNorm, SwiGLU, and RoPE kernels while projection delegates to the selectable
 custom SGEMM. The build is compile-validated, but those tests and benchmarks have
 not executed on a physical NVIDIA GPU.
 
@@ -146,7 +147,7 @@ cmake --build build --target format-check
 Helix targets. `HELIX_BUILD_TOOLS=OFF` omits the model pack/inspection utilities;
 it does not affect the runtime libraries. The one Python converter integration
 test auto-registers only when the selected Python 3 interpreter can import NumPy;
-otherwise the 185-test C++/benchmark suite remains available.
+otherwise the 190-test C++/benchmark suite remains available.
 
 ## Benchmarks
 
@@ -160,8 +161,8 @@ cmake --build build-release -j
 
 The first release-mode `Tensor::zeros` baseline is recorded without an optimization
 claim. Allocation-free CPU reference-kernel baselines are also recorded, including
-odd-width softmax, odd-dimension/standard-square matmul, SwiGLU, and decode/prefill-
-shaped RoPE. Attention fixtures retain dimension-major baselines, measure a common
+odd-width softmax, odd-dimension/standard-square matmul, embedding lookup, SwiGLU,
+and decode/prefill-shaped RoPE. Attention fixtures retain dimension-major baselines, measure a common
 32-coordinate value tile, and compare direct block traversal against contiguous
 storage. Contiguous-versus-paged KV lifecycle/layer-copy fixtures keep their actual
 CPU costs and unfavorable results. A paired decode-staging fixture measures the
@@ -259,8 +260,10 @@ independent storage. CPU storage may also wrap an externally owned, aligned,
 read-only or mutable buffer with an explicit shared lifetime token. Read-only views
 preserve immutability, mutable pointer access and in-place operations fail, and
 `clone` produces ordinary writable storage. Mutable external storage reports its
-full capacity separately from logical Tensor bytes. Float32 is executable, while
-Float16 currently supports only metadata, allocation, zeroing, and bytewise copy.
+full capacity separately from logical Tensor bytes. Float32 is the arithmetic
+type; UInt32 represents token/index tensors and supports typed access, transfer,
+zeroing, and embedding lookup. Float16 currently supports only metadata,
+allocation, zeroing, and bytewise copy.
 
 ```bash
 cmake --build build --target helix_tensor_demo
@@ -271,7 +274,8 @@ cmake --build build --target helix_tensor_demo
 
 The `helix::cpu` backend provides add, multiply, ReLU, SiLU, full and last-axis
 sum, row-wise softmax, rank-two matmul, RMSNorm, SwiGLU, adjacent-pair RoPE, and a
-model-layout linear wrapper. Each operation has a convenient allocating form and a
+model-layout linear wrapper. It also gathers UInt32 token IDs from a Float32
+`[vocabulary,width]` embedding table. Each operation has a convenient allocating form and a
 preallocated `_out` form used for benchmarking and GPU-oracle comparisons.
 Broadcasting is deliberately rejected.
 
@@ -556,7 +560,8 @@ Partial-page sharing, model-global cache namespaces, and request preemption rema
 future work. CPU and single-stream CUDA Tensor allocator ownership are opt-in and
 not wired into the runtime; arbitrary multi-stream pooling remains pending use
 tracking. Pinned host buffers allocate directly and no copy/compute overlap has
-been hardware-measured. Float16 has no arithmetic path yet. Tensor
+been hardware-measured. The CUDA embedding path is not yet composed into a model
+executor. Float16 has no arithmetic path yet. Tensor
 execution is contiguous-only; broadcasting, slicing, and general strided kernels are intentionally
 deferred. The mapped model path is POSIX/little-endian/IEEE-754 only, requires the
 source inode not be modified while a model lives, and has no cold-storage or RSS

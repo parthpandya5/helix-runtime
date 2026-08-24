@@ -3,8 +3,8 @@
 ## Validation status
 
 The Milestone 4 elementwise, Milestone 5 reduction/softmax, Milestone 6 SGEMM,
-Milestone 9 transformer kernels, and Milestone 10/Milestone 13 contiguous/paged
-attention baselines are **CUDA
+Milestone 9 embedding/transformer kernels, and Milestone 10/Milestone 13
+contiguous/paged attention baselines are **CUDA
 compile-validated, not GPU runtime-validated**. NVCC 12.6.85 and GCC 13.2 compiled
 the implementations, hardware-gated
 correctness tests, and CUDA-event benchmarks in the ARM64 CUDA 12.6 development
@@ -293,11 +293,50 @@ profiling identifies a limiting resource.
 
 ## Transformer primitives
 
-Milestone 9 adds Float32 RMSNorm, SwiGLU, and RoPE kernels in
+Milestone 9 adds UInt32/Float32 embedding lookup in
+`src/kernels/cuda/embedding.cu` and Float32 RMSNorm, SwiGLU, and RoPE kernels in
 `src/kernels/cuda/transformer.cu`. The bias-free linear API uses row-major weights
-shaped `[input_features, output_features]` and delegates to the explicitly selected
-M6 naive or tiled SGEMM. No cuBLAS or framework implementation is hidden behind
-these entry points.
+shaped `[input_features, output_features]` and delegates to the explicitly
+selected M6 naive or tiled SGEMM. No cuBLAS or framework implementation is hidden
+behind these entry points.
+
+### Embedding lookup
+
+The input is a contiguous UInt32 token vector `[T]`, the table is contiguous
+Float32 `[V,W]`, and output is Float32 `[T,W]`. One block owns each token, with 256
+threads striding across the selected row. The one-dimensional grid is capped at
+65,535 blocks and loops over additional tokens. Adjacent threads copy adjacent
+coordinates, so table reads and output writes are coalescing-friendly. The kernel
+uses no shared memory or barriers. Every thread in a block reads the same token ID;
+normal cache/broadcast behavior is left to the hardware in this auditable
+baseline.
+
+The decode case `T == 1` exposes only one block and may underutilize a GPU even for
+a wide row. A packed prefill or decode batch exposes one block per token. That is a
+launch-layout hypothesis, not a performance conclusion; both cases must be
+measured before changing the mapping or fusing lookup with downstream work.
+
+Host-side entry points validate dtype, rank, shape, device, contiguity, stream
+device, nonzero table width, and overflow-safe full logical byte-range
+nonoverlap. The CUDA `_out` form remains asynchronous, so all three tensors must
+outlive queued work. Device-resident token values cannot be converted into a
+synchronous host exception without a synchronization boundary. The kernel instead
+checks `id < V` before forming a table address and fills an invalid row with NaNs.
+Runtime-owned request IDs must still be validated on the host before transfer.
+The CPU oracle prevalidates every ID before any write and therefore gives late-OOV
+failure atomicity.
+
+CPU tests cover repeated and out-of-order IDs, empty and odd-width shapes, a late
+invalid ID, metadata errors, and partially overlapping external storage. GPU tests
+compare empty, tiny, odd, and 257x513 cases with the CPU oracle; they also cover the
+NaN sentinel, a moved stream, contract errors, and partial device-buffer overlap.
+The CUDA fixtures are hardware-gated and have not executed here.
+
+Matching CPU and CUDA benchmark cases use `(T,V,W)` of `(1,128,32)`, `(7,128,32)`,
+`(1,4096,256)`, `(128,4096,256)`, and `(1,32000,1024)`. The CUDA fixture performs
+ten warmup launches, validates output before and after timing, and uses events on
+the launch stream with stop-event synchronization. Allocation and transfers are
+excluded. No GPU result is recorded without hardware execution.
 
 ### RMSNorm
 
@@ -344,8 +383,7 @@ Input layout is `[tokens, ..., head_dimension]`; the intervening dimensions are
 independent vectors/heads. Cosine and sine are preselected Float32 caches shaped
 `[tokens, head_dimension/2]`. Selecting cache rows outside this kernel permits a
 future packed batch to use unrelated token positions. It also makes the kernel a
-pure rotation oracle without embedding an integer position representation into the
-Tensor core.
+pure rotation oracle without coupling its math to position-index storage.
 
 One thread owns one pair. Pair index varies fastest, so adjacent threads consume
 adjacent two-Float regions within a head; cache reads are adjacent and reused across
@@ -357,17 +395,19 @@ reports 27 registers/thread, no shared memory, and no spills.
 ### Correctness and benchmark gate
 
 CPU tests cover known quarter-turn rotations, three tokens by three heads with an
-odd 27-pair task count, exact in-place execution, empty tokens, invalid rank, odd or
-zero head width, cache shape, and output shape. GPU tests compare RMSNorm widths 1,
-37, and 513; SwiGLU sizes 0, 1, 31, 257, and 4,099; RoPE shapes through 5x7x34;
-both linear GEMM variants; exact in-place paths; and invalid contracts. The GPU
-tests compile and are hardware-gated; they have not executed here.
+odd 27-pair task count, exact in-place execution, empty tokens, invalid rank, odd
+or zero head width, cache shape, and output shape. GPU tests compare RMSNorm widths
+1, 37, and 513; SwiGLU sizes 0, 1, 31, 257, and 4,099; RoPE shapes through 5x7x34;
+both linear GEMM variants; exact in-place paths; and invalid contracts. Embedding
+has the separate contract and oracle cases above. The GPU tests compile and are
+hardware-gated; they have not executed here.
 
 CUDA benchmarks preallocate all storage, perform ten warmup launches, then use
 same-stream CUDA events with stop-event synchronization. RMSNorm uses 1x4,096 and
 32x4,096 rows, SwiGLU uses 4,096 and 131,072 values, and RoPE uses decode-shaped
 1x32x128 and prefill-shaped 128x32x128 inputs. Projection uses the existing M6 GEMM
-fixtures. No result or optimization conclusion is recorded without hardware.
+fixtures; embedding uses the five matching CPU/GPU cases above. No result or
+optimization conclusion is recorded without hardware.
 
 ## Contiguous attention baseline
 

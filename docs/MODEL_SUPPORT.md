@@ -56,6 +56,12 @@ temporarily repacks token-major `[T,A,D]` projections into the existing
 head-major `[A,T,D]` attention contract, then repacks its result back to `[T,H]`.
 That copying is intentionally visible in this first baseline.
 
+Embedding is implemented by the shared CPU kernel rather than a model-private
+loop. The span-based model API materializes a UInt32 `[T]` Tensor, validates every
+ID before output mutation, and gathers rows from the Float32 `[V,H]` weight. A
+matching CUDA kernel exists and is compile-validated, but it is not composed into
+a CUDA model executor, so complete model execution remains CPU-only.
+
 `CpuLlamaModel::forward` returns logits for every prompt position. The opt-in
 `forward_with_trace` additionally retains each post-layer hidden state and the
 final normalized state. Tests compare all of those stages with an independent

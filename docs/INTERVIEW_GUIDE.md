@@ -46,6 +46,12 @@ that contract for mapped weights. Mutable external ranges validate capacity,
 pointer, owner, and alignment separately. The CPU allocator bridge uses the latter
 to preserve rounded capacity and keep one pool allocation alive across all views.
 
+Float32 is the current arithmetic type. UInt32 provides a typed representation for
+token and index tensors and is the input contract for embedding lookup. Float16 is
+storage-only: metadata, allocation, zeroing, transfer, and bytewise copy work, but
+Helix does not imply Float16 arithmetic. Typed accessors reject a mismatched dtype
+instead of silently reinterpreting bytes.
+
 ## Why is GPU memory allocation expensive?
 
 Direct device allocation can enter the CUDA runtime/driver, update global device

@@ -63,7 +63,7 @@ Deliverables:
 
 - checked shape, canonical strides, numel, and byte calculations
 - CPU storage with explicit alignment and RAII ownership
-- contiguous Float32 tensors
+- contiguous Float32 and UInt32 token-index tensors
 - zero, deterministic random, clone/copy, safe reshape/view
 - backend-neutral transfer API with CPU-to-CPU implementation
 - explicit shallow-copy versus deep-copy semantics
@@ -84,6 +84,12 @@ dimensions; invalid alignment; incompatible reshape/copy; and unavailable CUDA
 storage are covered. The full suite contains 29 discovered tests including the
 benchmark smoke test. A release-mode `Tensor::zeros` allocation-plus-zero baseline
 is recorded in `docs/PERFORMANCE.md`.
+
+Token-index follow-up (2026-08-24, commit `61b3768`): UInt32 now has stable dtype
+metadata, typed Tensor construction/access, zeroing, views, clones, and CPU/CUDA
+transfer through the existing byte-exact storage paths. Float16 remains a storage-
+only type. Debug, Release, and ASan/UBSan suites pass 191/191; the CUDA compile
+suite passes 190 host tests and skips 69 hardware-gated tests (259 total).
 
 ### M2 — CPU reference kernels — Implemented, CPU-validated, and benchmarked
 
@@ -332,7 +338,7 @@ gap but not the M8 measurement gate.
 
 ### M9 — CPU-validated and CUDA compile-validated; GPU runtime validation pending
 
-- CPU and CUDA RMSNorm, RoPE, SwiGLU, and projection paths
+- CPU and CUDA embedding, RMSNorm, RoPE, SwiGLU, and projection paths
 - custom educational GEMM remains selectable
 - cuBLAS production path is separately named and documented if added
 
@@ -341,8 +347,8 @@ interfaces now cover RMSNorm, SwiGLU, full-dimension adjacent-pair RoPE, and
 bias-free linear projection with row-major `[input_features, output_features]`
 weights. RoPE consumes preselected Float32 cosine/sine rows shaped
 `[tokens, head_dimension/2]`, so packed requests can provide arbitrary positions
-without adding an integer Tensor dtype. The CPU path is the correctness oracle and
-supports exact in-place RMSNorm/RoPE where safe.
+without coupling RoPE itself to an integer position tensor. The CPU path is the
+correctness oracle and supports exact in-place RMSNorm/RoPE where safe.
 
 The CUDA RMSNorm assigns a 256-thread block to each row, uses warp shuffles plus
 32 bytes of shared memory for its sum-of-squares reduction, and permits exact
@@ -360,6 +366,25 @@ passes 72 independent tests and registers 53 GPU tests. Static `sm_52` compiler
 inspection reports no spills; it is documented separately and is not runtime
 evidence. CPU SwiGLU/RoPE baselines are recorded in `docs/PERFORMANCE.md`; GPU
 correctness and timing await NVIDIA hardware.
+
+Embedding follow-up (2026-08-24, commit `61b3768`): the model's former private row
+copy is now a reusable UInt32 `[tokens]` plus Float32 `[vocabulary,width]` kernel.
+CPU lookup prevalidates all IDs before any output write and rejects full or partial
+logical-range aliasing. The asynchronous CUDA baseline assigns one block per token,
+strides 256 threads across row width, and guards each device ID before table address
+formation; invalid IDs produce a NaN row rather than an out-of-bounds read. Host
+metadata, device, stream, shape, dtype, and range-overlap contracts are checked
+before launch.
+
+Three CPU tests cover repeated/out-of-order rows, empty and odd shapes, late OOV
+failure atomicity, dtype/shape errors, and partially overlapping external buffers.
+Three hardware-gated GPU tests add exact CPU-oracle comparisons through 257x513,
+invalid-ID sentinels, moved streams, and partial CUDA-buffer overlap. The Release
+CPU baseline performs ten explicit warmups; the CUDA fixture performs ten launch
+warmups, validates against the CPU oracle before and after timing, and uses same-
+stream CUDA events. CPU measurements are recorded in `docs/PERFORMANCE.md`. NVCC
+12.6.85/GCC 13.2 compile all paths with warnings as errors; GPU execution and
+timing remain pending.
 
 ### M10 — CPU-validated and CUDA compile-validated; GPU runtime validation pending
 

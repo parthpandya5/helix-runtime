@@ -119,8 +119,10 @@ index. CPU currently permits only index zero. CUDA device construction does not 
 itself touch the runtime; backend operations validate availability.
 
 `DType` identifies the element representation and maps to a checked byte size.
-Float32 is the first executable type. Float16 is introduced only with explicit
-conversion and arithmetic behavior.
+Float32 is the arithmetic type. UInt32 represents token/index tensors and has
+typed construction/access, zeroing, copies, transfers, and embedding lookup.
+Float16 remains byte storage until explicit conversion and arithmetic behavior are
+implemented.
 
 Recoverable host-side contract and runtime failures throw `helix::Error` with a
 stable category and contextual message. Programmer invariants that cannot safely
@@ -227,7 +229,9 @@ after baselines are retained and measured.
 
 The reference set grows in dependency order: elementwise operations, activations,
 reduction, softmax, matrix multiplication, RMSNorm, SwiGLU, adjacent-pair RoPE,
-and bias-free linear projection.
+embedding lookup, and bias-free linear projection. CPU embedding first validates
+every UInt32 token ID, then copies selected Float32 rows, so an out-of-vocabulary
+failure cannot partially mutate caller output.
 
 ## CUDA backend
 
@@ -271,7 +275,7 @@ Educational kernels remain separately selectable and benchmarkable:
 - reductions: naive, shared-memory, then warp-assisted variants,
 - softmax: correct row-wise baseline, then reduced global traffic,
 - GEMM: naive, shared-memory tiled, then evidence-driven refinements,
-- transformer operations: RMSNorm, RoPE, SwiGLU, and attention components.
+- transformer operations: embedding lookup, RMSNorm, RoPE, SwiGLU, and attention components.
 
 cuBLAS/cuBLASLt may later provide an optimized GEMM path. It will be labeled as a
 library backend and compared honestly with custom kernels.
@@ -284,6 +288,15 @@ maps one thread to each adjacent coordinate pair. RoPE input is
 and supports packed nonuniform positions later. Linear projection is a named
 adapter over the selectable custom SGEMM and uses row-major
 `[input_features, output_features]` weights.
+
+Embedding is the explicit integer-to-floating boundary: UInt32 `[tokens]` indices
+select rows from a Float32 `[vocabulary,hidden]` table. The CUDA baseline assigns
+one block to each token and threads stride across the hidden dimension. Its `_out`
+form is asynchronous and caller-owned. Metadata is checked before launch; the
+kernel bounds-checks device-resident values before address formation and emits a
+NaN row for invalid IDs rather than reading outside the table. Runtime-owned host
+request IDs must still be range-validated before transfer because reporting a
+device value as a synchronous host exception would require synchronization.
 
 ## Memory allocator
 
