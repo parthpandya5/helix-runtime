@@ -663,7 +663,7 @@ benchmark-observer correction.
 
 ## Phase F: narrow end-to-end inference
 
-### M17 — Minimal transformer runtime — Implemented, CPU-validated, sanitized, and benchmarked
+### M17 — Minimal transformer runtime — CPU measured; CUDA prefill compile-validated
 
 - one precisely documented Llama-style architecture
 - embedding, pre-norm blocks, Q/K/V, RoPE, attention, projection, SwiGLU,
@@ -759,6 +759,34 @@ against both the independent NumPy source oracle and optional CPU Float32 PyTorc
 and `8.94e-8`, respectively. Exact input/output hashes are recorded in
 `docs/MODEL_SUPPORT.md`. This is one random checkpoint and no tokenizer, broad
 compatibility, learned language quality, or CUDA model result is claimed.
+
+CUDA-prefill follow-up (2026-08-24, implementation commit `8706c8e`, oracle/
+contract refinement `ecce37d`): `LlamaWeights` now
+validates an explicit expected device and deep-transfers every top-level and layer
+payload. The CPU model and CUDA model share one private RoPE cache builder, keeping
+frequency, offset, and overflow semantics identical. `CudaLlamaModel` owns its
+device weights and composes the custom embedding, RMSNorm, tiled SGEMM projection,
+RoPE, token/head transforms, three-stage causal attention, residual add, and
+SwiGLU paths into Float32 full prefill.
+
+The first implementation is deliberately synchronous. Every layer retains all
+inputs, outputs, and explicit score scratch until a same-stream completion barrier;
+final logits are also complete before return. This supplies a correct lifetime
+boundary for ordinary direct Tensor allocations and exception unwinding. It does
+not integrate the caching allocator, K/V decode, scheduler, batching, or overlap,
+and the `L+1` synchronizations are not presented as optimized execution.
+
+Three deterministic GPU tests compare single-token and odd-length outputs with the
+CPU model, cover host/device metadata and moved-stream errors, and verify that a
+device OOV ID propagates the embedding kernel's safe NaN sentinel rather than an
+out-of-bounds read. A matching device-input benchmark preloads weights/IDs/RoPE,
+performs ten warmups, checks the CPU oracle before and after timing, and uses same-
+stream events for three disclosed synthetic geometries. The benchmark has not run.
+Debug, Release, and ASan/UBSan CPU suites pass 196/196. CUDA 12.6.85/GCC 13.2
+compile and link all targets with warnings as errors; 195 hardware-independent
+tests pass and 75 GPU-required tests/benchmark gates skip without a driver/device
+(270 registered total). Thus CUDA full-prefill correctness, sanitizer status, and
+performance remain pending physical NVIDIA hardware.
 
 ### M18 — Autoregressive generation — Implemented, CPU-validated, sanitized, and benchmarked
 

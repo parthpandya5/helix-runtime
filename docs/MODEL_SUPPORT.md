@@ -10,8 +10,10 @@ of compatibility with every model whose configuration contains the word “Llama
 The implementation, native weight container, unit tests, sanitizer suite, CPU
 benchmarks, and a narrowly checked Hugging Face Llama safetensors conversion path
 are complete. Native files can be loaded through either portable owned copies or
-an opt-in immutable POSIX mapping. CUDA model execution, fused tensor batching,
-and tokenizer/text-prompt integration remain later gates. One revision-pinned
+an opt-in immutable POSIX mapping. A synchronous CUDA full-prefill composition is
+compile-validated, with physical-GPU correctness and timing still pending. CUDA
+cached decode, fused tensor batching, and tokenizer/text-prompt integration remain
+later gates. One revision-pinned
 public tiny-random checkpoint has been validated at the raw-token/logit boundary;
 that single artifact does not imply broad checkpoint compatibility.
 
@@ -23,7 +25,8 @@ attention heads `A`, head dimension `D = H/A`, and prompt length `T`, Helix acce
 - positive dimensions, `H % A == 0`, and an even `D`;
 - one Q, K, and V head per attention head; grouped-query and multi-query attention
   are not supported;
-- Float32 CPU weights and activations in contiguous row-major storage;
+- contiguous row-major Float32 weights and activations; CPU execution is validated,
+  while CUDA full prefill is compile-validated only;
 - bias-free embedding/projection/MLP operations;
 - pre-attention and pre-MLP RMSNorm;
 - full adjacent-pair RoPE across each head dimension;
@@ -56,20 +59,51 @@ temporarily repacks token-major `[T,A,D]` projections into the existing
 head-major `[A,T,D]` attention contract, then repacks its result back through
 `[T,A,D]` and a zero-copy reshape to `[T,H]`. These copies now use shared checked
 CPU layout kernels rather than model-private loops. Matching asynchronous CUDA
-kernels are compile-validated, so the layout boundary no longer blocks a future
-CUDA executor; the standalone memory traffic remains intentionally visible and
-benchmarked.
+kernels are composed by the synchronous prefill baseline; the standalone memory
+traffic remains intentionally visible and benchmarkable.
 
 Embedding is implemented by the shared CPU kernel rather than a model-private
 loop. The span-based model API materializes a UInt32 `[T]` Tensor, validates every
 ID before output mutation, and gathers rows from the Float32 `[V,H]` weight. A
-matching CUDA kernel exists and is compile-validated, but it is not composed into
-a CUDA model executor, so complete model execution remains CPU-only.
+matching CUDA kernel is composed into `CudaLlamaModel` with the remaining custom
+primitives.
 
 `CpuLlamaModel::forward` returns logits for every prompt position. The opt-in
 `forward_with_trace` additionally retains each post-layer hidden state and the
 final normalized state. Tests compare all of those stages with an independent
 `std::vector<float>` oracle; the ordinary forward path does not retain them.
+
+### CUDA full-prefill baseline
+
+`CudaLlamaModel` implements the same full causal equations without delegating
+GEMM or attention to a library. Construction validates CPU Float32 weights, deep-
+copies every payload to one CUDA device through `LlamaWeights::to`, and validates
+the resulting device bundle. The model therefore owns all long-lived weight
+storage; the caller's source bundle can be released after construction.
+
+The host-token `forward` overload rejects empty, overlength, and out-of-vocabulary
+input before allocating token storage, creates RoPE tables with the shared CPU
+cache builder, transfers IDs/tables synchronously, and calls the device path. The
+`forward_device` overload instead accepts preloaded CUDA UInt32 `[T]` IDs and
+Float32 `[T,D/2]` cosine/sine tables. It validates dtype, rank, contiguity, shape,
+device, and a live same-device stream before launching. It cannot validate the
+values of device IDs without a readback; the embedding kernel safely emits a NaN
+row for an invalid ID and never forms an out-of-range table address.
+
+Every operation is ordered on the caller's stream. Layer-local projection,
+repacking, attention-output, and `[A,T,T]` score allocations remain alive through
+an explicit synchronization at the end of that layer. Final normalization and the
+LM head are synchronized before the CUDA logits return. This makes lifetime and
+failure behavior auditable even with ordinary direct Tensor allocations, but
+costs `L+1` stream barriers and prevents overlap. An optimized follow-up must use
+an explicit reusable workspace and stream-aware allocation; removing the barriers
+alone would be incorrect because asynchronous kernels could retain freed inputs.
+
+Three hardware-gated tests compare single-token and odd-five-token logits with
+the CPU model at `atol=2e-4`, `rtol=2e-3`, validate host/device metadata and a
+moved stream before execution, and require an invalid device ID to propagate only
+NaN logits. They compile and discover successfully but have not executed without
+an NVIDIA device. No CUDA correctness or performance result is claimed.
 
 ## Prefill, cached decode, and generation
 
@@ -528,14 +562,15 @@ evidence. The separate bounded validator then exercises the exact source-layout
 math, failure detection, and the revision-pinned public checkpoint described
 above; tokenizer/text-prompt behavior remains untested.
 
-Validation on 2026-08-24 through generation-validation test commit `09fd7aa`:
+Validation on 2026-08-24 through CUDA-prefill test commit `ecce37d`
+(implementation commit `8706c8e`):
 
-- Debug, Release, and Apple Clang ASan/UBSan CPU suites: 184/184 tests passed;
+- Debug, Release, and Apple Clang ASan/UBSan CPU suites: 196/196 tests passed;
 - all Release tests and benchmark smoke workloads passed;
 - CUDA 12.6.85/GCC 13.2 warnings-as-errors build: all targets compiled and all
-  183 hardware-independent tests passed;
-- 57 GPU runtime tests remained explicitly skipped because the compile container
-  has no NVIDIA driver or device (240 registered tests total);
+  195 hardware-independent tests passed;
+- 75 GPU-required tests/benchmark gates remained explicitly skipped because the
+  compile container has no NVIDIA driver or device (270 registered tests total);
 - the CUDA container lacks Python/NumPy, so its converter integration test was not
   registered; that test passed in every native CPU configuration.
 
@@ -580,7 +615,8 @@ results, not evidence about a future CUDA paged-attention kernel.
 
 ## Deliberate limitations
 
-- CPU Float32 only for complete model execution.
+- CPU Float32 is the only hardware-validated complete model execution path. CUDA
+  Float32 full prefill is compile-validated only and has no decode/session path.
 - Complete new prompts use one full prefill; chunked runtime prefill falls back to
   sequential one-token execution rather than a multi-token continuation kernel.
 - The standalone generator's contiguous-cache decode materializes one
@@ -589,6 +625,9 @@ results, not evidence about a future CUDA paged-attention kernel.
 - The standalone generator supports one sequence and greedy selection only. The
   runtime supports several paged sessions but executes work items serially and has
   no sampling or fused tensor batch.
+- CUDA prefill synchronizes after every layer and final projection, uses direct
+  Tensor allocations for all temporaries, and is not connected to HelixAllocator,
+  a K/V cache, scheduler, prefix reuse, generation, or the runtime engine.
 - No tokenizer or text-prompt path. One public tiny-random checkpoint is validated
   from raw token IDs through full logits, not through meaningful text generation.
 - The offline converter supports only the documented standard Llama safetensors

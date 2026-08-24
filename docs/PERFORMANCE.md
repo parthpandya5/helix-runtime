@@ -1122,6 +1122,62 @@ The recorded fixture enters the loop first, pauses only to initialize and warm u
 once, then resumes before its first measured operation. This correction is
 methodology repair, not a runtime speedup.
 
+## M17 CUDA synchronized prefill gate — pending NVIDIA hardware
+
+Source commit `ecce37d` (implementation commit `8706c8e`) adds a full-prefill
+benchmark for `CudaLlamaModel`. It is a measurement gate, not a result. CUDA
+12.6.85 with GCC 13.2 compiled and linked
+the fixture for `sm_52` in the ARM64 development container, but that container has
+no NVIDIA driver or device. Its CTest smoke is therefore explicitly skipped, and
+no latency, throughput, allocation, or memory-capacity number is published.
+
+The fixture uses the same three `H/I/L/heads/T/V` geometries as the CPU baseline:
+
+| H / I / L / heads / T / V | Parameters / bytes | Status |
+|---|---:|---|
+| 32 / 64 / 2 / 4 / 7 / 128 | 28,832 / 115,328 B | compile-validated; execution pending |
+| 64 / 128 / 2 / 4 / 31 / 256 | 115,008 / 460,032 B | compile-validated; execution pending |
+| 128 / 256 / 4 / 8 / 63 / 512 | 787,584 / 3,150,336 B | compile-validated; execution pending |
+
+Deterministic CPU and CUDA models are constructed from identical weight seeds.
+Model construction, CPU-to-device weight copies, token-ID upload, RoPE-table
+generation/upload, and the CPU oracle are outside timing. The device-input path is
+executed once and compared with the CPU oracle, then warmed for ten complete
+prefills. Every measured iteration records start and stop events on the same
+caller stream around one `forward_device` call; the stop event is synchronized and
+Google Benchmark consumes the event duration as manual time. A second complete
+prefill is compared with the CPU oracle after all measurement iterations. The
+comparison uses `atol=2e-4`, `rtol=2e-3` for accumulated Float32 CPU/CUDA
+differences.
+
+The timed call includes activation/workspace device allocation, all custom-kernel
+stages, layer-local Tensor destruction, one explicit stream synchronization after
+each of `L` layers, final normalization/projection, and the final synchronization.
+Because the start event is enqueued before host-side allocation/submission and the
+stop event only afterward, device idle gaps between the two event executions can
+contribute. This is still not complete host wall latency: preloading and the final
+returned-logits destruction are excluded. The fixture intentionally measures the
+current direct-allocation, synchronization-heavy correctness baseline; it must not
+be compared with the allocation-free standalone kernel fixtures as if their scopes
+were equal.
+
+Command for a future named NVIDIA system:
+
+```bash
+./build-cuda/benchmarks/helix_benchmarks \
+  '--benchmark_filter=BM_CudaLlamaSynchronousPrefill' \
+  --benchmark_min_time=0.1s \
+  --benchmark_repetitions=9 \
+  --benchmark_report_aggregates_only=true
+```
+
+A valid publication must additionally record GPU, driver, CUDA toolkit, CPU/RAM,
+compiler, architecture target, clocks/power policy where available, load,
+repetition variation, and peak memory. The first optimization candidate is a
+reusable allocator-backed workspace that removes per-layer barriers; no such
+change may be called faster until this exact baseline runs and a comparable event
+and host-wall-time experiment is repeated.
+
 ## M17 immutable mapped model loading — 2026-08-24
 
 Hypothesis: after format validation is held constant, allocating one owned buffer
@@ -1635,8 +1691,9 @@ required synchronization is never reported as execution latency.
 
 CUDA event fixtures now exist for M4 elementwise kernels, every M5
 reduction/softmax variant, both M6 SGEMM implementations, and the M9 embedding and
-transformer primitives. Their CUDA 12.6 compile validation is not a benchmark;
-result rows will be added only after execution on a named NVIDIA GPU and driver.
+transformer primitives, plus the M17 synchronized full-prefill composition. Their
+CUDA 12.6 compile validation is not a benchmark; result rows will be added only
+after execution on a named NVIDIA GPU and driver.
 
 M8's CUDA event-backed reclamation path likewise has correctness fixtures but no
 published timing. Direct, Helix, and supported `cudaMallocAsync` fixtures now make

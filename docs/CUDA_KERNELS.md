@@ -482,6 +482,41 @@ geometry/alias contracts. Four event-timed fixtures pair the contiguous logical
 shapes with reversed page mappings. Neither tests nor timings have run without a
 physical NVIDIA device.
 
+## Full-prefill composition baseline
+
+Milestone 17 composes the custom kernels into `CudaLlamaModel` for the same narrow
+Float32 architecture as the CPU model. No new fused kernel is hidden at this
+boundary: embedding, RMSNorm, tiled custom SGEMM projections, RoPE, token/head
+layout copies, causal score/softmax/value attention, residual add, SwiGLU, final
+norm, and the LM-head projection remain individually visible launches. Attention
+uses an explicit layer-local `[heads,tokens,tokens]` Float32 score workspace.
+
+The first composition prioritizes pointer lifetime over concurrency. Every
+operation in a layer is issued to one caller-owned stream. All layer-local Tensor
+storage remains alive until `Stream::synchronize` completes, after which the next
+hidden state replaces the previous allocation and local projections/workspace can
+be destroyed. Final logits receive another completion barrier. If a launch or
+allocation throws after earlier work was accepted, the exceptional path attempts
+to drain the stream before local ownership unwinds and rethrows the original
+failure. Deleting these barriers without adding a persistent workspace or stream-
+aware deferred release would permit asynchronous use-after-free.
+
+The existing standalone analyses describe thread layout, coalescing, shared
+memory, and register usage for each constituent kernel. Composition does not alter
+those launch configurations. It does expose additional global-memory copies at the
+token/head boundary, direct allocation cost, quadratic attention scratch, many
+launches, and `layers+1` synchronizations. Those are profiling hypotheses, not
+measured bottlenecks.
+
+Three hardware-gated model tests use deterministic weights and compare full logits
+with the CPU model for one-token and odd-five-token prompts, then exercise input,
+device, and moved-stream failures plus the invalid-device-ID NaN sentinel. The
+matching event fixture preloads long-lived inputs, performs ten complete warmups,
+and checks the CPU oracle before and after timing. CUDA 12.6 compiles and links all
+paths, but no model test, sanitizer workload, or timing has run on a physical GPU.
+See `docs/MODEL_SUPPORT.md` for ownership and architecture boundaries and
+`docs/PERFORMANCE.md` for the exact future measurement scope.
+
 ## Reproducible profiling
 
 `scripts/profile_cuda.sh` turns one exact CUDA Google Benchmark case into a

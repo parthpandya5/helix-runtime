@@ -8,12 +8,14 @@ that into a GPU performance claim.
 
 - Engineered a CPU-first C++20/CUDA inference runtime with checked Tensor/storage
   ownership, deterministic reference kernels, causal attention, contiguous and
-  paged KV caches, request scheduling, and continuous batching; maintained 185
+  paged KV caches, request scheduling, and continuous batching; maintained 196
   passing Debug, Release, and ASan/UBSan CPU tests.
 - Implemented manual CUDA elementwise, reduction, stable-softmax, naive/tiled
-  SGEMM, RMSNorm, RoPE, SwiGLU, and attention paths with RAII streams/events and
-  hardware-gated CPU-oracle tests; compile-validated all CUDA targets with NVCC
-  12.6 while explicitly deferring runtime/performance claims until GPU access.
+  SGEMM, embedding, layout, RMSNorm, RoPE, SwiGLU, and attention paths with RAII
+  streams/events; composed them into a synchronous full-prefill model with owned
+  device weights and explicit temporary-lifetime barriers, then compile-validated
+  all CUDA targets and CPU-oracle tests with NVCC 12.6 while explicitly deferring
+  runtime/performance claims until GPU access.
 - Designed a best-fit caching allocator with aligned split/coalesce, reservation
   limits, generation-tagged stale/double-free protection, internal/external
   fragmentation metrics, and event-backed deferred reuse for stream-ordered CUDA

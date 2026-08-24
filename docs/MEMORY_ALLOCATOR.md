@@ -5,12 +5,12 @@
 The allocator metadata, generic deferred-reclamation layer, and opt-in CPU Tensor
 ownership bridge are **implemented, CPU-validated, sanitizer-validated, and host-
 resource benchmarked**. Twenty-one focused allocator/deferred/bridge tests and the
-full 195-test CPU suite pass in Debug, Release, and ASan/UBSan builds. A CUDA 12.6
+full 196-test CPU suite pass in Debug, Release, and ASan/UBSan builds. A CUDA 12.6
 warnings-as-errors build compiles `CudaMemoryResource`, `StreamOrderedAllocator`,
 six hardware-gated allocator/ownership tests, both Tensor bridges, and native-CUDA
-comparison benchmarks. It passes 194 hardware-independent tests and skips 71 GPU
-tests without a driver/device (265 registered), so no CUDA allocator code has run
-on a physical GPU.
+comparison benchmarks. It passes 195 hardware-independent tests and skips 75 GPU-
+required tests/benchmark gates without a driver/device (270 registered), so no
+CUDA allocator code has run on a physical GPU.
 
 The event-backed adapter is therefore compile-validated rather than hardware-
 validated. The CUDA Tensor bridge has an explicit single-stream contract; Tensor

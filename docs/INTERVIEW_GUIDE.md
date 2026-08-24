@@ -15,10 +15,27 @@ KV caches, direct block-table attention, and a deterministic continuous-batching
 scheduler. The current end-to-end path loads a checksummed native model format,
 runs a narrowly defined Float32 Llama-style model on CPU, performs single-sequence
 greedy generation, and drives multiple scheduled requests through a shared paged
-KV pool with transactional prefill/decode/reclamation.
+KV pool with transactional prefill/decode/reclamation. A separate synchronous
+CUDA baseline now composes the custom kernels through complete causal prefill with
+device-owned weights and explicit per-layer lifetime barriers; it is not yet the
+scheduler/KV runtime path.
 CPU paths pass normal and sanitizer suites and have reproducible benchmarks. CUDA
 paths compile under CUDA 12.6, but I do not claim GPU correctness or performance
 because this development environment has no NVIDIA device.
+
+## How does the CUDA model baseline manage asynchronous lifetime?
+
+`CudaLlamaModel` deep-copies validated CPU weights to one device, while each
+forward call owns its activations and explicit attention score workspace. All
+kernels for a layer use the caller's one stream. The model synchronizes at the end
+of the layer before destroying projections, repacked Q/K/V, attention scratch, or
+the old hidden state, and synchronizes final logits before returning. Its exception
+path also tries to drain accepted work before unwinding. That is correct but
+intentionally expensive: `layers+1` barriers, direct temporary allocation, no K/V
+decode, and no overlap. A production follow-up needs persistent workspace or
+stream-aware deferred release; simply removing synchronization would create
+device use-after-free risk. This design is compile-validated only until the GPU
+oracle and sanitizer tests run.
 
 ## Why build an inference runtime rather than use PyTorch?
 

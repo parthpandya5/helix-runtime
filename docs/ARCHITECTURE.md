@@ -46,7 +46,9 @@ The implemented synchronous CPU runtime executes one scheduling iteration at a
 time: admit requests, construct prefill/decode work within token and KV-memory
 budgets, optionally seed exact cached prefixes, execute the model serially, append
 paged K/V state, select tokens, and retire or requeue requests. CUDA model
-execution and asynchronous iterations remain later layers of this architecture.
+execution now has an isolated synchronous full-prefill composition baseline;
+CUDA-backed K/V, scheduling, and asynchronous iterations remain later layers of
+this architecture.
 
 ## Layering and dependency direction
 
@@ -658,6 +660,44 @@ file-backed weights. The optional diagnostic path preserves post-layer Tensor
 handles and the final normalized state; ordinary execution does not retain those
 intermediates.
 
+`CudaLlamaModel` accepts a validated CPU weight bundle and owns a deep copy on one
+CUDA device. The host-token overload validates every ID before any transfer and
+builds RoPE tables with the same private helper as the CPU model. The device-input
+overload requires preloaded contiguous UInt32 IDs and Float32 cosine/sine tables on
+the model device; this is the benchmark/composition boundary. Device-resident IDs
+cannot be inspected without a transfer, so the embedding kernel turns an invalid
+ID into a NaN row after checking the ID before table address formation. The normal
+host path rejects that ID instead.
+
+All kernels inside the device-input prefill execute on the caller's stream; the
+host overload's ID/RoPE transfers are blocking prerequisites. Each layer owns its
+projections, repacked Q/K/V, attention output, and explicit
+`[heads,tokens,tokens]` score workspace until a stream synchronization completes.
+Only then are layer temporaries destroyed and the next hidden state installed.
+Final norm/projection receives the same completion boundary before device logits
+return. An exceptional exit makes a best effort to drain already accepted work
+before local storage unwinds while preserving the original error.
+
+```mermaid
+flowchart LR
+    Weights[Validated CPU weights] --> Copy[Deep copy to one CUDA device]
+    IDs[Device IDs + RoPE tables] --> Layer[Enqueue one decoder layer]
+    Copy --> Layer
+    Layer --> Scratch[Owned projections + attention scratch]
+    Scratch --> Barrier[Stream synchronization]
+    Barrier --> Reclaim[Reclaim layer temporaries]
+    Reclaim --> Layer
+    Layer --> Final[Final norm + LM head]
+    Final --> Done[Stream synchronization + CUDA logits]
+```
+
+These barriers are a correctness baseline, not a proposed throughput design. The
+path uses ordinary Tensor device allocation rather than `HelixAllocator`, exposes
+the existing token/head copies and unfused attention stages, and has no K/V decode,
+batch construction, graph capture, or overlap. Replacing the barriers requires an
+explicit long-lived workspace or stream-aware allocator ownership; merely deleting
+them would permit asynchronous use-after-free.
+
 `CpuLlamaGenerator` is the single-sequence session owner. It contains the model,
 one `ContiguousKvCache`, and one sequence handle and is deliberately noncopyable,
 nonmovable, and not thread-safe. The cache owns fixed-capacity
@@ -752,7 +792,8 @@ selection, EOS/length/context stops, a token-ID CLI, and scheduler-driven multi-
 request paged decode are implemented.
 The runtime schedules several requests per iteration but executes their model work
 serially; a fused tensor batch, tokenizer integration, validation of additional
-checkpoint architectures, and CUDA model dispatch remain later work. The
+checkpoint architectures, CUDA cached decode, and GPU runtime dispatch remain
+later work. The
 implemented converter supports only the documented ordinary Hugging Face Llama
 safetensors layout and rejects GQA/MQA, biases, scaled/partial RoPE, quantization,
 and arbitrary model graphs rather than guessing compatibility.
@@ -844,3 +885,9 @@ graphs, arbitrary strides, production serving APIs, quantization, automatic
 cross-model prefix namespaces, partial-page prefix sharing, preemption, or
 multi-GPU inference. Each can be considered only after the core runtime is correct
 and measured.
+
+The CUDA full-prefill composition is compile-validated but has not executed on an
+NVIDIA device. It synchronizes per layer, allocates temporaries directly, and is
+not connected to paged K/V, the scheduler, or the runtime engine. No correctness,
+latency, throughput, occupancy, or memory-capacity inference is drawn from CUDA
+compilation alone.
