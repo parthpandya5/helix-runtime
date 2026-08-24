@@ -28,6 +28,10 @@ public:
                                              Device device = Device::cpu());
   [[nodiscard]] static Tensor from_values(Shape shape, std::span<const float> values,
                                           Device device = Device::cpu());
+  [[nodiscard]] static Tensor
+  from_read_only_cpu_buffer(Shape shape, DType dtype, const void* data,
+                            std::shared_ptr<const void> owner,
+                            std::size_t alignment = kDefaultStorageAlignment);
 
   [[nodiscard]] const Shape& shape() const noexcept {
     return shape_;
@@ -57,8 +61,11 @@ public:
     return storage_offset_bytes_;
   }
   [[nodiscard]] bool is_contiguous() const;
+  [[nodiscard]] bool is_read_only() const noexcept {
+    return storage_->is_read_only();
+  }
 
-  [[nodiscard]] void* data() noexcept;
+  [[nodiscard]] void* data();
   [[nodiscard]] const void* data() const noexcept;
 
   template <typename T> [[nodiscard]] T* data_as() {
@@ -94,6 +101,7 @@ private:
 
   void validate_storage_bounds() const;
   void require_cpu(std::string_view operation) const;
+  void require_writable(std::string_view operation) const;
 
   Shape shape_;
   Strides strides_;

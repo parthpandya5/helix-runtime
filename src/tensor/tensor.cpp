@@ -73,15 +73,24 @@ Tensor Tensor::from_values(Shape shape, std::span<const float> values, Device de
   return device.is_cpu() ? result : result.to(device);
 }
 
+Tensor Tensor::from_read_only_cpu_buffer(Shape shape, DType dtype, const void* data,
+                                         std::shared_ptr<const void> owner, std::size_t alignment) {
+  const std::size_t size_bytes = checked_nbytes(shape, dtype);
+  auto storage = Storage::wrap_read_only_cpu(data, size_bytes, std::move(owner), alignment);
+  auto strides = contiguous_strides(shape);
+  return Tensor(std::move(shape), std::move(strides), dtype, Device::cpu(), std::move(storage), 0);
+}
+
 bool Tensor::is_contiguous() const {
   return has_contiguous_strides(shape_, strides_);
 }
 
-void* Tensor::data() noexcept {
-  if (storage_->data() == nullptr) {
+void* Tensor::data() {
+  if (static_cast<const Storage&>(*storage_).data() == nullptr) {
     return nullptr;
   }
-  return static_cast<void*>(static_cast<std::byte*>(storage_->data()) + storage_offset_bytes_);
+  return static_cast<void*>(static_cast<std::byte*>(storage_->mutable_data()) +
+                            storage_offset_bytes_);
 }
 
 const void* Tensor::data() const noexcept {
@@ -93,6 +102,7 @@ const void* Tensor::data() const noexcept {
 }
 
 Tensor& Tensor::zero_() {
+  require_writable("Tensor::zero_");
   HELIX_CHECK(is_contiguous(), ErrorCode::kUnsupported,
               "Tensor::zero_ currently requires contiguous storage");
   if (device_.is_cpu() && nbytes_ != 0) {
@@ -109,6 +119,7 @@ Tensor& Tensor::zero_() {
 }
 
 Tensor& Tensor::random_uniform_(std::uint64_t seed, float lower, float upper) {
+  require_writable("Tensor::random_uniform_");
   require_cpu("Tensor::random_uniform_");
   HELIX_CHECK(dtype_ == DType::kFloat32, ErrorCode::kUnsupported,
               "random initialization currently supports float32 only");
@@ -132,6 +143,7 @@ Tensor& Tensor::random_uniform_(std::uint64_t seed, float lower, float upper) {
 }
 
 Tensor& Tensor::copy_from(const Tensor& source) {
+  require_writable("Tensor::copy_from");
   HELIX_CHECK(shape_ == source.shape_, ErrorCode::kInvalidArgument,
               "tensor copy requires equal shapes");
   HELIX_CHECK(dtype_ == source.dtype_, ErrorCode::kInvalidArgument,
@@ -224,6 +236,11 @@ void Tensor::validate_storage_bounds() const {
 void Tensor::require_cpu(std::string_view operation) const {
   HELIX_CHECK(device_.is_cpu(), ErrorCode::kUnsupported,
               operation_device_message(operation, device_));
+}
+
+void Tensor::require_writable(std::string_view operation) const {
+  HELIX_CHECK(!is_read_only(), ErrorCode::kInvalidArgument,
+              std::string(operation) + " cannot mutate read-only storage");
 }
 
 } // namespace helix

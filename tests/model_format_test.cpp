@@ -14,6 +14,7 @@
 #include <sstream>
 #include <string>
 #include <system_error>
+#include <utility>
 #include <vector>
 
 namespace helix::model {
@@ -139,6 +140,13 @@ std::string read_file(const std::filesystem::path& path) {
   return std::string(std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>());
 }
 
+void write_file(const std::filesystem::path& path, const std::string& bytes) {
+  std::ofstream output(path, std::ios::binary | std::ios::trunc);
+  ASSERT_TRUE(output) << path;
+  output.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+  ASSERT_TRUE(output) << path;
+}
+
 struct TemporaryDirectory final {
   explicit TemporaryDirectory(std::string_view prefix) {
     const auto nonce = std::chrono::steady_clock::now().time_since_epoch().count();
@@ -203,6 +211,17 @@ void expect_invalid_file(const std::string& bytes) {
   try {
     static_cast<void>(deserialize(bytes));
     FAIL() << "expected malformed model file to be rejected";
+  } catch (const Error& error) {
+    EXPECT_EQ(error.code(), ErrorCode::kInvalidArgument);
+    EXPECT_NE(error.message().find("model::format"), std::string::npos);
+  }
+}
+
+void expect_invalid_mapped_file(const std::filesystem::path& path, const std::string& bytes) {
+  write_file(path, bytes);
+  try {
+    static_cast<void>(read_llama_model_file_mapped(path));
+    FAIL() << "expected malformed mapped model file to be rejected";
   } catch (const Error& error) {
     EXPECT_EQ(error.code(), ErrorCode::kInvalidArgument);
     EXPECT_NE(error.message().find("model::format"), std::string::npos);
@@ -335,6 +354,99 @@ TEST(ModelFormatTest, FilesystemOverloadsRoundTripAndReportMissingFileContext) {
   try {
     static_cast<void>(read_llama_model_file(missing));
     FAIL() << "expected a missing model file error";
+  } catch (const Error& error) {
+    EXPECT_EQ(error.code(), ErrorCode::kRuntime);
+    EXPECT_NE(error.message().find(missing.string()), std::string::npos);
+  }
+}
+
+TEST(ModelFormatTest, MappedLoaderIsBitExactReadOnlyAndOwnsLifetime) {
+  if (!mapped_model_loading_supported()) {
+    GTEST_SKIP() << "read-only model mapping is unavailable on this platform";
+  }
+
+  const LlamaConfig config = test_config();
+  const LlamaWeights weights = make_weights(config);
+  TemporaryDirectory temporary("helix-model-mapped");
+  const std::filesystem::path path = temporary.path / "model.helix";
+  write_llama_model_file(path, config, weights);
+
+  LoadedLlamaModel copied = read_llama_model_file(path);
+  LoadedLlamaModel mapped = read_llama_model_file_mapped(path);
+  expect_weights_equal(mapped.weights, weights);
+  expect_weights_equal(mapped.weights, copied.weights);
+  for (const Tensor* tensor : canonical_tensors(mapped.weights)) {
+    EXPECT_TRUE(tensor->is_read_only());
+    EXPECT_EQ(tensor->allocated_bytes(), tensor->nbytes());
+    EXPECT_EQ(reinterpret_cast<std::uintptr_t>(tensor->data()) % 64, 0U);
+  }
+
+  Tensor mapped_alias = mapped.weights.token_embedding();
+  EXPECT_THROW(static_cast<void>(mapped_alias.data()), Error);
+  EXPECT_THROW(static_cast<void>(mapped_alias.zero_()), Error);
+  Tensor clone = mapped_alias.clone();
+  EXPECT_FALSE(clone.is_read_only());
+  clone.data_as<float>()[0] = -7.0F;
+  EXPECT_NE(clone.data_as<float>()[0], std::as_const(mapped_alias).data_as<float>()[0]);
+
+  CpuLlamaModel copied_model(copied.config, std::move(copied.weights));
+  CpuLlamaModel mapped_model(mapped.config, std::move(mapped.weights));
+  const std::vector<std::uint32_t> tokens{6, 1, 4, 0, 2};
+  const Tensor copied_logits = copied_model.forward(tokens);
+  const Tensor first_mapped_logits = mapped_model.forward(tokens);
+  expect_tensor_equal(first_mapped_logits, copied_logits);
+
+  ASSERT_TRUE(std::filesystem::remove(path));
+  const Tensor after_unlink_logits = mapped_model.forward(tokens);
+  expect_tensor_equal(after_unlink_logits, copied_logits);
+}
+
+TEST(ModelFormatTest, MappedLoaderRejectsCorruptionAndReportsPathErrors) {
+  if (!mapped_model_loading_supported()) {
+    GTEST_SKIP() << "read-only model mapping is unavailable on this platform";
+  }
+
+  const LlamaConfig config = test_config();
+  const std::string valid = serialize(config, make_weights(config));
+  const std::size_t tensor_count = 3 + config.layer_count * 9;
+  const std::size_t metadata_end = kHeaderBytes + tensor_count * kDirectoryEntryBytes;
+  const std::size_t first_payload = static_cast<std::size_t>(read_u64(valid, kHeaderBytes + 48));
+  const std::size_t first_payload_bytes =
+      static_cast<std::size_t>(read_u64(valid, kHeaderBytes + 56));
+  TemporaryDirectory temporary("helix-model-mapped-invalid");
+  const std::filesystem::path path = temporary.path / "model.helix";
+
+  expect_invalid_mapped_file(path, valid.substr(0, valid.size() - 1));
+  expect_invalid_mapped_file(path, valid + std::string(1, '\0'));
+
+  std::string bad_metadata = valid;
+  bad_metadata[kHeaderBytes] ^= 1;
+  expect_invalid_mapped_file(path, bad_metadata);
+
+  std::string bad_padding = valid;
+  ASSERT_LT(metadata_end, first_payload);
+  bad_padding[metadata_end] = 1;
+  expect_invalid_mapped_file(path, bad_padding);
+
+  std::string non_finite = valid;
+  const std::uint32_t infinity =
+      std::bit_cast<std::uint32_t>(std::numeric_limits<float>::infinity());
+  for (std::size_t shift = 0; shift < 32; shift += 8) {
+    non_finite[first_payload + shift / 8] = static_cast<char>((infinity >> shift) & 0xffU);
+  }
+  std::uint64_t payload_checksum = kFnvOffset;
+  for (std::size_t index = 0; index < first_payload_bytes; ++index) {
+    payload_checksum ^= static_cast<unsigned char>(non_finite[first_payload + index]);
+    payload_checksum *= kFnvPrime;
+  }
+  write_u64(non_finite, kHeaderBytes + 72, payload_checksum);
+  refresh_metadata_checksum(non_finite, tensor_count);
+  expect_invalid_mapped_file(path, non_finite);
+
+  const std::filesystem::path missing = temporary.path / "missing.helix";
+  try {
+    static_cast<void>(read_llama_model_file_mapped(missing));
+    FAIL() << "expected a missing mapped model file error";
   } catch (const Error& error) {
     EXPECT_EQ(error.code(), ErrorCode::kRuntime);
     EXPECT_NE(error.message().find(missing.string()), std::string::npos);

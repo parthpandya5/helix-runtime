@@ -10,7 +10,9 @@
 #include <cstdint>
 #include <gtest/gtest.h>
 #include <limits>
+#include <memory>
 #include <span>
+#include <utility>
 #include <vector>
 
 namespace helix {
@@ -76,6 +78,29 @@ TEST(StorageTest, RejectsInvalidAlignmentAndUnavailableCuda) {
 #if !HELIX_ENABLE_CUDA
   EXPECT_THROW(static_cast<void>(Storage::allocate(16, Device::cuda())), Error);
 #endif
+}
+
+TEST(StorageTest, ReadOnlyExternalStorageValidatesOwnershipAndAlignment) {
+  struct alignas(64) Buffer final {
+    std::array<float, 4> values{1.0F, 2.0F, 3.0F, 4.0F};
+  };
+  const auto owner = std::make_shared<Buffer>();
+  const auto storage =
+      Storage::wrap_read_only_cpu(owner->values.data(), sizeof(owner->values), owner, 64);
+
+  EXPECT_EQ(storage->data(), owner->values.data());
+  EXPECT_TRUE(storage->is_read_only());
+  EXPECT_THROW(static_cast<void>(storage->mutable_data()), Error);
+  EXPECT_THROW(static_cast<void>(Storage::wrap_read_only_cpu(owner->values.data(),
+                                                             sizeof(owner->values), {}, 64)),
+               Error);
+  EXPECT_THROW(static_cast<void>(Storage::wrap_read_only_cpu(
+                   reinterpret_cast<const std::byte*>(owner->values.data()) + sizeof(float),
+                   sizeof(owner->values) - sizeof(float), owner, 64)),
+               Error);
+  EXPECT_THROW(static_cast<void>(Storage::wrap_read_only_cpu(owner->values.data(), 0, {}, 64)),
+               Error);
+  EXPECT_EQ(Storage::wrap_read_only_cpu(nullptr, 0, {}, 64)->data(), nullptr);
 }
 
 TEST(TensorTest, OwnsCanonicalContiguousMetadata) {
@@ -163,6 +188,41 @@ TEST(TensorTest, ViewKeepsStorageAlive) {
   }();
 
   EXPECT_EQ(values_of(view), (std::vector<float>{1.0F, 2.0F, 3.0F, 4.0F}));
+}
+
+TEST(TensorTest, ReadOnlyExternalBufferPreservesLifetimeAndSupportsDeepClone) {
+  struct alignas(64) Buffer final {
+    std::array<float, 4> values{1.0F, 2.0F, 3.0F, 4.0F};
+  };
+
+  auto owner = std::make_shared<Buffer>();
+  std::weak_ptr<Buffer> lifetime = owner;
+  Tensor tensor =
+      Tensor::from_read_only_cpu_buffer({2, 2}, DType::kFloat32, owner->values.data(), owner, 64);
+  owner.reset();
+
+  EXPECT_FALSE(lifetime.expired());
+  EXPECT_TRUE(tensor.is_read_only());
+  EXPECT_EQ(values_of(tensor), (std::vector<float>{1.0F, 2.0F, 3.0F, 4.0F}));
+  EXPECT_THROW(static_cast<void>(tensor.data()), Error);
+  EXPECT_THROW(static_cast<void>(tensor.data_as<float>()), Error);
+  EXPECT_THROW(static_cast<void>(tensor.zero_()), Error);
+  EXPECT_THROW(static_cast<void>(tensor.random_uniform_(7)), Error);
+  EXPECT_THROW(static_cast<void>(tensor.copy_from(Tensor::zeros({2, 2}))), Error);
+
+  Tensor view = tensor.view({4});
+  EXPECT_TRUE(view.is_read_only());
+  EXPECT_EQ(std::as_const(view).data(), std::as_const(tensor).data());
+
+  Tensor clone = tensor.clone();
+  EXPECT_FALSE(clone.is_read_only());
+  clone.data_as<float>()[0] = -5.0F;
+  EXPECT_FLOAT_EQ(std::as_const(tensor).data_as<float>()[0], 1.0F);
+
+  tensor = Tensor::zeros({1});
+  EXPECT_FALSE(lifetime.expired());
+  view = Tensor::zeros({1});
+  EXPECT_TRUE(lifetime.expired());
 }
 
 TEST(TensorTest, ReshapeRejectsIncompatibleElementCounts) {

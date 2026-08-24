@@ -35,4 +35,12 @@ void write_llama_model_file_from_raw_float32_files(
 [[nodiscard]] LoadedLlamaModel read_llama_model_file(std::istream& input);
 [[nodiscard]] LoadedLlamaModel read_llama_model_file(const std::filesystem::path& path);
 
+// The mapped path is an opt-in POSIX/little-endian IEEE-754 optimization. It
+// performs the same structural, checksum, padding, and finite-value validation
+// as the copied loader, then exposes payloads through read-only Tensor storage
+// whose lifetime owns the mapping. The source inode must not be modified while
+// the model lives.
+[[nodiscard]] bool mapped_model_loading_supported() noexcept;
+[[nodiscard]] LoadedLlamaModel read_llama_model_file_mapped(const std::filesystem::path& path);
+
 } // namespace helix::model

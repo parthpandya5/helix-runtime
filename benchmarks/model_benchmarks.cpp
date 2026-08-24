@@ -3,11 +3,14 @@
 #include "helix/model/llama.hpp"
 
 #include <benchmark/benchmark.h>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <filesystem>
 #include <optional>
 #include <sstream>
 #include <string>
+#include <system_error>
 #include <utility>
 #include <vector>
 
@@ -49,6 +52,33 @@ LlamaConfig config_from_state(const benchmark::State& state) {
                      1.0e-5F,
                      10'000.0F};
 }
+
+class TemporaryModelFile final {
+public:
+  TemporaryModelFile(const LlamaConfig& config, const LlamaWeights& weights) {
+    const auto nonce = std::chrono::steady_clock::now().time_since_epoch().count();
+    path_ = std::filesystem::temp_directory_path() /
+            ("helix-model-load-benchmark-" + std::to_string(nonce) + ".helix");
+    write_llama_model_file(path_, config, weights);
+  }
+
+  ~TemporaryModelFile() {
+    std::error_code ignored;
+    std::filesystem::remove(path_, ignored);
+  }
+
+  TemporaryModelFile(const TemporaryModelFile&) = delete;
+  TemporaryModelFile& operator=(const TemporaryModelFile&) = delete;
+  TemporaryModelFile(TemporaryModelFile&&) = delete;
+  TemporaryModelFile& operator=(TemporaryModelFile&&) = delete;
+
+  [[nodiscard]] const std::filesystem::path& path() const noexcept {
+    return path_;
+  }
+
+private:
+  std::filesystem::path path_;
+};
 
 std::size_t parameter_count(const LlamaConfig& config) {
   const std::size_t embedding_and_head = 2 * config.vocabulary_size * config.hidden_size;
@@ -121,6 +151,38 @@ void BM_LlamaModelLoadFromMemory(benchmark::State& state) {
   set_model_counters(state, config, serialized->size());
 }
 
+void BM_LlamaModelLoadFromFile(benchmark::State& state, bool mapped) {
+  if (mapped && !mapped_model_loading_supported()) {
+    state.SkipWithError("read-only model mapping is unavailable on this platform");
+    return;
+  }
+
+  const LlamaConfig config = config_from_state(state);
+  const LlamaWeights weights = benchmark_weights(config);
+  const TemporaryModelFile file(config, weights);
+  const std::size_t model_file_bytes = std::filesystem::file_size(file.path());
+  if (mapped) {
+    const LoadedLlamaModel warmup = read_llama_model_file_mapped(file.path());
+    benchmark::DoNotOptimize(warmup.weights.token_embedding().data());
+  } else {
+    const LoadedLlamaModel warmup = read_llama_model_file(file.path());
+    benchmark::DoNotOptimize(warmup.weights.token_embedding().data());
+  }
+
+  for ([[maybe_unused]] const auto iteration : state) {
+    if (mapped) {
+      const LoadedLlamaModel loaded = read_llama_model_file_mapped(file.path());
+      benchmark::DoNotOptimize(loaded.weights.token_embedding().data());
+    } else {
+      const LoadedLlamaModel loaded = read_llama_model_file(file.path());
+      benchmark::DoNotOptimize(loaded.weights.token_embedding().data());
+    }
+    benchmark::ClobberMemory();
+  }
+
+  set_model_counters(state, config, model_file_bytes);
+}
+
 std::vector<std::uint32_t> make_prompt(std::size_t token_count, std::size_t vocabulary_size) {
   std::vector<std::uint32_t> token_ids(token_count);
   for (std::size_t index = 0; index < token_ids.size(); ++index) {
@@ -186,6 +248,12 @@ BENCHMARK(BM_CpuLlamaFullPrefill)
     ->Apply(model_arguments)
     ->ArgNames({"hidden", "intermediate", "layers", "heads", "tokens", "vocabulary"});
 BENCHMARK(BM_LlamaModelLoadFromMemory)
+    ->Apply(model_arguments)
+    ->ArgNames({"hidden", "intermediate", "layers", "heads", "tokens", "vocabulary"});
+BENCHMARK_CAPTURE(BM_LlamaModelLoadFromFile, Copied, false)
+    ->Apply(model_arguments)
+    ->ArgNames({"hidden", "intermediate", "layers", "heads", "tokens", "vocabulary"});
+BENCHMARK_CAPTURE(BM_LlamaModelLoadFromFile, ReadOnlyMapped, true)
     ->Apply(model_arguments)
     ->ArgNames({"hidden", "intermediate", "layers", "heads", "tokens", "vocabulary"});
 BENCHMARK_CAPTURE(BM_CpuLlamaNextPosition, CachedKvDecode, true)

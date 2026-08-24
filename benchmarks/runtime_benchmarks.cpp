@@ -209,8 +209,9 @@ RuntimeTraceConfig prefix_trace_config(const benchmark::State& state, bool enabl
   const auto request_count = static_cast<std::size_t>(state.range(4));
   const auto prompt_tokens = static_cast<std::size_t>(state.range(5));
   const std::size_t physical_blocks = blocks_for_tokens(prompt_tokens, kBlockTokens);
-  CpuRuntimeConfig runtime{scheduler::SchedulerConfig{prompt_tokens, 1, kBlockTokens},
-                           physical_blocks};
+  CpuRuntimeConfig runtime;
+  runtime.scheduler = scheduler::SchedulerConfig{prompt_tokens, 1, kBlockTokens};
+  runtime.physical_kv_blocks = physical_blocks;
   if (enable_prefix_cache) {
     runtime.prefix_cache = kv_cache::PagedPrefixCacheConfig{1, (prompt_tokens - 1) / kBlockTokens};
   }

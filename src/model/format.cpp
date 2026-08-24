@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <cerrno>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -13,13 +14,25 @@
 #include <fstream>
 #include <istream>
 #include <limits>
+#include <memory>
 #include <ostream>
 #include <span>
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <utility>
 #include <vector>
+
+#if defined(__unix__) || defined(__APPLE__)
+#define HELIX_MODEL_HAS_POSIX_MMAP 1
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#else
+#define HELIX_MODEL_HAS_POSIX_MMAP 0
+#endif
 
 namespace helix::model {
 namespace {
@@ -37,6 +50,8 @@ constexpr std::uint32_t kGlobalLayer = std::numeric_limits<std::uint32_t>::max()
 constexpr std::uint64_t kFnvOffset = 14'695'981'039'346'656'037ULL;
 constexpr std::uint64_t kFnvPrime = 1'099'511'628'211ULL;
 constexpr std::size_t kIoChunkBytes = 64 * 1024;
+static_assert(sizeof(float) == sizeof(std::uint32_t),
+              "HELIXLM1 requires a 32-bit host Float32 representation");
 
 enum class TensorRole : std::uint32_t {
   kTokenEmbedding = 1,
@@ -72,6 +87,21 @@ struct DirectoryRecord {
   std::uint64_t checksum;
 };
 
+struct DecodedHeader {
+  LlamaConfig config;
+  std::uint64_t metadata_checksum;
+  std::size_t tensor_count;
+  std::size_t directory_bytes;
+  std::size_t metadata_end;
+  std::size_t data_offset;
+};
+
+struct ParsedModelMetadata {
+  DecodedHeader header;
+  std::vector<TensorSpec> specs;
+  std::vector<DirectoryRecord> records;
+};
+
 [[noreturn]] void invalid_format(std::string message) {
   throw_error(ErrorCode::kInvalidArgument, "model::format: " + std::move(message));
 }
@@ -79,6 +109,102 @@ struct DirectoryRecord {
 [[noreturn]] void io_error(std::string message) {
   throw_error(ErrorCode::kRuntime, "model::format: " + std::move(message));
 }
+
+#if HELIX_MODEL_HAS_POSIX_MMAP
+std::string posix_error_message(int error_number) {
+  return std::error_code(error_number, std::generic_category()).message();
+}
+
+class FileDescriptor final {
+public:
+  explicit FileDescriptor(int value) noexcept : value_(value) {}
+
+  ~FileDescriptor() {
+    if (value_ >= 0) {
+      static_cast<void>(::close(value_));
+    }
+  }
+
+  FileDescriptor(const FileDescriptor&) = delete;
+  FileDescriptor& operator=(const FileDescriptor&) = delete;
+  FileDescriptor(FileDescriptor&&) = delete;
+  FileDescriptor& operator=(FileDescriptor&&) = delete;
+
+  [[nodiscard]] int get() const noexcept {
+    return value_;
+  }
+
+private:
+  int value_;
+};
+
+class MappedFile final {
+public:
+  explicit MappedFile(const std::filesystem::path& path) {
+    const std::string native_path = path.string();
+    if (native_path.find('\0') != std::string::npos) {
+      io_error("model path contains an embedded null byte");
+    }
+
+    const int descriptor_value = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+    if (descriptor_value < 0) {
+      const int error_number = errno;
+      io_error("could not open '" + path.string() +
+               "' for memory mapping: " + posix_error_message(error_number));
+    }
+    const FileDescriptor descriptor(descriptor_value);
+
+    struct stat status{};
+    if (::fstat(descriptor.get(), &status) != 0) {
+      const int error_number = errno;
+      io_error("could not inspect '" + path.string() +
+               "' for memory mapping: " + posix_error_message(error_number));
+    }
+    if (!S_ISREG(status.st_mode)) {
+      io_error("memory-mapped model path '" + path.string() + "' is not a regular file");
+    }
+    if (status.st_size < 0) {
+      io_error("memory-mapped model file '" + path.string() + "' has a negative size");
+    }
+    const auto unsigned_size = static_cast<std::uintmax_t>(status.st_size);
+    if (unsigned_size > std::numeric_limits<std::size_t>::max()) {
+      throw_error(ErrorCode::kOutOfRange,
+                  "model::format: memory-mapped file exceeds this host's addressable range");
+    }
+    size_bytes_ = static_cast<std::size_t>(unsigned_size);
+    if (size_bytes_ == 0) {
+      return;
+    }
+
+    void* const mapping = ::mmap(nullptr, size_bytes_, PROT_READ, MAP_PRIVATE, descriptor.get(), 0);
+    if (mapping == MAP_FAILED) {
+      const int error_number = errno;
+      io_error("could not memory-map '" + path.string() +
+               "': " + posix_error_message(error_number));
+    }
+    data_ = static_cast<const std::uint8_t*>(mapping);
+  }
+
+  ~MappedFile() {
+    if (data_ != nullptr) {
+      static_cast<void>(::munmap(const_cast<std::uint8_t*>(data_), size_bytes_));
+    }
+  }
+
+  MappedFile(const MappedFile&) = delete;
+  MappedFile& operator=(const MappedFile&) = delete;
+  MappedFile(MappedFile&&) = delete;
+  MappedFile& operator=(MappedFile&&) = delete;
+
+  [[nodiscard]] std::span<const std::uint8_t> bytes() const noexcept {
+    return {data_, size_bytes_};
+  }
+
+private:
+  const std::uint8_t* data_ = nullptr;
+  std::size_t size_bytes_ = 0;
+};
+#endif
 
 std::size_t checked_add(std::size_t lhs, std::size_t rhs, std::string_view context) {
   if (rhs > std::numeric_limits<std::size_t>::max() - lhs) {
@@ -620,6 +746,141 @@ void validate_record(const DirectoryRecord& record, const TensorSpec& spec,
   }
 }
 
+DecodedHeader decode_header(std::span<const std::uint8_t> header, std::size_t actual_size) {
+  if (actual_size < kHeaderBytes || header.size() != kHeaderBytes) {
+    invalid_format("file is smaller than the v1 header");
+  }
+  if (!std::equal(kMagic.begin(), kMagic.end(), header.begin())) {
+    invalid_format("magic does not identify a Helix Llama model");
+  }
+
+  ByteReader reader(header.subspan(kMagic.size()));
+  const std::uint32_t version = reader.u32("format version");
+  const std::uint32_t endian_marker = reader.u32("endianness marker");
+  const std::uint32_t header_bytes = reader.u32("header size");
+  const std::uint32_t model_kind = reader.u32("model kind");
+  const std::uint64_t declared_file_size = reader.u64("file size");
+  const std::uint64_t directory_offset = reader.u64("directory offset");
+  const std::uint64_t tensor_count_value = reader.u64("tensor count");
+  const std::uint64_t directory_entry_bytes = reader.u64("directory entry size");
+  const std::uint64_t data_offset_value = reader.u64("data offset");
+  LlamaConfig config;
+  config.vocabulary_size = to_size(reader.u64("vocabulary size"), "vocabulary size");
+  config.hidden_size = to_size(reader.u64("hidden size"), "hidden size");
+  config.intermediate_size = to_size(reader.u64("intermediate size"), "intermediate size");
+  config.layer_count = to_size(reader.u64("layer count"), "layer count");
+  config.attention_head_count = to_size(reader.u64("attention head count"), "attention head count");
+  config.max_sequence_length =
+      to_size(reader.u64("maximum sequence length"), "maximum sequence length");
+  config.rms_norm_epsilon = std::bit_cast<float>(reader.u32("RMSNorm epsilon"));
+  config.rope_theta = std::bit_cast<float>(reader.u32("RoPE theta"));
+  const std::uint64_t metadata_checksum = reader.u64("metadata checksum");
+  HELIX_ASSERT(reader.offset() + kMagic.size() == kHeaderBytes,
+               "decoded model header size must match");
+
+  if (version != kFormatVersion) {
+    invalid_format("unsupported format version " + std::to_string(version));
+  }
+  if (endian_marker != kEndianMarker) {
+    invalid_format("invalid endianness marker");
+  }
+  if (header_bytes != kHeaderBytes || model_kind != kModelKindLlama ||
+      directory_offset != kDirectoryOffset || directory_entry_bytes != kDirectoryEntryBytes) {
+    invalid_format("header layout or model kind is not supported by v1");
+  }
+  if (declared_file_size != to_u64(actual_size)) {
+    invalid_format("declared file size does not match the stream length");
+  }
+  config.validate();
+
+  const std::size_t tensor_count = to_size(tensor_count_value, "tensor count");
+  if (tensor_count > (actual_size - kHeaderBytes) / kDirectoryEntryBytes) {
+    invalid_format("tensor directory exceeds the file bounds");
+  }
+  const std::size_t directory_bytes = checked_multiply(
+      tensor_count, static_cast<std::size_t>(kDirectoryEntryBytes), "model directory");
+  const std::size_t metadata_end = checked_add(kHeaderBytes, directory_bytes, "model metadata");
+  const std::size_t expected_data_offset =
+      aligned_size(metadata_end, kPayloadAlignment, "model payload start");
+  const std::size_t data_offset = to_size(data_offset_value, "data offset");
+  if (data_offset != expected_data_offset || data_offset > actual_size) {
+    invalid_format("data offset is not canonical or exceeds the file bounds");
+  }
+
+  return DecodedHeader{std::move(config), metadata_checksum, tensor_count,
+                       directory_bytes,   metadata_end,      data_offset};
+}
+
+ParsedModelMetadata parse_model_metadata(DecodedHeader header,
+                                         std::span<const std::uint8_t> header_bytes,
+                                         std::span<const std::uint8_t> directory,
+                                         std::size_t actual_size) {
+  if (directory.size() != header.directory_bytes) {
+    invalid_format("truncated tensor directory");
+  }
+
+  std::vector<TensorSpec> specs = make_specs(header.config, nullptr);
+  if (header.tensor_count != specs.size()) {
+    invalid_format("tensor count does not match the model configuration");
+  }
+
+  std::vector<std::uint8_t> checksum_header(header_bytes.begin(), header_bytes.end());
+  set_u64(checksum_header, kHeaderBytes - sizeof(std::uint64_t), 0);
+  std::uint64_t computed_metadata_checksum = fnv_bytes(checksum_header);
+  computed_metadata_checksum = fnv_bytes(directory, computed_metadata_checksum);
+  if (computed_metadata_checksum != header.metadata_checksum) {
+    invalid_format("metadata checksum mismatch");
+  }
+
+  ByteReader directory_reader(directory);
+  std::vector<DirectoryRecord> records;
+  records.reserve(header.tensor_count);
+  std::size_t expected_offset = header.data_offset;
+  for (std::size_t index = 0; index < header.tensor_count; ++index) {
+    DirectoryRecord record = decode_record(directory_reader);
+    expected_offset = aligned_size(expected_offset, kPayloadAlignment, "tensor payload offset");
+    validate_record(record, specs[index], expected_offset, actual_size);
+    expected_offset = checked_add(expected_offset, to_size(record.byte_length, "tensor bytes"),
+                                  "model payload bounds");
+    records.push_back(record);
+  }
+  HELIX_ASSERT(directory_reader.offset() == directory.size(),
+               "decoded model directory size must match");
+  if (expected_offset != actual_size) {
+    invalid_format("payload extents do not exactly cover the declared file");
+  }
+
+  return ParsedModelMetadata{std::move(header), std::move(specs), std::move(records)};
+}
+
+void validate_zero_padding(std::span<const std::uint8_t> padding) {
+  if (!std::all_of(padding.begin(), padding.end(), [](std::uint8_t value) { return value == 0; })) {
+    invalid_format("alignment padding must contain only zero bytes");
+  }
+}
+
+float decode_finite_float32(std::span<const std::uint8_t> bytes, std::size_t offset,
+                            TensorRole role) {
+  HELIX_ASSERT(offset <= bytes.size() && bytes.size() - offset >= sizeof(float),
+               "Float32 payload decode must remain in bounds");
+  std::uint32_t bits = 0;
+  for (std::size_t shift = 0; shift < 32; shift += 8) {
+    bits |= static_cast<std::uint32_t>(bytes[offset + shift / 8]) << shift;
+  }
+  const float value = std::bit_cast<float>(bits);
+  if (!std::isfinite(value)) {
+    invalid_format(std::string(role_name(role)) + " contains a non-finite value");
+  }
+  return value;
+}
+
+void validate_finite_float32_payload(std::span<const std::uint8_t> bytes, TensorRole role) {
+  HELIX_ASSERT(bytes.size() % sizeof(float) == 0, "Float32 payload must contain complete values");
+  for (std::size_t offset = 0; offset < bytes.size(); offset += sizeof(float)) {
+    static_cast<void>(decode_finite_float32(bytes, offset, role));
+  }
+}
+
 Tensor read_tensor_payload(std::istream& input, const TensorSpec& spec,
                            const DirectoryRecord& record) {
   Tensor tensor = Tensor::empty(spec.shape);
@@ -632,18 +893,11 @@ Tensor read_tensor_payload(std::istream& input, const TensorSpec& spec,
         std::min(tensor.numel() - value_offset, bytes.size() / sizeof(float));
     const std::size_t byte_count = value_count * sizeof(float);
     read_bytes(input, std::span<std::uint8_t>(bytes.data(), byte_count), "tensor payload");
-    checksum = fnv_bytes(std::span<const std::uint8_t>(bytes.data(), byte_count), checksum);
+    const std::span<const std::uint8_t> chunk(bytes.data(), byte_count);
+    checksum = fnv_bytes(chunk, checksum);
     for (std::size_t index = 0; index < value_count; ++index) {
       const std::size_t byte_offset = index * sizeof(float);
-      std::uint32_t bits = 0;
-      for (std::size_t shift = 0; shift < 32; shift += 8) {
-        bits |= static_cast<std::uint32_t>(bytes[byte_offset + shift / 8]) << shift;
-      }
-      const float value = std::bit_cast<float>(bits);
-      if (!std::isfinite(value)) {
-        invalid_format(std::string(role_name(spec.role)) + " contains a non-finite value");
-      }
-      values[value_offset + index] = value;
+      values[value_offset + index] = decode_finite_float32(chunk, byte_offset, spec.role);
     }
     value_offset += value_count;
   }
@@ -651,6 +905,23 @@ Tensor read_tensor_payload(std::istream& input, const TensorSpec& spec,
     invalid_format(std::string(role_name(spec.role)) + " payload checksum mismatch");
   }
   return tensor;
+}
+
+Tensor map_tensor_payload(std::span<const std::uint8_t> file_bytes, const TensorSpec& spec,
+                          const DirectoryRecord& record,
+                          const std::shared_ptr<const void>& mapping_owner) {
+  const std::size_t offset = to_size(record.offset, "tensor offset");
+  const std::size_t byte_length = to_size(record.byte_length, "tensor byte length");
+  const std::span<const std::uint8_t> payload = file_bytes.subspan(offset, byte_length);
+  if (fnv_bytes(payload) != record.checksum) {
+    invalid_format(std::string(role_name(spec.role)) + " payload checksum mismatch");
+  }
+  validate_finite_float32_payload(payload, spec.role);
+  if (reinterpret_cast<std::uintptr_t>(payload.data()) % kPayloadAlignment != 0) {
+    io_error("mapped tensor payload does not satisfy its declared alignment");
+  }
+  return Tensor::from_read_only_cpu_buffer(spec.shape, DType::kFloat32, payload.data(),
+                                           mapping_owner, kPayloadAlignment);
 }
 
 LlamaWeights assemble_weights(const LlamaConfig& config, std::vector<Tensor> tensors) {
@@ -784,108 +1055,27 @@ LoadedLlamaModel read_llama_model_file(std::istream& input) {
 
   std::vector<std::uint8_t> header(kHeaderBytes);
   read_bytes(input, header, "model header");
-  if (!std::equal(kMagic.begin(), kMagic.end(), header.begin())) {
-    invalid_format("magic does not identify a Helix Llama model");
-  }
-  ByteReader header_reader(std::span<const std::uint8_t>(header).subspan(kMagic.size()));
-  const std::uint32_t version = header_reader.u32("format version");
-  const std::uint32_t endian_marker = header_reader.u32("endianness marker");
-  const std::uint32_t header_bytes = header_reader.u32("header size");
-  const std::uint32_t model_kind = header_reader.u32("model kind");
-  const std::uint64_t declared_file_size = header_reader.u64("file size");
-  const std::uint64_t directory_offset = header_reader.u64("directory offset");
-  const std::uint64_t tensor_count_value = header_reader.u64("tensor count");
-  const std::uint64_t directory_entry_bytes = header_reader.u64("directory entry size");
-  const std::uint64_t data_offset_value = header_reader.u64("data offset");
-  LlamaConfig config;
-  config.vocabulary_size = to_size(header_reader.u64("vocabulary size"), "vocabulary size");
-  config.hidden_size = to_size(header_reader.u64("hidden size"), "hidden size");
-  config.intermediate_size = to_size(header_reader.u64("intermediate size"), "intermediate size");
-  config.layer_count = to_size(header_reader.u64("layer count"), "layer count");
-  config.attention_head_count =
-      to_size(header_reader.u64("attention head count"), "attention head count");
-  config.max_sequence_length =
-      to_size(header_reader.u64("maximum sequence length"), "maximum sequence length");
-  config.rms_norm_epsilon = std::bit_cast<float>(header_reader.u32("RMSNorm epsilon"));
-  config.rope_theta = std::bit_cast<float>(header_reader.u32("RoPE theta"));
-  const std::uint64_t stored_metadata_checksum = header_reader.u64("metadata checksum");
-  HELIX_ASSERT(header_reader.offset() + kMagic.size() == kHeaderBytes,
-               "decoded model header size must match");
-
-  if (version != kFormatVersion) {
-    invalid_format("unsupported format version " + std::to_string(version));
-  }
-  if (endian_marker != kEndianMarker) {
-    invalid_format("invalid endianness marker");
-  }
-  if (header_bytes != kHeaderBytes || model_kind != kModelKindLlama ||
-      directory_offset != kDirectoryOffset || directory_entry_bytes != kDirectoryEntryBytes) {
-    invalid_format("header layout or model kind is not supported by v1");
-  }
-  if (declared_file_size != to_u64(actual_size)) {
-    invalid_format("declared file size does not match the stream length");
-  }
-  config.validate();
-
-  const std::size_t tensor_count = to_size(tensor_count_value, "tensor count");
-  if (tensor_count > (actual_size - kHeaderBytes) / kDirectoryEntryBytes) {
-    invalid_format("tensor directory exceeds the file bounds");
-  }
-  const std::vector<TensorSpec> specs = make_specs(config, nullptr);
-  if (tensor_count != specs.size()) {
-    invalid_format("tensor count does not match the model configuration");
-  }
-  const std::size_t directory_bytes = checked_multiply(
-      tensor_count, static_cast<std::size_t>(kDirectoryEntryBytes), "model directory");
-  const std::size_t metadata_end = checked_add(kHeaderBytes, directory_bytes, "model metadata");
-  const std::size_t expected_data_offset =
-      aligned_size(metadata_end, kPayloadAlignment, "model payload start");
-  const std::size_t data_offset = to_size(data_offset_value, "data offset");
-  if (data_offset != expected_data_offset || data_offset > actual_size) {
-    invalid_format("data offset is not canonical or exceeds the file bounds");
-  }
-
-  std::vector<std::uint8_t> directory(directory_bytes);
+  DecodedHeader decoded_header = decode_header(header, actual_size);
+  std::vector<std::uint8_t> directory(decoded_header.directory_bytes);
   read_bytes(input, directory, "tensor directory");
-  set_u64(header, kHeaderBytes - sizeof(std::uint64_t), 0);
-  std::uint64_t computed_metadata_checksum = fnv_bytes(header);
-  computed_metadata_checksum = fnv_bytes(directory, computed_metadata_checksum);
-  if (computed_metadata_checksum != stored_metadata_checksum) {
-    invalid_format("metadata checksum mismatch");
-  }
+  ParsedModelMetadata metadata =
+      parse_model_metadata(std::move(decoded_header), header, directory, actual_size);
 
-  ByteReader directory_reader(directory);
-  std::vector<DirectoryRecord> records;
-  records.reserve(tensor_count);
-  std::size_t expected_offset = data_offset;
-  for (std::size_t index = 0; index < tensor_count; ++index) {
-    DirectoryRecord record = decode_record(directory_reader);
-    expected_offset = aligned_size(expected_offset, kPayloadAlignment, "tensor payload offset");
-    validate_record(record, specs[index], expected_offset, actual_size);
-    expected_offset = checked_add(expected_offset, to_size(record.byte_length, "tensor bytes"),
-                                  "model payload bounds");
-    records.push_back(record);
-  }
-  HELIX_ASSERT(directory_reader.offset() == directory.size(),
-               "decoded model directory size must match");
-  if (expected_offset != actual_size) {
-    invalid_format("payload extents do not exactly cover the declared file");
-  }
-
-  std::size_t cursor = metadata_end;
+  std::size_t cursor = metadata.header.metadata_end;
   std::vector<Tensor> tensors;
-  tensors.reserve(tensor_count);
-  for (std::size_t index = 0; index < tensor_count; ++index) {
-    const std::size_t offset = to_size(records[index].offset, "tensor offset");
+  tensors.reserve(metadata.header.tensor_count);
+  for (std::size_t index = 0; index < metadata.header.tensor_count; ++index) {
+    const std::size_t offset = to_size(metadata.records[index].offset, "tensor offset");
     read_zero_padding(input, offset - cursor);
-    tensors.push_back(read_tensor_payload(input, specs[index], records[index]));
-    cursor = checked_add(offset, to_size(records[index].byte_length, "tensor bytes"),
+    tensors.push_back(read_tensor_payload(input, metadata.specs[index], metadata.records[index]));
+    cursor = checked_add(offset, to_size(metadata.records[index].byte_length, "tensor bytes"),
                          "model payload cursor");
   }
   HELIX_ASSERT(cursor == actual_size, "read model byte count must match stream size");
 
+  LlamaConfig config = metadata.header.config;
   LlamaWeights weights = assemble_weights(config, std::move(tensors));
-  return LoadedLlamaModel{config, std::move(weights)};
+  return LoadedLlamaModel{std::move(config), std::move(weights)};
 }
 
 LoadedLlamaModel read_llama_model_file(const std::filesystem::path& path) {
@@ -894,6 +1084,60 @@ LoadedLlamaModel read_llama_model_file(const std::filesystem::path& path) {
     io_error("could not open '" + path.string() + "' for reading");
   }
   return read_llama_model_file(input);
+}
+
+bool mapped_model_loading_supported() noexcept {
+#if HELIX_MODEL_HAS_POSIX_MMAP
+  return std::endian::native == std::endian::little && std::numeric_limits<float>::is_iec559;
+#else
+  return false;
+#endif
+}
+
+LoadedLlamaModel read_llama_model_file_mapped(const std::filesystem::path& path) {
+#if HELIX_MODEL_HAS_POSIX_MMAP
+  HELIX_CHECK(std::endian::native == std::endian::little && std::numeric_limits<float>::is_iec559,
+              ErrorCode::kUnsupported,
+              "model::format: memory-mapped model loading requires a little-endian IEEE-754 "
+              "Float32 host");
+  auto mapping = std::make_shared<MappedFile>(path);
+  const std::span<const std::uint8_t> file_bytes = mapping->bytes();
+  if (file_bytes.size() < kHeaderBytes) {
+    invalid_format("file is smaller than the v1 header");
+  }
+  if (reinterpret_cast<std::uintptr_t>(file_bytes.data()) % kPayloadAlignment != 0) {
+    io_error("model-file mapping does not satisfy payload alignment");
+  }
+
+  const std::span<const std::uint8_t> header = file_bytes.first(kHeaderBytes);
+  DecodedHeader decoded_header = decode_header(header, file_bytes.size());
+  const std::span<const std::uint8_t> directory =
+      file_bytes.subspan(kHeaderBytes, decoded_header.directory_bytes);
+  ParsedModelMetadata metadata =
+      parse_model_metadata(std::move(decoded_header), header, directory, file_bytes.size());
+  const std::shared_ptr<const void> mapping_owner = mapping;
+
+  std::size_t cursor = metadata.header.metadata_end;
+  std::vector<Tensor> tensors;
+  tensors.reserve(metadata.header.tensor_count);
+  for (std::size_t index = 0; index < metadata.header.tensor_count; ++index) {
+    const std::size_t offset = to_size(metadata.records[index].offset, "tensor offset");
+    validate_zero_padding(file_bytes.subspan(cursor, offset - cursor));
+    tensors.push_back(map_tensor_payload(file_bytes, metadata.specs[index], metadata.records[index],
+                                         mapping_owner));
+    cursor = checked_add(offset, to_size(metadata.records[index].byte_length, "tensor bytes"),
+                         "model payload cursor");
+  }
+  HELIX_ASSERT(cursor == file_bytes.size(), "mapped model byte count must match file size");
+
+  LlamaConfig config = metadata.header.config;
+  LlamaWeights weights = assemble_weights(config, std::move(tensors));
+  return LoadedLlamaModel{std::move(config), std::move(weights)};
+#else
+  static_cast<void>(path);
+  throw_error(ErrorCode::kUnsupported,
+              "model::format: memory-mapped model loading requires a POSIX host");
+#endif
 }
 
 } // namespace helix::model
