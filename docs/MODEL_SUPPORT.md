@@ -7,9 +7,10 @@ single-sequence generation session, and multi-request CPU orchestration path. Th
 are Float32 correctness baselines for full causal prefill and contiguous or paged
 KV decode, not a claim
 of compatibility with every model whose configuration contains the word “Llama.”
-The implementation, native weight container, unit tests, sanitizer suite, and CPU
-benchmarks are complete. CUDA model execution, fused tensor batching, tokenizer
-integration, and real checkpoint conversion remain later gates.
+The implementation, native weight container, unit tests, sanitizer suite, CPU
+benchmarks, and a narrowly checked Hugging Face Llama safetensors conversion path
+are complete. CUDA model execution, fused tensor batching, tokenizer integration,
+and validation against a downloaded public checkpoint remain later gates.
 
 ## Exact architecture contract
 
@@ -24,8 +25,9 @@ attention heads `A`, head dimension `D = H/A`, and prompt length `T`, Helix acce
 - pre-attention and pre-MLP RMSNorm;
 - full adjacent-pair RoPE across each head dimension;
 - causal scaled dot-product attention;
-- a SwiGLU MLP, residual connections, final RMSNorm, and an explicit untied LM
-  head.
+- a SwiGLU MLP, residual connections, final RMSNorm, and an explicit LM-head
+  payload. A tied source embedding can be duplicated into that payload by the
+  offline converter.
 
 The complete baseline is:
 
@@ -143,6 +145,114 @@ model APIs never mutate weights, and concurrent forward calls are safe only whil
 no external alias mutates backing storage. A future immutable weight-storage type
 would enforce this boundary rather than merely documenting it.
 
+## Offline Hugging Face Llama conversion
+
+`tools/convert_hf_llama.py` maps one explicit Hugging Face Llama checkpoint
+layout into Helix; it is not a generic `transformers` importer. It follows the
+published [safetensors metadata layout](https://huggingface.co/docs/safetensors/metadata_parsing)
+and the projection/RoPE semantics in Hugging Face's
+[Llama implementation](https://github.com/huggingface/transformers/blob/main/src/transformers/models/llama/modeling_llama.py),
+but its parser, layout conversion, packer, and tests are implemented independently.
+Python/NumPy is used only during conversion. Loading and execution remain C++.
+
+Accepted input is a directory containing `config.json` and either:
+
+- one `model.safetensors`; or
+- `model.safetensors.index.json` plus the referenced shards.
+
+The converter accepts F32, F16, and BF16 safetensors payloads and materializes
+Float32 Helix weights. It requires `model_type == "llama"`, SiLU/SwiGLU, no
+attention/MLP projection bias, equal attention and K/V head counts, the ordinary
+`hidden_size / num_attention_heads` head dimension, full rotary dimensions, and
+default unscaled RoPE. GQA/MQA, scaled/dynamic/partial RoPE, adapters, fused QKV,
+quantized tensors, and nonstandard tensor names are rejected with context.
+
+### Layout mapping
+
+PyTorch linear layers store `[output,input]`; Helix linear kernels consume
+`[input,output]`. All projection and LM-head matrices are therefore transposed.
+Embedding and normalization vectors keep their source order. The Q/K mapping has
+one additional transformation:
+
+```text
+Hugging Face head coordinates: [x0 x1 ... xN  y0 y1 ... yN]
+Helix head coordinates:        [x0 y0 x1 y1 ... xN yN]
+```
+
+Hugging Face's Llama path rotates the two coordinate halves, while Helix's
+educational kernel rotates adjacent pairs. Interleaving Q/K projection outputs per
+head makes those two representations mathematically equivalent. V and the output
+projection are not permuted. If `tie_word_embeddings` is true and
+`lm_head.weight` is absent, the converter transposes the token embedding into
+Helix's explicit LM-head payload.
+
+### Conversion and packing boundary
+
+```mermaid
+flowchart LR
+    Config[config.json] --> Validate[Strict architecture validation]
+    Shards[Safetensors / shard index] --> Parse[Bounds-checked metadata parser]
+    Validate --> Plan[Canonical tensor plan]
+    Parse --> Plan
+    Plan --> Convert[Chunked NumPy dtype/layout conversion]
+    Convert --> Raw[Private numbered Float32 staging files]
+    Raw --> Pack[C++ helix_model_pack]
+    Pack --> Native[HELIXLM1]
+    Native --> Inspect[C++ load / inspect / execute]
+```
+
+The safetensors reader requires duplicate-free JSON, exact shape/dtype byte
+lengths, in-bounds nonoverlapping ranges, and complete data-buffer coverage.
+Sharded index paths must resolve inside the checkpoint directory. Conversion is
+chunked, checks every converted value for finiteness, and writes into a private
+temporary directory beside the output.
+
+`helix_model_pack` calls
+`write_llama_model_file_from_raw_float32_files`. That C++ path checks canonical
+file count/order, exact byte length, little-endian Float32 finiteness, output/input
+aliasing (including hard links), and checksums every raw file before opening its
+output. It recomputes the checksum while copying so concurrent source mutation
+cannot silently produce a self-inconsistent container. The packer refuses to
+overwrite an existing file. Only after packing succeeds does Python use a
+same-filesystem atomic replacement; `--force` therefore preserves the old output
+until a complete new file exists.
+
+The straightforward staging design has an explicit cost: conversion temporarily
+needs roughly twice the final Float32 payload size in free space. It avoids
+retaining an entire second `LlamaWeights` object in RAM, but it is not a zero-copy
+or low-disk-footprint converter.
+
+```bash
+python3 -m venv .venv-convert
+.venv-convert/bin/python -m pip install -r tools/requirements-convert.txt
+cmake --build build --target helix_model_pack helix_model_inspect
+
+.venv-convert/bin/python tools/convert_hf_llama.py \
+  --input ./models/hf-llama \
+  --output ./models/model.helix \
+  --packer ./build/tools/helix_model_pack
+
+./build/tools/helix_model_inspect ./models/model.helix --smoke
+```
+
+`helix_model_inspect` loads and validates every payload, reports geometry and
+parameter count, and can run a one-token CPU smoke forward. Its
+`--last-logits TOKEN[,TOKEN...]` mode prints exact hexadecimal Float32 values for
+validation tooling; it is not the user-facing generation CLI.
+
+To register the converter integration test in a fresh build, point CMake at the
+conversion environment before configuring:
+
+```bash
+cmake -S . -B build-converter \
+  -DPython3_EXECUTABLE="$PWD/.venv-convert/bin/python"
+cmake --build build-converter -j
+ctest --test-dir build-converter -L converter --output-on-failure
+```
+
+If Python/NumPy is absent, CMake reports converter tests as off; this never blocks
+the C++ runtime, tools, or the remaining test suite.
+
 ## Native model file v1
 
 `write_llama_model_file` and `read_llama_model_file` implement a deterministic,
@@ -219,16 +329,31 @@ Model-file tests cover bit-exact deterministic round trips, executable loaded
 weights, filesystem APIs, truncation, trailing bytes, wrong magic/version/endian
 markers, metadata and payload corruption, nonzero padding, structurally invalid
 but checksum-consistent ranks/offsets, invalid weights, non-finite weights, and
-nonzero stream origins.
+nonzero stream origins. Two additional C++ tests prove that canonical raw Float32
+files produce byte-identical containers and reject wrong counts/sizes, non-finite
+values, direct aliases, and hard-link aliases before destructive output access.
 
-Validation on 2026-08-23 through prefix-runtime benchmark commit `7840546`:
+The converter integration test synthesizes a two-layer sharded Hugging Face-style
+checkpoint containing F32, F16, and BF16 tensors. It independently parses the
+resulting directory/payloads, checks every transformed value and checksum, proves
+that Q permutation is nontrivial, and executes the C++ loader/forward path. A
+separate NumPy oracle evaluates the source `[output,input]` projections with
+Hugging Face half-split RoPE and compares its final logits with converted Helix
+execution. Tied-embedding fallback, atomic `--force`, GQA rejection, wrong shapes,
+non-finite inputs, and shard path escape are also covered. This is strong mapping
+evidence, but it is not a claim that a downloaded public checkpoint or tokenizer
+has been exercised.
 
-- Debug, Release, and Apple Clang ASan/UBSan CPU suites: 169/169 tests passed;
+Validation on 2026-08-24 through converter commit `4c13d59`:
+
+- Debug, Release, and Apple Clang ASan/UBSan CPU suites: 172/172 tests passed;
 - all Release tests and benchmark smoke workloads passed;
 - CUDA 12.6.85/GCC 13.2 warnings-as-errors build: all targets compiled and all
-  169 hardware-independent tests passed;
+  171 C++ hardware-independent tests passed;
 - 57 GPU runtime tests remained explicitly skipped because the compile container
-  has no NVIDIA driver or device (226 registered tests total).
+  has no NVIDIA driver or device (228 registered tests total);
+- the CUDA container lacks Python/NumPy, so its converter integration test was not
+  registered; that test passed in every native CPU configuration.
 
 ## Measured CPU baselines
 
@@ -275,9 +400,11 @@ results, not evidence about a future CUDA paged-attention kernel.
 - The standalone generator supports one sequence and greedy selection only. The
   runtime supports several paged sessions but executes work items serially and has
   no sampling or fused tensor batch.
-- No tokenizer and no supported public checkpoint conversion tool yet.
-- No GQA/MQA, tied-embedding option, biases, partial rotary dimensions, sliding
-  windows, mixture-of-experts blocks, quantization, or arbitrary model graphs.
+- No tokenizer; no downloaded public checkpoint has been validated end to end.
+- The offline converter supports only the documented standard Llama safetensors
+  layout. No GQA/MQA, biases, partial/scaled RoPE, sliding windows, mixture-of-
+  experts blocks, quantization, adapters, or arbitrary model graphs. Tied input
+  embeddings are materialized as a separate explicit output payload.
 - No memory mapping or zero-copy file loading; each payload is decoded and copied
   into owned aligned Tensor storage.
 

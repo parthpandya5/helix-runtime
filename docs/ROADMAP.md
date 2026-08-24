@@ -579,6 +579,26 @@ checkpoint converter was not added because no checkpoint is yet claimed; the
 native writer API is tested and ready for a later explicit mapping tool. See
 `docs/MODEL_SUPPORT.md`.
 
+Conversion follow-up (2026-08-24, commit `4c13d59`): the later explicit mapping
+tool is now implemented for one documented Hugging Face Llama safetensors layout.
+The Python/NumPy stage strictly parses single or indexed/sharded F32/F16/BF16
+payloads, validates the narrow architecture, transposes PyTorch linear weights,
+and interleaves per-head Q/K coordinates to reconcile half-split and adjacent-pair
+RoPE. A streaming C++ raw-payload writer remains the `HELIXLM1` format authority;
+it validates count, exact sizes, finiteness, input/output aliasing, and checksums
+without retaining a second complete weight bundle.
+
+The synthetic integration fixture covers mixed precision, sharding, atomic output
+replacement, tied-embedding fallback, path confinement, rejected GQA/shape/non-
+finite inputs, exact container contents, and C++ execution. Its independent
+source-layout oracle compares Hugging Face-style half-split-RoPE logits with the
+converted Helix model. Debug, Release, and ASan/UBSan CPU suites pass 172/172.
+The CUDA 12.6 compile container builds both C++ tools, passes 171 host tests, and
+explicitly skips 57 GPU tests (228 total); its absent Python/NumPy means the one
+converter integration test is not registered there. No downloaded public
+checkpoint or tokenizer has been validated, so broad compatibility is not
+claimed. Details are in `docs/MODEL_SUPPORT.md`.
+
 ### M18 — Autoregressive generation — Implemented, CPU-validated, sanitized, and benchmarked
 
 - prefill, cached decode, greedy token selection, and stop conditions
@@ -600,7 +620,8 @@ EOS, and context-capacity stops. The last emitted token is not cached unless it 
 fed through a subsequent decode step; the returned cache count makes that
 contract visible. The minimal `helix_generate` executable reads a checked
 `HELIXLM1` file and accepts token IDs directly. No tokenizer or public-checkpoint
-compatibility is implied.
+compatibility is implied by the generation CLI itself; the later narrow converter
+does not change this token-ID boundary.
 
 Deterministic tests compare prefill and successive cached-decode logits with full
 prefix recomputation, compare complete greedy token sequences, cover position

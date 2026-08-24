@@ -18,6 +18,9 @@ Milestones 9–10, the M11–M12 KV caches, the M13 direct paged-attention CPU p
 the M14–M16 request and continuous-batching scheduler, the M17 narrow Llama-style
 CPU prefill runtime, the M18 single-sequence cached generation path, and the M19
 synchronous multi-request CPU execution engine are implemented and CPU-validated.
+The narrow M17 model path now has an offline Hugging Face Llama safetensors
+converter with an independent source-layout logits oracle; no downloaded public
+checkpoint result is claimed yet.
 M22 now includes the measured block-aligned sharing primitive, a bounded exact-
 content prefix index, persistent LRU anchors, and opt-in reuse in the CPU runtime.
 The repository
@@ -32,8 +35,8 @@ final normalization, and an untied LM head, loads a checksummed versioned native
 weight format, performs greedy generation through a contiguous KV cache, and
 executes scheduler batches against a shared paged KV pool with optional prompt-
 prefix reuse. On
-2026-08-23, Apple Clang 17 built the project on macOS arm64 with warnings as
-errors; 169/169 CPU tests passed in Debug, Release, and ASan/UBSan configurations.
+2026-08-24, Apple Clang 17 built the project on macOS arm64 with warnings as
+errors; 172/172 CPU tests passed in Debug, Release, and ASan/UBSan configurations.
 
 CUDA is optional at configure time. The current Apple Silicon development host has
 no NVIDIA GPU or native CUDA toolkit, so no CUDA execution or performance claim is
@@ -43,9 +46,11 @@ compile-validated in an ARM64 CUDA 12.6 development container without a
 driver/device. The M8 stream-ordered allocator and M9 block-reduced RMSNorm,
 grid-stride SwiGLU, adjacent-pair RoPE, and projection adapter are also
 compile-validated, as is the M10 three-stage contiguous attention baseline. None is
-runtime-validated on a GPU. The CUDA-on build passes the same 169 hardware-
-independent tests and explicitly skips 57 GPU tests without a driver/device (226
-registered tests total).
+runtime-validated on a GPU. The CUDA-on build passes 171 C++ hardware-independent
+tests and explicitly skips 57 GPU tests without a driver/device (228 registered
+tests total). Its container lacks Python/NumPy, so the separate converter
+integration test is not registered there; it passes in all three native CPU
+configurations.
 
 ## Architecture
 
@@ -122,7 +127,10 @@ cmake --build build --target format-check
 ```
 
 `HELIX_ENABLE_CLANG_TIDY=ON` requires `clang-tidy` in `PATH` and applies it only to
-Helix targets.
+Helix targets. `HELIX_BUILD_TOOLS=OFF` omits the model pack/inspection utilities;
+it does not affect the runtime libraries. The one Python converter integration
+test auto-registers only when the selected Python 3 interpreter can import NumPy;
+otherwise the 171-test C++/benchmark suite remains available.
 
 ## Benchmarks
 
@@ -324,6 +332,37 @@ returning a model. Exact layouts, ownership, validation, measured CPU baselines,
 and compatibility boundaries are in
 [`docs/MODEL_SUPPORT.md`](docs/MODEL_SUPPORT.md).
 
+### Checkpoint conversion
+
+`tools/convert_hf_llama.py` converts a deliberately narrow Hugging Face Llama
+safetensors layout into `HELIXLM1`. NumPy is a one-time conversion dependency;
+the C++ runtime and generated model file do not depend on Python. The converter
+accepts single-file or indexed/sharded F32, F16, and BF16 weights, emits Float32,
+transposes PyTorch linear weights, and interleaves Q/K output coordinates so Hugging
+Face half-split RoPE matches Helix's adjacent-pair kernel. The C++ packer owns
+native shape/finiteness/checksum validation and serialization.
+
+```bash
+python3 -m venv .venv-convert
+.venv-convert/bin/python -m pip install -r tools/requirements-convert.txt
+cmake --build build --target helix_model_pack helix_model_inspect
+
+.venv-convert/bin/python tools/convert_hf_llama.py \
+  --input ./models/hf-llama \
+  --output ./models/model.helix \
+  --packer ./build/tools/helix_model_pack
+
+./build/tools/helix_model_inspect ./models/model.helix --smoke
+```
+
+Compatibility is rejected rather than guessed: the converter currently requires
+ordinary bias-free Llama/SwiGLU layers, equal Q/K/V head counts, full unscaled
+RoPE, and standard tensor names/shapes. It does not support GQA/MQA, partial or
+scaled RoPE, biases, quantization, adapters, or arbitrary `transformers` models.
+The synthetic integration test covers sharding, all three source dtypes, exact
+layout conversion, atomic replacement, invalid input, and source-style versus C++
+logits; a downloaded checkpoint and tokenizer remain separate validation gates.
+
 ## Autoregressive generation
 
 `helix::model::CpuLlamaGenerator` owns one `CpuLlamaModel`, one fixed-capacity
@@ -337,7 +376,7 @@ ID on a tie. Maximum-new-token, optional EOS, and context-capacity stops are
 explicitly reported.
 
 The minimal CLI deliberately accepts token IDs because Helix does not yet ship a
-tokenizer or claim a public-checkpoint mapping:
+tokenizer:
 
 ```bash
 cmake --build build --target helix_generate
@@ -391,9 +430,10 @@ remain pending. KV caches, paged attention, and continuous batching are host-onl
 the CPU engine integrates the scheduler with physical paged-KV capacity and model
 execution, but scheduled work items run serially and no tensor batch is formed.
 Transformer execution currently supports CPU Float32 prefill, contiguous-KV
-single-sequence generation, and paged-KV multi-request orchestration; tokenization,
-public checkpoint conversion, GPU-resident paged KV, and CUDA model dispatch
-remain roadmap work. CPU prefix reuse is exact-content, block-aligned, bounded,
+single-sequence generation, and paged-KV multi-request orchestration. The narrow
+Hugging Face Llama converter is synthetically validated, but downloaded public-
+checkpoint execution, tokenization, GPU-resident paged KV, and CUDA model dispatch
+remain validation/roadmap work. CPU prefix reuse is exact-content, block-aligned, bounded,
 and opt-in; it stores only one maximum reusable prefix per completed prompt, uses
 an engine-local namespace, and does not cache next-token logits or run on the GPU.
 Partial-page sharing, model-global cache namespaces, and request preemption remain

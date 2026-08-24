@@ -595,15 +595,37 @@ values, an FNV-1a metadata checksum, and one checksum per payload before returni
 a model. FNV provides accidental-corruption detection, not authenticity. Details
 and the exact byte layout are in `docs/MODEL_SUPPORT.md`.
 
+The offline checkpoint boundary is intentionally outside runtime execution:
+
+```mermaid
+flowchart LR
+    HF[Hugging Face Llama config + safetensors] --> Py[Python/NumPy converter]
+    Py --> Raw[Canonical staged Float32 payloads]
+    Raw --> Packer[C++ model packer]
+    Packer --> File[HELIXLM1]
+    File --> Loader[C++ checked loader]
+    Loader --> Model[CpuLlamaModel]
+```
+
+Python owns only strict safetensors/index parsing and chunked dtype/layout
+conversion. It transposes `[output,input]` linear weights and interleaves Q/K
+coordinates per head so Hugging Face half-split RoPE matches Helix adjacent-pair
+RoPE. The C++ packer remains the format authority: it checks raw-file count,
+shape-derived sizes, finite little-endian Float32 values, aliasing, and checksums.
+Packing occurs in a private same-filesystem temporary directory, and the final
+path changes only through atomic replacement after success. The runtime has no
+Python dependency.
+
 The current CPU path performs full causal prefill and single-token decode against
 either contiguous or paged K/V storage, repacking token-major Q/K/V tensors around
 the existing head-major attention API. Greedy selection, EOS/length/context stops,
 a token-ID CLI, and scheduler-driven multi-request paged decode are implemented.
 The runtime schedules several requests per iteration but executes their model work
-serially; a fused tensor batch, tokenizer integration, public-checkpoint conversion,
-and CUDA model dispatch remain later work. A model-specific conversion utility has
-intentionally not been guessed because no public checkpoint compatibility is
-claimed yet.
+serially; a fused tensor batch, tokenizer integration, downloaded-checkpoint
+validation, and CUDA model dispatch remain later work. The implemented converter
+supports only the documented ordinary Hugging Face Llama safetensors layout and
+rejects GQA/MQA, biases, scaled/partial RoPE, quantization, and arbitrary model
+graphs rather than guessing compatibility.
 
 ## Runtime execution and asynchronous work
 

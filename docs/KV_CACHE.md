@@ -383,8 +383,9 @@ eviction, explicit erase/clear, invalid/stale/foreign sources, anchor lifetime,
 destructor reclamation, and concurrent lookup/fork/release lifecycles. Runtime
 tests compare reused-suffix output with full recomputation, verify cancellation
 ownership, and force anchor eviction in a three-page pool. The complete native
-Debug and ASan/UBSan suites pass 169/169; the CUDA-on compile-validation suite
-passes those 169 host tests and explicitly skips 57 GPU tests without a device.
+Debug, Release, and ASan/UBSan suites pass 172/172. The CUDA-on compile-validation
+suite passes 171 C++ host tests and explicitly skips 57 GPU tests without a device
+(228 total); its missing Python/NumPy omits the separate converter integration test.
 
 ## Direct block-table attention lease
 

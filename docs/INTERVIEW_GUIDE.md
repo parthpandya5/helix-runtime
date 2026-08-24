@@ -311,15 +311,41 @@ integrates them with CUDA streams. It is preferable to hand-building production
 collectives for the optional tensor-parallel demonstration. Helix does not yet
 enable NCCL or claim multi-GPU support.
 
+## How does Helix convert and validate model weights?
+
+Runtime loading uses the C++ `HELIXLM1` format only: a fixed little-endian header,
+canonical tensor directory, 64-byte payload alignment, exact file coverage,
+finite Float32 values, and FNV-1a metadata/payload checksums. FNV is accidental-
+corruption detection, not authentication. The loader constructs local RAII
+tensors and returns no partial model after an error.
+
+The optional offline converter accepts one narrow Hugging Face Llama safetensors
+layout. Python/NumPy strictly parses single or indexed shards, validates the exact
+architecture, converts F32/F16/BF16 to Float32, and transposes PyTorch
+`[output,input]` projections into Helix `[input,output]`. It also interleaves Q/K
+coordinates within each head because Hugging Face Llama uses half-split RoPE while
+Helix rotates adjacent pairs. A C++ packer—not Python—owns native file checksums
+and canonical serialization. Packing uses private staging plus atomic replacement,
+so `--force` does not destroy an old output before the replacement is complete.
+
+The strongest test is semantic, not just structural: a synthetic sharded mixed-
+precision checkpoint is evaluated by an independent source-layout NumPy oracle,
+then its final logits are compared with C++ Helix execution after conversion.
+That does not justify claiming every public Llama-family checkpoint; GQA/MQA,
+biases, scaled/partial RoPE, quantization, adapters, tokenization, and downloaded-
+checkpoint validation remain outside the supported boundary.
+
 ## What did Helix implement itself versus delegate to libraries?
 
 Helix implements Tensor/storage metadata, CPU kernels, CUDA elementwise/reduction/
 softmax/GEMM/transformer/attention kernels, allocator metadata and deferred reuse,
 KV layouts, paged attention, requests, scheduling/metrics, the CPU transformer,
 cached generation session, exact bounded prefix index/LRU, paged multi-request CPU
-engine with suffix reuse, greedy selection, and native file parser. It delegates
-CUDA driver/runtime operations to the CUDA Runtime API and testing/benchmark
-harnesses to GoogleTest/Google Benchmark.
+engine with suffix reuse, greedy selection, native file parser/packer, and the
+narrow safetensors metadata/layout converter. It delegates numerical array
+transposition in the one-time converter to NumPy, CUDA driver/runtime operations
+to the CUDA Runtime API, and testing/benchmark harnesses to GoogleTest/Google
+Benchmark.
 No PyTorch runtime, BLAS, cuBLAS, NCCL, or external model graph executes Helix
 inference today. cuBLAS and NCCL remain explicitly labeled future library paths.
 
