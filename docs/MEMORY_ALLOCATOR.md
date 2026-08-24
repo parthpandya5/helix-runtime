@@ -344,6 +344,13 @@ Google Benchmark real time; CUDA events are not used to time host APIs. GPU mode
 driver, toolkit, warmup, iteration count, trace, reserved/peak bytes, underlying
 calls, and fragmentation must accompany any future published result.
 
+CUDA Toolkit 11.2+ builds also register a capability-gated `cudaMallocAsync` /
+`cudaFreeAsync` default-pool baseline. It trims the pool before warmup, performs
+ten warmups, synchronizes its stream after every measured pair, and reports the
+unchanged default-pool release threshold plus reserved-memory counters. This
+avoids mistaking enqueue latency for completed allocation lifetime and exposes
+whether the NVIDIA pool retained memory. It is compile-validated only here.
+
 ## Current limitations
 
 - CUDA event-backed reclamation and the stream-bound Tensor bridge are not
@@ -358,5 +365,5 @@ calls, and fragmentation must accompany any future published result.
 - linear best-fit scan and address-ordered vector shifts may scale poorly with many
   fragmented blocks,
 - no memory-pressure callback or automatic trim policy,
-- no `cudaMallocAsync` baseline yet,
+- the `cudaMallocAsync` baseline has not run on supported hardware,
 - no per-stream, per-size, or per-device sharding within one allocator.

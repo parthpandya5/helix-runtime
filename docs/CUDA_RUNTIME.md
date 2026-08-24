@@ -85,11 +85,11 @@ Synchronous Tensor operations use synchronous CUDA copies/memset. The lower-leve
 asynchronous memory functions enqueue work on a caller-owned `Stream`; the caller
 must keep source/destination memory alive until the stream/event dependency proves
 completion. M8 now provides a separate CUDA-event-backed
-`StreamOrderedAllocator`, but Tensor storage still allocates directly because it
-does not record every stream that used a block. A caller using the allocator must
-order all such uses before the event on the chosen release stream. Every CUDA
-Tensor storage allocation is therefore still directly freed and `cudaFree` may
-synchronize.
+`StreamOrderedAllocator`. Ordinary Tensor factories still allocate directly and
+`cudaFree` may synchronize. The opt-in `allocate_cuda_tensor_on_stream` factory
+instead retains one usage stream and records its release event after the final
+view; callers must order every use before that event. Tensor does not record
+arbitrary additional streams, so the bridge is not a general multi-stream pool.
 
 The current runtime objects are safe to move between host threads only when no
 other thread concurrently accesses the same object and the CUDA context rules are

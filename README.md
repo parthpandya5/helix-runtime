@@ -183,6 +183,9 @@ block-vector rebuilds and hash-node churn with in-place metadata updates and a
 reusable active-slot registry reduced median cached-trace CPU time by 53.1%–66.7%.
 The final cache was 3.13x–9.41x faster on random/large/LLM-like traces but remained
 2.34x–2.45x slower on small-heavy/bursty traces; no CUDA result is inferred.
+CUDA Toolkit 11.2+ builds additionally register a device-capability-gated,
+stream-synchronized `cudaMallocAsync/cudaFreeAsync` default-pool baseline. It has
+compiled but has not run in the current environment.
 
 A paired warm-page model-loader fixture retains the copied path and compares it
 with the immutable mapped path while preserving all checksum, padding, shape, and

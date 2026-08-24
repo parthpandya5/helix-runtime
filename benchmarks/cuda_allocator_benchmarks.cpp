@@ -9,6 +9,7 @@
 #include <array>
 #include <benchmark/benchmark.h>
 #include <cstddef>
+#include <cstdint>
 #include <cuda_runtime_api.h>
 #include <memory>
 #include <vector>
@@ -19,7 +20,94 @@ namespace {
 constexpr std::array<std::size_t, 16> kCudaTraceSizes{
     256,    4'096,  1'024,   65'536, 512,   2'048,   8'192,  131'072,
     16'384, 32'768, 262'144, 4'096,  1'536, 524'288, 65'536, 1'048'576};
-constexpr int kTensorLifecycleWarmups = 10;
+constexpr int kCudaAllocatorWarmups = 10;
+
+#if CUDART_VERSION >= 11020
+bool cuda_async_allocator_supported(int device_index) {
+  int supported = 0;
+  HELIX_CUDA_CHECK_CONTEXT(
+      cudaDeviceGetAttribute(&supported, cudaDevAttrMemoryPoolsSupported, device_index),
+      "querying CUDA stream-ordered allocator support");
+  return supported != 0;
+}
+
+cudaMemPool_t prepare_default_cuda_pool(int device_index) {
+  cudaMemPool_t pool = nullptr;
+  HELIX_CUDA_CHECK_CONTEXT(cudaDeviceGetDefaultMemPool(&pool, device_index),
+                           "querying the default CUDA memory pool");
+  HELIX_CUDA_CHECK_CONTEXT(cudaMemPoolTrimTo(pool, 0),
+                           "trimming the default CUDA memory pool before benchmarking");
+  std::uint64_t zero = 0;
+  HELIX_CUDA_CHECK_CONTEXT(cudaMemPoolSetAttribute(pool, cudaMemPoolAttrReservedMemHigh, &zero),
+                           "resetting the default CUDA memory-pool reserved high watermark");
+  HELIX_CUDA_CHECK_CONTEXT(cudaMemPoolSetAttribute(pool, cudaMemPoolAttrUsedMemHigh, &zero),
+                           "resetting the default CUDA memory-pool used high watermark");
+  return pool;
+}
+
+std::uint64_t cuda_pool_attribute(cudaMemPool_t pool, cudaMemPoolAttr attribute,
+                                  const char* context) {
+  std::uint64_t value = 0;
+  HELIX_CUDA_CHECK_CONTEXT(cudaMemPoolGetAttribute(pool, attribute, &value), context);
+  return value;
+}
+
+void cuda_malloc_async_free_synchronized(std::size_t bytes, const cuda::Stream& stream) {
+  void* pointer = nullptr;
+  HELIX_CUDA_CHECK_CONTEXT(cudaMallocAsync(&pointer, bytes, stream.native_handle()),
+                           "allocator benchmark cudaMallocAsync");
+  benchmark::DoNotOptimize(pointer);
+  const cudaError_t free_result = cudaFreeAsync(pointer, stream.native_handle());
+  if (free_result != cudaSuccess) {
+    cuda::report_cleanup_error(cudaStreamSynchronize(stream.native_handle()),
+                               "waiting after allocator benchmark cudaFreeAsync failure");
+    cuda::report_cleanup_error(cudaFree(pointer),
+                               "cleaning up after allocator benchmark cudaFreeAsync failure");
+    HELIX_CUDA_CHECK_CONTEXT(free_result, "allocator benchmark cudaFreeAsync");
+  }
+  stream.synchronize();
+}
+
+void BM_CudaMallocAsyncFreeSynchronizedDefaultPool(benchmark::State& state) {
+  if (!cuda::runtime_available()) {
+    state.SkipWithError("requires a visible NVIDIA CUDA device");
+    return;
+  }
+  constexpr int kDeviceIndex = 0;
+  cuda::set_device(kDeviceIndex);
+  if (!cuda_async_allocator_supported(kDeviceIndex)) {
+    state.SkipWithError("CUDA device does not support stream-ordered memory pools");
+    return;
+  }
+
+  cuda::Stream stream;
+  const cudaMemPool_t pool = prepare_default_cuda_pool(kDeviceIndex);
+  const std::size_t bytes = static_cast<std::size_t>(state.range(0));
+  for (int warmup = 0; warmup < kCudaAllocatorWarmups; ++warmup) {
+    cuda_malloc_async_free_synchronized(bytes, stream);
+  }
+  for ([[maybe_unused]] auto iteration : state) {
+    cuda_malloc_async_free_synchronized(bytes, stream);
+  }
+
+  const std::uint64_t used_current = cuda_pool_attribute(
+      pool, cudaMemPoolAttrUsedMemCurrent, "querying the default CUDA memory-pool used bytes");
+  HELIX_CHECK(used_current == 0, ErrorCode::kInternal,
+              "cudaMallocAsync benchmark left live pool bytes");
+  state.counters["pool_release_threshold_bytes"] = static_cast<double>(
+      cuda_pool_attribute(pool, cudaMemPoolAttrReleaseThreshold,
+                          "querying the default CUDA memory-pool release threshold"));
+  state.counters["pool_reserved_bytes"] = static_cast<double>(
+      cuda_pool_attribute(pool, cudaMemPoolAttrReservedMemCurrent,
+                          "querying the default CUDA memory-pool reserved bytes"));
+  state.counters["pool_reserved_high_bytes"] = static_cast<double>(
+      cuda_pool_attribute(pool, cudaMemPoolAttrReservedMemHigh,
+                          "querying the default CUDA memory-pool reserved high watermark"));
+  state.SetItemsProcessed(state.iterations());
+  HELIX_CUDA_CHECK_CONTEXT(cudaMemPoolTrimTo(pool, 0),
+                           "trimming the default CUDA memory pool after benchmarking");
+}
+#endif
 
 void BM_CudaTensorDirectLifecycle(benchmark::State& state) {
   if (!cuda::runtime_available()) {
@@ -28,7 +116,7 @@ void BM_CudaTensorDirectLifecycle(benchmark::State& state) {
   }
   cuda::set_device(0);
   const auto elements = static_cast<Dimension>(state.range(0));
-  for (int warmup = 0; warmup < kTensorLifecycleWarmups; ++warmup) {
+  for (int warmup = 0; warmup < kCudaAllocatorWarmups; ++warmup) {
     const Tensor tensor = Tensor::empty({elements}, DType::kFloat32, Device::cuda(0));
     benchmark::DoNotOptimize(tensor.data());
   }
@@ -50,7 +138,7 @@ void BM_CudaTensorHelixStreamBoundLifecycle(benchmark::State& state) {
   const auto elements = static_cast<Dimension>(state.range(0));
   auto allocator = std::make_shared<StreamOrderedAllocator>(0);
   auto stream = std::make_shared<cuda::Stream>();
-  for (int warmup = 0; warmup < kTensorLifecycleWarmups; ++warmup) {
+  for (int warmup = 0; warmup < kCudaAllocatorWarmups; ++warmup) {
     {
       const Tensor tensor =
           allocate_cuda_tensor_on_stream({elements}, DType::kFloat32, allocator, stream);
@@ -85,6 +173,11 @@ void BM_CudaMallocFree(benchmark::State& state) {
   }
   cuda::set_device(0);
   const std::size_t bytes = static_cast<std::size_t>(state.range(0));
+  for (int warmup = 0; warmup < kCudaAllocatorWarmups; ++warmup) {
+    void* pointer = nullptr;
+    HELIX_CUDA_CHECK_CONTEXT(cudaMalloc(&pointer, bytes), "allocator benchmark warmup cudaMalloc");
+    HELIX_CUDA_CHECK_CONTEXT(cudaFree(pointer), "allocator benchmark warmup cudaFree");
+  }
   for ([[maybe_unused]] auto iteration : state) {
     void* pointer = nullptr;
     HELIX_CUDA_CHECK_CONTEXT(cudaMalloc(&pointer, bytes), "allocator benchmark cudaMalloc");
@@ -102,6 +195,10 @@ void BM_CudaHelixAllocatorFixed(benchmark::State& state) {
   cuda::set_device(0);
   HelixAllocator allocator(std::make_shared<CudaMemoryResource>(0));
   const std::size_t bytes = static_cast<std::size_t>(state.range(0));
+  for (int warmup = 0; warmup < kCudaAllocatorWarmups; ++warmup) {
+    const Allocation allocation = allocator.allocate(bytes);
+    allocator.deallocate(allocation);
+  }
   for ([[maybe_unused]] auto iteration : state) {
     const Allocation allocation = allocator.allocate(bytes);
     benchmark::DoNotOptimize(allocation.pointer());
@@ -278,6 +375,13 @@ void BM_CudaHelixAllocatorWorkloadTrace(benchmark::State& state, bench::Allocati
 
 BENCHMARK(BM_CudaMallocFree)->Arg(256)->Arg(4'096)->Arg(1 << 20)->UseRealTime();
 BENCHMARK(BM_CudaHelixAllocatorFixed)->Arg(256)->Arg(4'096)->Arg(1 << 20)->UseRealTime();
+#if CUDART_VERSION >= 11020
+BENCHMARK(BM_CudaMallocAsyncFreeSynchronizedDefaultPool)
+    ->Arg(256)
+    ->Arg(4'096)
+    ->Arg(1 << 20)
+    ->UseRealTime();
+#endif
 BENCHMARK(BM_CudaTensorDirectLifecycle)->Arg(1)->Arg(1'024)->Arg(1 << 20)->UseRealTime();
 BENCHMARK(BM_CudaTensorHelixStreamBoundLifecycle)->Arg(1)->Arg(1'024)->Arg(1 << 20)->UseRealTime();
 BENCHMARK(BM_CudaMallocMixedTrace)->UseRealTime();

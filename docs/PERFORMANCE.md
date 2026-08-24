@@ -427,10 +427,26 @@ and reclamation are inside the pooled boundary. Counters record logical bytes,
 retained bytes, reuse count, and upstream allocation count. Because no payload is
 touched, bytes-per-second would be meaningless and is not reported.
 
+A second compile-validated family compares the allocation mechanisms themselves
+at 256 B, 4 KiB, and 1 MiB. Direct `cudaMalloc/cudaFree`, warmed
+`HelixAllocator(CudaMemoryResource)`, and (with CUDA Toolkit 11.2 or newer)
+`BM_CudaMallocAsyncFreeSynchronizedDefaultPool` each perform ten setup warmups.
+The async fixture first checks `cudaDevAttrMemoryPoolsSupported`, trims the default
+pool, preserves its configured release policy, then enqueues one allocation/free
+pair on a nonblocking stream and synchronizes that stream inside every timed
+iteration. It therefore measures completed host-visible lifecycle, not asynchronous
+API enqueue latency. It reports the default pool's release threshold and current/
+peak reserved bytes so caching policy is not hidden; unsupported devices are
+reported as skipped rather than silently falling back.
+
 ```bash
 ctest --test-dir build-cuda -L gpu --output-on-failure
 ./build-cuda/benchmarks/helix_benchmarks \
   --benchmark_filter='BM_CudaTensor(Direct|HelixStreamBound)Lifecycle' \
+  --benchmark_repetitions=15 \
+  --benchmark_enable_random_interleaving=true
+./build-cuda/benchmarks/helix_benchmarks \
+  --benchmark_filter='BM_Cuda(MallocFree|HelixAllocatorFixed|MallocAsyncFreeSynchronizedDefaultPool)' \
   --benchmark_repetitions=15 \
   --benchmark_enable_random_interleaving=true
 ```
@@ -1474,9 +1490,10 @@ compile validation is not a benchmark; result rows will be added only after
 execution on a named NVIDIA GPU and driver.
 
 M8's CUDA event-backed reclamation path likewise has correctness fixtures but no
-published timing. A future comparison must use equivalent stream dependencies and
-synchronization for direct `cudaMalloc/cudaFree`, Helix deferred reuse, and
-`cudaMallocAsync`; a compile-only fixture or CPU completion mock is not a result.
+published timing. Direct, Helix, and supported `cudaMallocAsync` fixtures now make
+their warmups and host-visible completion boundaries explicit. Their compile-only
+presence is not a result; a published comparison still requires execution on a
+named device/driver and interpretation of the recorded pool release policy.
 
 ## Local benchmark commands
 

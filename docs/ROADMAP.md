@@ -295,8 +295,8 @@ hardware-gated test holds the stream behind a host callback, verifies the pendin
 address cannot be reused, releases the callback, then verifies reclamation/reuse.
 NVCC 12.6.85 compiles this adapter and test with warnings as errors; all 68
 hardware-independent tests pass in that build and 47 GPU tests are registered.
-There is no CUDA driver/device in the container, so the event test, GPU allocation
-latency, synchronized comparison, and `cudaMallocAsync` comparison remain pending.
+There is no CUDA driver/device in the container, so the event test and all GPU
+allocation timing remain pending.
 General CUDA Tensor integration remains pending a complete multi-stream use-
 recording contract; the event adapter alone cannot infer outstanding work on other
 streams.
@@ -320,6 +320,13 @@ complete host lifecycle cost at 1, 1,024, and 1,048,576 Float32 elements. NVCC
 12.6.85 compiles all paths with warnings as errors; the CUDA suite passes 185 host
 tests and registers 64 GPU tests (249 total), all skipped without a driver/device.
 No lifecycle latency or event-correctness result is claimed.
+
+CUDA Toolkit 11.2+ builds now also register a default-pool
+`cudaMallocAsync/cudaFreeAsync` comparison. It checks device memory-pool support,
+performs ten warmups, preserves and reports the pool release threshold, and
+synchronizes each timed allocation/free pair. The fixture compiles with CUDA
+12.6.85; it has not executed without a device, so it closes the benchmark-harness
+gap but not the M8 measurement gate.
 
 ## Phase D: transformer primitives and memory
 

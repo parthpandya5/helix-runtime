@@ -183,8 +183,9 @@ results.
 
 ### Ownership
 
-- Owning factory operations allocate `Storage` through a backend-specific storage
-  routine. CUDA storage remains direct until the cache is stream-safe.
+- Ordinary owning factory operations allocate `Storage` through a backend-specific
+  routine and CUDA defaults remain direct. The opt-in single-stream allocator
+  bridge described below provides event-safe pooled CUDA Storage.
 - Views retain shared storage ownership.
 - A read-only external-buffer Tensor requires a non-null shared lifetime owner for
   non-empty storage, validates its declared alignment, and never exposes a mutable
