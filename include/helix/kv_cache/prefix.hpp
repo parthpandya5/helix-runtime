@@ -68,9 +68,9 @@ struct PagedPrefixCacheStats {
 
 // Thread-safe bounded metadata index over persistent PagedKvCache anchor
 // sequences. Keys contain exact token IDs plus a namespace, so equality never
-// depends on a digest alone. The baseline performs a linear longest-prefix scan
-// and keeps entries in most-recently-used order; measurement must justify a more
-// complex hash/trie index.
+// depends on a digest alone. Longest lookup hashes each block-aligned prefix of
+// the query, probes an indexed candidate set, and verifies the complete token
+// vector. Entries remain in most-recently-used order for bounded eviction.
 //
 // Public methods acquire the prefix-cache mutex before the paged-cache mutex.
 // Callers must not invoke them while holding a LayerReadView from the same pool.

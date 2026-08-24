@@ -4,11 +4,12 @@
 
 The M11 contiguous cache, M12 paged cache, M13 direct paged-attention read path,
 M19 bulk-append/runtime/direct-decode integration, and M22 block-aligned prefix
-sharing primitive are implemented, CPU-validated, sanitized, and benchmarked in
-Float32. They expose the memory-capacity, compaction, and direct-traversal
-tradeoffs between a
-per-sequence allocation and a global fixed-block pool. There is not yet a GPU-
-resident KV-cache or CUDA paged-attention path.
+sharing plus bounded exact-content cache are implemented, CPU-validated,
+sanitized, and benchmarked in Float32. The CPU runtime can opt into longest-prefix
+reuse and pressure-driven LRU anchor eviction. These paths expose the memory-
+capacity, compaction, direct-traversal, lookup-scaling, and reuse tradeoffs between
+a per-sequence allocation and a global fixed-block pool. There is not yet a GPU-
+resident KV cache or CUDA paged-attention/prefix-reuse path.
 
 ## Why cache keys and values?
 
@@ -237,8 +238,83 @@ The new block table and map entry are created before any reference count changes
 It requires no free physical page and can succeed when the pool is full; a later
 append at the aligned boundary still fails transactionally until a page is freed.
 The cache mutex serializes forks with append, release, and read leases. This API is
-the ownership primitive beneath a future prefix cache; it does not hash prompts,
-find matches, retain hidden anchors, or evict entries automatically.
+the ownership primitive used by the content cache below; by itself it does not
+hash prompts, find matches, retain hidden anchors, or evict entries.
+
+### Bounded exact-content prefix cache
+
+`PagedPrefixCache` owns a `shared_ptr<PagedKvCache>` and a bounded metadata index.
+Each entry contains:
+
+- a nonzero `PrefixNamespaceId` for model/tokenization isolation;
+- the complete block-aligned token-ID vector;
+- one persistent anchor sequence forked from a source with matching K/V;
+- its digest and block-reference count;
+- a position in a most-recently-used list.
+
+Both `maximum_entries` and `maximum_block_references` must be positive. The latter
+counts block-table references retained by anchors, not unique physical pages or
+reserved pool bytes. Insertion validates namespace, alignment, source ownership,
+source length, and configured capacity before publishing a key. An exact duplicate
+only becomes MRU; it does not replace its existing anchor. A single oversized
+entry returns `kRejectedTooLarge` without mutation. Otherwise token storage, the
+anchor fork, the list node, and hash entry are staged with rollback before older
+LRU entries are released to satisfy both bounds.
+
+```mermaid
+flowchart LR
+    Query[namespace + prompt tokens] --> Digest[Incremental token digest]
+    Digest --> Boundary[Each block-aligned length]
+    Boundary --> Index[(namespace, length, digest)]
+    Index --> Verify[Exact token-vector verification]
+    Verify --> Longest[Longest matching anchor]
+    Longest --> Fork[Reference-counted sequence fork]
+```
+
+`lookup_longest` scans the input tokens once, extends the digest using explicit
+bytes of each 32-bit token, and probes the hash index at every block boundary up
+to the caller's maximum. It remembers the longest candidate whose entire stored
+vector equals the query prefix. Digest collision can therefore increase candidate
+work but cannot produce a false hit. A successful fork occurs before the entry is
+moved to MRU and before hit counters change; the returned `PagedSequenceHandle` is
+owned by the caller and must be released through the underlying paged cache.
+
+The prefix-cache mutex is acquired before the paged-cache mutex on every composite
+operation. Callers must not call the prefix manager while holding a
+`LayerReadView` from the same cache. `clear`, explicit erase, bounded insertion,
+and `evict_lru` release anchors; destruction performs the same cleanup without
+throwing. Statistics report current/peak entries and block references, retained
+tokens, lookups/hits/misses, insertions/duplicates/rejections, evictions, and
+explicit erases.
+
+The first correct lookup baseline scanned every LRU entry. Measurement showed
+that path wins for tiny caches but scales linearly. The production index above is
+expected independent of entry count aside from hash collisions and the number of
+aligned query prefixes; the retained linear benchmark makes the small-cache loss
+and large-cache crossover visible in `docs/PERFORMANCE.md`.
+
+### CPU runtime integration
+
+`CpuRuntimeConfig::prefix_cache` is optional and disabled by default. When
+enabled, submission searches up to:
+
+```text
+floor((prompt_tokens - 1) / block_tokens) * block_tokens
+```
+
+The subtraction is required because a K/V anchor does not contain the logits
+after its final token. At least one prompt token must execute to produce fresh
+next-token logits. A hit supplies a forked physical sequence and
+`FifoScheduler::submit_prefilled` records the block-aligned logical seed; the seed
+becomes processed prompt progress only when FIFO admission happens. Cancellation
+or failure releases the fork like any other session.
+
+After final prompt work succeeds, the engine publishes only that request's maximum
+reusable aligned prefix. A duplicate refreshes recency. Retained anchors own real
+page references, so a prefix-enabled cache can correctly report used blocks with
+no live request sessions. If those anchors leave a FIFO head unable to schedule
+any work, `run_iteration` evicts LRU entries and retries until it can make progress
+or no cached entry remains. This is cache eviction, not request preemption.
 
 ### Accounting and invariants
 
@@ -301,6 +377,15 @@ Release-mode lifecycle and layer-copy comparisons are recorded in
 unfavorable to paging because materialization must traverse many discontiguous
 blocks; direct block-table attention therefore does not use compact retrieval.
 
+Seven additional prefix-index tests cover longest exact matching, namespace and
+token separation, duplicate handling, both capacity bounds, deterministic LRU
+eviction, explicit erase/clear, invalid/stale/foreign sources, anchor lifetime,
+destructor reclamation, and concurrent lookup/fork/release lifecycles. Runtime
+tests compare reused-suffix output with full recomputation, verify cancellation
+ownership, and force anchor eviction in a three-page pool. The complete native
+Debug and ASan/UBSan suites pass 169/169; the CUDA-on compile-validation suite
+passes those 169 host tests and explicitly skips 57 GPU tests without a device.
+
 ## Direct block-table attention lease
 
 `read_layer(sequence, layer)` returns a move-only `LayerReadView`. It shares
@@ -350,10 +435,14 @@ benefit and the much smaller end-to-end effect in `docs/PERFORMANCE.md`.
   unrelated sequence mutation during that layer call.
 - Contiguous sequence capacity cannot grow; the paged pool cannot grow after
   construction.
-- Prefix sharing is explicitly block-aligned and caller-directed; there is no
-  content index, automatic longest-prefix lookup, persistent anchor, or eviction
-  policy yet. Partial-page sharing/copy-on-write and runtime integration are absent.
-- No request preemption exists.
+- Prefix reuse is block-aligned and exact-token only. Partial-page sharing and
+  copy-on-write are absent.
+- The CPU runtime stores only the maximum reusable prefix published by each
+  completed prompt, uses one engine-local namespace, and does not cache logits.
+  Cross-model/shared-runtime namespace management is not implemented.
+- Prefix lookup and reuse are CPU-only and opt-in; GPU-resident anchors and a
+  device block table do not exist.
+- No request preemption exists; only retained prefix anchors can be evicted.
 - One mutex serializes all sequences, and a direct read lease holds it for the
   complete attention call.
 

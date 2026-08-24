@@ -221,14 +221,14 @@ markers, metadata and payload corruption, nonzero padding, structurally invalid
 but checksum-consistent ranks/offsets, invalid weights, non-finite weights, and
 nonzero stream origins.
 
-Validation on 2026-08-23 through direct paged-decode commit `c9b151c`:
+Validation on 2026-08-23 through prefix-runtime benchmark commit `7840546`:
 
-- Debug, Release, and Apple Clang ASan/UBSan CPU suites: 156/156 tests passed;
+- Debug, Release, and Apple Clang ASan/UBSan CPU suites: 169/169 tests passed;
 - all Release tests and benchmark smoke workloads passed;
 - CUDA 12.6.85/GCC 13.2 warnings-as-errors build: all targets compiled and all
-  156 hardware-independent tests passed;
+  169 hardware-independent tests passed;
 - 57 GPU runtime tests remained explicitly skipped because the compile container
-  has no NVIDIA driver or device.
+  has no NVIDIA driver or device (226 registered tests total).
 
 ## Measured CPU baselines
 

@@ -18,8 +18,8 @@ Milestones 9–10, the M11–M12 KV caches, the M13 direct paged-attention CPU p
 the M14–M16 request and continuous-batching scheduler, the M17 narrow Llama-style
 CPU prefill runtime, the M18 single-sequence cached generation path, and the M19
 synchronous multi-request CPU execution engine are implemented and CPU-validated.
-M22 now has a measured lower-level block-aligned prefix-sharing primitive; an
-automatic content-indexed prefix cache is still future work.
+M22 now includes the measured block-aligned sharing primitive, a bounded exact-
+content prefix index, persistent LRU anchors, and opt-in reuse in the CPU runtime.
 The repository
 contains the CPU-first build foundation, a checked contiguous tensor core,
 Float32 reference kernels for elementwise math, reductions, stable softmax,
@@ -30,9 +30,10 @@ reference-counted prefix pages, and copy-free block-table attention traversal. T
 primitives into embedding, pre-norm attention/MLP blocks, RoPE, SwiGLU, residuals,
 final normalization, and an untied LM head, loads a checksummed versioned native
 weight format, performs greedy generation through a contiguous KV cache, and
-executes scheduler batches against a shared paged KV pool. On
+executes scheduler batches against a shared paged KV pool with optional prompt-
+prefix reuse. On
 2026-08-23, Apple Clang 17 built the project on macOS arm64 with warnings as
-errors; 156/156 CPU tests passed in Debug, Release, and ASan/UBSan configurations.
+errors; 169/169 CPU tests passed in Debug, Release, and ASan/UBSan configurations.
 
 CUDA is optional at configure time. The current Apple Silicon development host has
 no NVIDIA GPU or native CUDA toolkit, so no CUDA execution or performance claim is
@@ -42,9 +43,9 @@ compile-validated in an ARM64 CUDA 12.6 development container without a
 driver/device. The M8 stream-ordered allocator and M9 block-reduced RMSNorm,
 grid-stride SwiGLU, adjacent-pair RoPE, and projection adapter are also
 compile-validated, as is the M10 three-stage contiguous attention baseline. None is
-runtime-validated on a GPU. The CUDA-on build passes the same 156 hardware-
-independent tests and registers 57 GPU tests that cannot run without a driver and
-device.
+runtime-validated on a GPU. The CUDA-on build passes the same 169 hardware-
+independent tests and explicitly skips 57 GPU tests without a driver/device (226
+registered tests total).
 
 ## Architecture
 
@@ -55,6 +56,8 @@ flowchart TD
     Executor --> Allocator[HelixAllocator]
     Executor --> Kernels[CPU / CUDA Kernels]
     Executor --> KV[Paged KV Cache]
+    Executor --> Prefix[Exact Prefix Index / LRU]
+    Prefix --> KV
     Allocator --> Memory[(GPU Memory)]
     Kernels --> Memory
     KV --> Memory
@@ -160,6 +163,15 @@ and assigned no additional physical payload. The pool itself is fixed and alread
 reserved, and the fixture excludes content lookup, hashing, and eviction; these are
 mechanism-level CPU results, not end-to-end inference or GPU claims.
 
+The content-index follow-up retains the original linear scan in the same binary.
+At 1,024 entries, the indexed hot-hit median was 165 ns versus 1,529 ns linear,
+and an indexed miss was 33.1 ns versus 1,961 ns linear. It loses at very small
+caches, including a 136 ns versus 81.2 ns hot hit with one entry, so no universal
+lookup win is claimed. In a separate steady-state CPU runtime trace, opt-in reuse
+was 68.7% slower for an 8-token prompt, but 1.80x and 6.04x faster for 16- and
+32-token prompts. Each result uses the exact disclosed tiny model/workload in
+[`docs/PERFORMANCE.md`](docs/PERFORMANCE.md); none is a production or GPU result.
+
 ## Tensor runtime
 
 `helix::Tensor` is a shallow-copy handle over shared RAII storage. It tracks a
@@ -251,8 +263,18 @@ a page only after its last sequence reference disappears. Alignment makes every
 shared page immutable, so subsequent scalar or bulk appends touch only exclusive
 tail pages and branches can safely diverge without copy-on-write. Statistics
 separate logical `active_tokens` from unique `resident_tokens`, physical block
-references, and shared blocks. This primitive does not yet discover matching
-prompts or retain/evict prefixes automatically.
+references, and shared blocks.
+
+`PagedPrefixCache` builds on that primitive. An entry owns an exact namespace plus
+token vector and a persistent paged anchor, and bounded entry/block-reference
+budgets drive deterministic LRU eviction. Longest lookup incrementally hashes each
+block-aligned query prefix, uses namespace/length/digest to find candidates, then
+compares the full token vector so a digest collision cannot establish identity. A
+hit returns a new sequence fork whose caller owns release. The CPU runtime can
+enable this cache, seed logical scheduler progress from a hit, execute only the
+uncached suffix, publish the maximum reusable aligned prefix after successful
+prefill, and evict retained anchors if they prevent forward progress under page
+pressure.
 
 The paged cache also exposes a move-only layer read lease that pins pool/table
 lifetime and excludes append/release while attention holds raw spans. This coarse
@@ -271,6 +293,9 @@ waiting/prefill/decoding/terminal transition matrix. Explicit monotonic
 in tests. The M15 single-thread-owned scheduler owns requests, preserves waiting and
 running FIFO order, separates chunked prefill from one-token decode work, and
 enforces per-iteration token, running-request, and caller-supplied KV-block limits.
+`submit_prefilled` admits an externally owned, block-aligned K/V prefix while
+recording logical progress only at FIFO admission; cached tokens never become
+scheduled model work.
 One checked batch may be in flight; ordered completion validates all results before
 mutating any request and reports blocks to release on finish, failure, or
 cancellation. Finished slots admit waiting work in the next iteration without a
@@ -331,20 +356,23 @@ measured CPU decode baselines are in
 ## CPU runtime engine
 
 `helix::runtime::CpuRuntimeEngine` owns one model, one FIFO scheduler, one global
-paged KV pool, and one session per live request. Each synchronous iteration reads
-actual free-block capacity, schedules a mixed batch, executes genuine prefill or
-cached-decode model work, reports ordered completions, and reclaims terminal K/V
-blocks before returning. Deterministic tests cover continuous refill, token/KV
-budgets, exact-boundary exhaustion, reuse, EOS, cancellation, and injected model
-failure.
+paged KV pool, an optional bounded prefix index, and one session per live request.
+Each synchronous iteration reads actual free-block capacity, schedules a mixed
+batch, executes genuine prefill or cached-decode model work, reports ordered
+completions, and reclaims terminal K/V blocks before returning. Deterministic tests
+cover continuous refill, token/KV budgets, exact-boundary exhaustion, prefix hits,
+pressure eviction, reuse, EOS, cancellation, and injected model failure.
 
 The default full-prompt path executes an admitted prompt in one causal model call
 and transactionally bulk-appends layer-major K/V. A retained sequential-token mode
 handles chunked prompts and provides the paired prefill benchmark baseline. Paged
 decode defaults to direct block-table traversal with an uncommitted current-token
-tail; a compact-copy mode remains available as the paired decode baseline. Work
-items are still executed serially on the CPU; this is a correctness engine, not
-fused GPU batch execution. Ownership, protocol, measurements, and limitations are in
+tail; a compact-copy mode remains available as the paired decode baseline. Prefix
+reuse is disabled by default because short prompts regress on the measured CPU
+path. When enabled, it always leaves at least one prompt token to execute because
+the cache retains K/V, not next-token logits. Work items are still executed
+serially on the CPU; this is a correctness engine, not fused GPU batch execution.
+Ownership, protocol, measurements, and limitations are in
 [`docs/RUNTIME.md`](docs/RUNTIME.md).
 
 ## Supported hardware
@@ -365,9 +393,11 @@ execution, but scheduled work items run serially and no tensor batch is formed.
 Transformer execution currently supports CPU Float32 prefill, contiguous-KV
 single-sequence generation, and paged-KV multi-request orchestration; tokenization,
 public checkpoint conversion, GPU-resident paged KV, and CUDA model dispatch
-remain roadmap work. Block-aligned page sharing exists, but the runtime has no
-content-key lookup, prefix insertion/eviction policy, or automatic prefix reuse.
-Tensor
+remain roadmap work. CPU prefix reuse is exact-content, block-aligned, bounded,
+and opt-in; it stores only one maximum reusable prefix per completed prompt, uses
+an engine-local namespace, and does not cache next-token logits or run on the GPU.
+Partial-page sharing, model-global cache namespaces, and request preemption remain
+future work. Tensor
 allocator integration is also pending. Float16 has no arithmetic path yet. Tensor
 execution is contiguous-only; broadcasting, slicing, and general strided kernels are intentionally
 deferred. CPU kernels are reference implementations, not optimized BLAS

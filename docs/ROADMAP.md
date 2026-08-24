@@ -686,49 +686,74 @@ improves a measured workload.
 Profile-driven candidates such as bias/activation, RMSNorm, or SwiGLU. Record
 latency, launch count, and traffic before and after.
 
-### M22 — Prefix cache — Block-sharing primitive implemented; content cache pending
+### M22 — Prefix cache — Implemented, CPU-validated, sanitized, and benchmarked
 
-Implemented/validation record (2026-08-23, commit `56d0cd0`):
+Implementation record (2026-08-23, commits `56d0cd0`, `cc4bc29`, `888dd30`,
+`56db693`, `fbc6b20`, and `7840546`):
+
 `PagedKvCache::fork_sequence` aliases a positive, block-aligned source prefix by
-copying only physical IDs into a new block table and incrementing per-page
-reference counts. Full-page alignment is the immutability contract: each branch
-only writes an exclusive tail, so divergence needs no partial-page copy-on-write.
-The fork allocates a new tail at its next write; the source may already own a later
-exclusive tail. Release decrements references and returns a page to the FIFO only
-on the final owner. Fork metadata is constructed before counters change,
-and a fork can succeed with zero free pages.
+copying physical IDs into a new block table and incrementing per-page references.
+Full-page alignment is the immutability contract: each branch appends only to an
+exclusive tail, so divergence needs no partial-page copy-on-write. Release returns
+a page to the FIFO only after its final logical owner. Debug invariants rebuild all
+references, require shared pages to be full, and reconcile logical active tokens
+with unique resident payload.
 
-Statistics now separate logical active tokens from unique resident payload and
-report total block-table references, shared physical blocks, and fork count. Debug
-invariants rebuild reference counts from all tables, require aliased pages to be
-full, validate written-token counts, detect duplicate free-queue entries, and
-reconcile bytes/slots/logical/resident accounting. Three new tests cover exact
-prefix values, scalar/bulk divergence, either-owner release, invalid and stale
-handles, full-pool behavior, FIFO reuse, and concurrent reference transitions
-above two. The current Debug, Release, and ASan/UBSan CPU suites pass 156/156; a
-CUDA 12.6.85 warnings-as-errors build passes those 156 host tests and explicitly
-skips 57 GPU tests without a driver/device.
+`PagedPrefixCache` layers exact namespace/token keys, persistent anchor sequences,
+an MRU list, and bounded entry/block-reference budgets over that primitive. Its
+production index uses `(namespace, aligned length, incremental 64-bit digest)` to
+find candidates, then compares the entire token vector so digest collisions cannot
+create false identity. Longest lookup probes every aligned prefix during one input
+scan and returns an owned sequence fork. Duplicate insertions refresh recency;
+oversized entries are rejected without mutation; bounded insertion, explicit
+erase/clear, and LRU eviction release anchor references. The documented lock order
+is prefix manager before paged cache.
 
-The retained duplicate-payload benchmark copies the same aligned prefix into a
-new sequence. On the disclosed Apple M3 Pro host, page sharing reduced median
-lifecycle CPU time from 916 to 83.1 ns for 32 KiB, 3.180 us to 93.3 ns for 93,240
-B, and 29.598 us to 92.3 ns for 1 MiB while assigning no additional physical
-payload. The fixed pool was already reserved in both modes, and content lookup,
-hashing, runtime integration, and eviction were excluded.
+`FifoScheduler::submit_prefilled` accepts a validated aligned logical seed but
+does not own or discover K/V. It records progress only on FIFO admission and
+schedules only the suffix. The optional CPU runtime cache looks up at most
+`floor((prompt_size - 1) / block_tokens) * block_tokens`, deliberately leaving a
+token to regenerate logits. After successful final prefill it publishes that
+request's maximum reusable aligned prefix. If retained anchors prevent any
+scheduling progress, the runtime evicts LRU entries and retries against the real
+free-page count. Cancellation/failure release live forks; anchors remain until
+bounded or pressure eviction.
 
-M22 is not complete: content keys, collision-safe longest-prefix lookup,
-persistent anchor ownership, admission-aware eviction, and runtime reuse remain
-planned. This lower-level primitive is not described as an automatic prefix cache.
+Seven prefix-index tests cover exact longest matching, namespaces/content,
+duplicate and capacity behavior, transactional invalid/stale/foreign inputs,
+anchor/destructor lifetime, and concurrency. Two scheduler and two runtime tests
+cover seeded admission, suffix-only execution, cancellation, output equivalence
+with full recomputation, and forced pressure eviction. Debug and ASan/UBSan CPU
+suites pass 169/169; the Release targets and benchmark smoke tests pass. CUDA
+12.6.85/GCC 13.2 compiles every target and passes the same 169 host tests; all 57
+GPU-runtime tests are explicitly skipped without an NVIDIA driver/device (226
+registered tests total).
 
-### M23 — Memory pressure and preemption — Safe-admission baseline implemented; optional extension
+The page-sharing lifecycle benchmark remains the mechanism baseline: sharing
+measured 11.02x–320.67x faster than duplicating 32 KiB–1 MiB of already-computed
+payload while assigning no child payload pages. A same-binary content-index
+experiment shows the honest crossover: at one entry, indexed hot hit was 136 ns
+versus 81.2 ns linear; at 1,024 entries, it was 165 ns versus 1,529 ns, and indexed
+miss was 33.1 ns versus 1,961 ns. The steady-state CPU runtime experiment measured
+reuse 68.7% slower for 8-token prompts, 1.80x faster for 16 tokens, and 6.04x faster
+for 32 tokens across the disclosed tiny fixtures. Prefix reuse remains opt-in;
+these results are neither GPU nor production-model claims.
+
+Remaining M22 limitations are explicit: CPU-only anchors, one maximum published
+prefix per request, an engine-local namespace, no cached logits, no partial-page
+sharing/copy-on-write, and no cross-model shared cache.
+
+### M23 — Memory pressure and preemption — Safe admission and prefix eviction implemented; request preemption optional
 
 The implemented CPU engine rejects submission when one request's maximum live K/V
 prefix cannot fit in the physical pool. Transient pressure does not fail a request:
 the scheduler preserves FIFO order, waits for terminal reclamation, then admits more
 work from the cache's actual free-block snapshot. Exact-boundary and 32-request
-stress tests cover progress, reuse, and leak-free exhaustion. Preemption or prefix
-eviction remains an optional measured extension with explicit fairness and
-restoration semantics.
+stress tests cover progress, reuse, and leak-free exhaustion. With prefixing
+enabled, a no-progress capacity result triggers measured LRU anchor eviction and a
+fresh scheduling attempt. Live requests are never evicted. Request preemption
+remains an optional extension requiring explicit fairness, restoration, and K/V
+ownership semantics.
 
 ### M24 — Additional precision/quantization — Optional
 

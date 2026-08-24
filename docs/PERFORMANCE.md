@@ -38,6 +38,8 @@ Every recorded experiment must include:
 | M19 synchronous CPU runtime prefill | Execute every scheduled prompt token through the one-token paged decode path | Execute a complete newly admitted prompt once and bulk-append its layer-major K/V pages | Sequential/full-prompt median CPU trace times: 461.833/224.800 us, 2.616/1.675 ms, and 11.745/9.890 ms; reductions 51.3%, 36.0%, and 15.8% | Full prefill wins all paired tiny traces, but the benefit narrows as decode dominates. The timed region is real serial CPU model/scheduler/cache execution, not GPU or fused-batch throughput. |
 | M19 paged model decode staging | Copy all cached pages into two contiguous history-plus-current K/V tensors per layer | Traverse leased block-table spans plus an uncommitted current K/V tail | Isolated compact/direct medians: 1,609/1,239 ns, 2,359/2,045 ns, 15.667/11.324 us, and 112.007/88.662 us; reductions 23.0%, 13.3%, 27.7%, and 20.8% | Direct traversal eliminates 2 KiB–1 MiB of combined-K/V payload per layer call. Complete tiny trace medians improved only 0.08%–6.23%, so the end-to-end impact is explicitly modest. |
 | M22 block-aligned prefix sharing | Create a child sequence and bulk-copy the already-computed prefix K/V payload into newly assigned pages | Copy only block IDs and increment physical reference counts | Duplicate/shared medians: 916/83.1 ns for 32 KiB, 3.180 us/93.3 ns for 93,240 B, and 29.598 us/92.3 ns for 1 MiB (11.02x, 34.08x, and 320.67x) | The paired lifecycle isolates the page-sharing mechanism. Assigned child payload falls to zero, but the fixed pool is pre-reserved and content lookup, hashing, eviction, model execution, and GPU work are excluded. |
+| M22 exact prefix content index | Linear exact longest-prefix scan retained in the same binary | Incremental token digest plus namespace/length hash probes and full-vector collision verification | At 1/64/256/1,024 entries, indexed versus linear hot-hit medians were 136/81.2 ns, 164/172 ns, 153/441 ns, and 165/1,529 ns; miss medians were 31.8/7.61 ns, 34.4/115 ns, 34.0/404 ns, and 33.1/1,961 ns | Indexing loses on tiny caches but bounds entry-count scaling in this fixture. Exact token comparison preserves correctness; the linear baseline remains benchmarkable and no machine-specific hybrid cutoff was encoded. |
+| M22 hot CPU runtime prefix reuse | Full vectorized prefill for every request after an equivalent untimed warm request | Exact lookup, page fork, four-token suffix execution, and duplicate-anchor refresh | Disabled/enabled median CPU trace times: 434.232/732.500 us (8-token prompt), 3.375/1.877 ms (16), and 28.370/4.695 ms (32): 68.7% regression, 1.80x speedup, and 6.04x speedup | Reuse reduces executed prompt tokens but fixed lookup/fork cost and sequential suffix execution lose on the shortest trace. The feature remains opt-in; these are tiny serial CPU reference workloads, not GPU/production serving results. |
 
 ## M1 CPU tensor baseline — 2026-08-20
 
@@ -956,6 +958,138 @@ Command:
 ./build-release/benchmarks/helix_benchmarks \
   '--benchmark_filter=BM_PagedKvPrefixForkLifecycle' \
   --benchmark_min_time=10000x \
+  --benchmark_repetitions=15 \
+  --benchmark_enable_random_interleaving=true \
+  --benchmark_report_aggregates_only=true
+```
+
+## M22 exact prefix-index scaling — 2026-08-23
+
+Hypothesis: scanning every retained content entry makes both misses and longest-
+prefix hits grow with cache population. An incremental digest should let lookup
+scan the query once and probe only candidates at block-aligned lengths. Full token
+comparison must remain mandatory so a digest collision cannot establish cache
+identity.
+
+Environment:
+
+- source: commit `2d5202d` (production index from `888dd30`, retained linear
+  benchmark from `dc5aa5e`);
+- host: Apple M3 Pro, 12 CPU cores (6 performance, 6 efficiency), 18 GB RAM;
+- OS/compiler/build: macOS 26.0.1 arm64, Apple Clang 17.0.0, Release,
+  `HELIX_ENABLE_CUDA=OFF`, warnings as errors, Float32;
+- CMake 4.2.3 and Google Benchmark 1.9.1;
+- one benchmark thread; affinity/frequency metadata unavailable;
+- load averages at the main scaling run start: 6.00/7.05/7.67;
+- warmup: one lookup lifecycle before each hot case and one miss before each miss
+  case;
+- measurement: time-based minimum 0.1 seconds per case per repetition, 15 random-
+  interleaved repetitions; median process CPU time reported.
+
+Every entry is an exact eight-token key occupying two four-token pages in a
+one-layer/one-head/one-dimension cache. Entries differ in their first token. The
+hot query matches one exact entry and includes lookup, anchor fork, MRU update, and
+child release. The miss differs in its first token and measures lookup only. Pool
+and entry construction are outside timing. `Linear` is the original mutex-
+protected exact LRU scan compiled into the same executable; `Indexed` is
+`PagedPrefixCache`. A direct fork/release floor measured 69.5 ns median in the
+same run.
+
+| Entries | Linear hot lifecycle | Indexed hot lifecycle | Linear miss | Indexed miss |
+|---:|---:|---:|---:|---:|
+| 1 | 81.2 ns | 136 ns | 7.61 ns | 31.8 ns |
+| 16 | 120 ns | 169 ns | 29.0 ns | 41.5 ns |
+| 64 | 172 ns | 164 ns | 115 ns | 34.4 ns |
+| 256 | 441 ns | 153 ns | 404 ns | 34.0 ns |
+| 1,024 | 1,529 ns | 165 ns | 1,961 ns | 33.1 ns |
+
+The negative small-cache result is real: at one entry, indexing adds 67.5% to the
+hot lifecycle and makes the miss 4.18x slower. The indexed hot path is effectively
+tied at 64 entries, then measures 2.88x and 9.27x faster at 256 and 1,024 entries.
+Indexed misses measure 3.34x, 11.88x, and 59.2x faster at 64, 256, and 1,024.
+A targeted 24/32/48-entry run placed the miss crossover between 16 and 24 entries,
+while hot lookup remained slower through 48 and crossed by 64 on this host.
+
+The production path stays indexed rather than embedding a benchmark-host-specific
+hybrid threshold. Its expected lookup work depends on query length/aligned
+boundaries and collision-bucket size instead of total entries. The linear
+implementation remains only in the benchmark so a future trie, radix index, or
+hybrid proposal must beat both sides of this crossover. These numbers cover CPU
+metadata and page-reference operations only; no model execution or CUDA work ran.
+
+Command:
+
+```bash
+./build-release/benchmarks/helix_benchmarks \
+  '--benchmark_filter=BM_PagedPrefix(DirectForkLifecycle|CacheHotHitLifecycle|CacheMiss|LinearHotHitLifecycle|LinearMiss)' \
+  --benchmark_min_time=0.1s \
+  --benchmark_repetitions=15 \
+  --benchmark_enable_random_interleaving=true \
+  --benchmark_report_aggregates_only=true
+```
+
+## M22 hot CPU runtime prefix reuse — 2026-08-23
+
+Hypothesis: once an aligned prompt prefix has a persistent K/V anchor, forking its
+pages and executing only the uncached suffix should reduce complete request-trace
+CPU time when avoided model work exceeds lookup, reference, and incremental-suffix
+overhead. A paired short-prompt case is required to expose the crossover rather
+than assuming reuse always wins.
+
+Environment:
+
+- source: commit `7840546` (runtime integration from `fbc6b20`);
+- host: Apple M3 Pro, 12 CPU cores (6 performance, 6 efficiency), 18 GB RAM;
+- OS/compiler/build: macOS 26.0.1 arm64, Apple Clang 17.0.0, Release,
+  `HELIX_ENABLE_CUDA=OFF`, warnings as errors, Float32;
+- CMake 4.2.3 and Google Benchmark 1.9.1;
+- one benchmark thread; affinity/frequency metadata unavailable;
+- load averages at command start: 6.75/6.37/6.64;
+- warmup: construct one engine and complete one request outside timing for every
+  measured trace; this populates the prefix only in the enabled variant while
+  warming equivalent model work in both;
+- measurement: time-based minimum 0.1 seconds per case per repetition, 15 random-
+  interleaved repetitions; median process CPU time and CPU-time CV reported.
+
+Each measured trace submits and completes 16 sequential requests on the warmed
+engine. Vocabulary is 128, K/V pages hold four tokens, every request emits one
+length-limited output, and all prompts share the maximum reusable aligned prefix
+but vary in their final page. Engine/model construction, weight generation, warmup,
+statistics validation, and destruction are outside timing. Timed work includes
+request submission, exact lookup, scheduling, serial CPU model execution, paged
+append/read/release, request completion, and prefix duplicate refresh. Both modes
+use full-prompt prefill when starting at offset zero and direct block-table decode;
+a hit necessarily executes its four-token suffix through the sequential path.
+
+| H / I / L / heads | Prompt / shared | Disabled median / CPU CV | Enabled median / CPU CV | Executed prefill tokens (off/on) | Result |
+|---|---:|---:|---:|---:|---:|
+| 16 / 32 / 1 / 4 | 8 / 4 | 434.232 us / 2.79% | 732.500 us / 3.79% | 128 / 64 | 68.7% slower |
+| 32 / 64 / 2 / 4 | 16 / 12 | 3.375 ms / 1.44% | 1.877 ms / 2.49% | 256 / 64 | 1.80x faster |
+| 64 / 128 / 2 / 4 | 32 / 28 | 28.370 ms / 2.06% | 4.695 ms / 2.12% | 512 / 64 | 6.04x faster |
+
+All variants complete 32 runtime iterations (one prefill and one terminal decode
+per measured request). Peak physical K/V payload was unchanged at 1,024 B, 8,192
+B, and 32,768 B because both variants reach the same full-prompt page footprint;
+sharing reduces recomputation and duplicate page assignment, not the fixed pool's
+reservation. The cache-enabled scheduler reports exactly 64, 192, and 448 reused
+prompt tokens across the 16 measured requests.
+
+The 8-token regression matters: even after eliminating half of prompt tokens,
+hashing, locking, page forks, and four separate suffix model calls lose to one
+vectorized eight-token prefill. The two larger cases amortize that overhead and
+avoid enough projection/attention work to win. Helix therefore leaves
+`CpuRuntimeConfig::prefix_cache` disabled by default; a future activation policy
+needs representative workloads rather than a hard-coded crossover from this
+machine. These are tiny serial CPU reference models with synthetic weights and
+token IDs, not tokenizer, public-model, concurrent-batch, GPU, or production-
+serving measurements.
+
+Command:
+
+```bash
+./build-release/benchmarks/helix_benchmarks \
+  '--benchmark_filter=BM_CpuRuntimeHotPrefixReuseTrace/(Disabled|Enabled)' \
+  --benchmark_min_time=0.1s \
   --benchmark_repetitions=15 \
   --benchmark_enable_random_interleaving=true \
   --benchmark_report_aggregates_only=true

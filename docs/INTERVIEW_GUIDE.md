@@ -207,11 +207,23 @@ divergent continuation safe without copy-on-write. Release decrements
 references and returns a page to the FIFO only at zero, so either sequence may die
 first. Statistics distinguish logical active tokens from unique resident tokens.
 
-This is intentionally only the ownership primitive. Helix does not yet hash prompt
-content, find the longest cached match, retain an anchor after all requests finish,
-or evict prefixes under pressure. Its paired CPU benchmark measures 11.02x–320.67x
-faster child lifecycle than duplicating 32 KiB–1 MiB of already-computed payload;
-the result excludes lookup and model execution and is not a GPU claim.
+`fork_sequence` is intentionally only the ownership primitive and does not hash
+prompt content by itself. `PagedPrefixCache` adds an exact namespace/token key, a
+persistent anchor sequence, a most-recently-used list, and entry/block-reference
+limits. Longest lookup incrementally hashes every block-aligned query prefix and
+probes `(namespace,length,digest)`, but verifies the complete token vector before
+accepting a candidate; collisions cannot create false reuse. A hit forks the
+anchor and transfers that child handle to the caller. Bounded insertion and
+pressure eviction release LRU anchors.
+
+The CPU runtime searches only through the largest aligned prefix that leaves one
+prompt token to execute, because K/V does not include the logits after the cached
+prompt. It seeds scheduler progress from a hit, executes only the suffix, and
+publishes the maximum reusable prefix after successful prefill. Page sharing alone
+measured 11.02x–320.67x faster child lifecycle than copying 32 KiB–1 MiB. The full
+runtime result is workload-dependent: reuse was 68.7% slower for the measured
+8-token prompt, then 1.80x and 6.04x faster for 16 and 32 tokens. None is a GPU or
+production-model claim.
 
 ## Explain continuous batching
 
@@ -267,7 +279,9 @@ snapshot, keeps a FIFO head waiting when it cannot reserve the required delta, a
 does not pretend it owns physical blocks. A final length-limited output needs no
 new K/V because it is sampled from existing logits, so it can retire and release
 an exactly full block even with zero free pages. The CPU engine tests that boundary
-and real block reuse. Preemption and prefix eviction are not implemented.
+and real block reuse. If optional prefix anchors are the reason no batch can be
+formed, the CPU engine evicts LRU anchors and retries with the cache's new free-
+block count. It never evicts a live request. Request preemption is not implemented.
 
 ## What would break first at 10x workload?
 
@@ -302,8 +316,8 @@ enable NCCL or claim multi-GPU support.
 Helix implements Tensor/storage metadata, CPU kernels, CUDA elementwise/reduction/
 softmax/GEMM/transformer/attention kernels, allocator metadata and deferred reuse,
 KV layouts, paged attention, requests, scheduling/metrics, the CPU transformer,
-cached generation session, paged multi-request CPU engine, greedy selection, and
-native file parser. It delegates
+cached generation session, exact bounded prefix index/LRU, paged multi-request CPU
+engine with suffix reuse, greedy selection, and native file parser. It delegates
 CUDA driver/runtime operations to the CUDA Runtime API and testing/benchmark
 harnesses to GoogleTest/Google Benchmark.
 No PyTorch runtime, BLAS, cuBLAS, NCCL, or external model graph executes Helix
@@ -340,3 +354,10 @@ runtime traces improved by only 0.08%–6.23%; the largest case was effectively 
 tie relative to variation. That taught me to distinguish a verified local
 bottleneck from overall model throughput. Helix keeps `kCompactCopy` selectable so
 the comparison remains reproducible.
+
+Prefix reuse produced the clearest negative result. It cut executed prompt tokens
+in half for the eight-token fixture but made the complete trace 68.7% slower:
+hashing, page-reference bookkeeping, and four sequential suffix calls cost more
+than one vectorized full prefill. The same implementation became 1.80x and 6.04x
+faster at 16 and 32 tokens. That is why the cache is opt-in and why I would profile
+a representative prompt distribution before adding an activation threshold.

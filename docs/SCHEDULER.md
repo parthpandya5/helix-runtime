@@ -6,8 +6,9 @@ Milestones 14–16 are implemented and integrated by the M19 CPU engine: the
 host-only request state machine feeds a single-thread-owned FIFO/token/KV-budget
 scheduler, finished slots are refilled between iterations, and deterministic
 metric aggregation exposes lifecycle distributions and rates. Normal, Release,
-and ASan/UBSan suites pass 156/156 tests. The CUDA build passes the same host tests
-and registers 57 GPU tests, but this scheduler is host policy and requires no GPU.
+and ASan/UBSan-applicable paths pass in the current 169-test CPU suite. The CUDA
+build passes the same 169 host tests and explicitly skips 57 GPU tests, but this
+scheduler is host policy and requires no GPU.
 
 ## Ownership and thread safety
 
@@ -63,6 +64,12 @@ Prompts must contain at least one token. `max_new_tokens` may be zero; such a
 request still performs prefill and finishes with the length reason when its prompt
 is complete. Prefill can be reported in positive chunks and rejects work beyond
 the remaining prompt. This is the boundary the token-budget scheduler will use.
+
+`reused_prompt_tokens` records a prefix whose K/V already exists in the runtime's
+physical authority. It must be smaller than the prompt and block aligned. The
+value is seeded while the request is waiting, but `prompt_tokens_processed`
+remains zero until FIFO admission; this preserves waiting-state timing and keeps
+physical ownership separate from logical execution progress.
 
 Generated tokens may be appended only during decode. Reaching the configured
 limit atomically marks the request finished with `length`; the executor may finish
@@ -146,6 +153,15 @@ second scheduling decision from observing work whose device outcome is unknown.
 Failed work carries only a nonempty error context; successful prefill carries no
 token, while successful decode carries exactly one token and an optional EOS flag.
 
+`submit_prefilled(request, reused_prompt_tokens)` is the narrow admission hook for
+an external prefix cache. It validates the seed before taking ownership. At
+admission, the scheduler records that many prompt tokens as completed and emits
+prefill work beginning at the reused offset; cached tokens consume neither the
+iteration token budget nor model work. `SchedulerStats` reports reused prompt
+tokens separately from actually scheduled prefill tokens. Cancelling a waiting
+seeded request reports the logical blocks represented by its fork so the runtime
+can audit physical release.
+
 ## KV ownership boundary
 
 The scheduler never owns or fabricates KV memory. Its input is a free-block
@@ -171,7 +187,9 @@ conservatively capacity-reserved.
 checks each sequence length against the scheduled token offset, applies successful
 appends, completes the ordered batch, and then releases every terminal sequence.
 The scheduler's reported release count remains an audit value; the cache manager is
-the physical ownership authority.
+the physical ownership authority. For a reused prefix, the scheduler sees logical
+blocks already owned; `PagedPrefixCache` and `PagedKvCache` establish and release
+the underlying reference-counted fork before/after this policy boundary.
 
 ## Transactional completion
 
@@ -182,10 +200,11 @@ strings and generated-token vector capacity before mutation. Once mutation start
 the remaining state transitions and vector insertions are nonallocating. A malformed
 later completion therefore cannot leave an earlier request partially progressed.
 
-Twelve scheduler tests cover configuration, mixed prefill/decode batches, token and
+Fourteen scheduler tests cover configuration, mixed prefill/decode batches, token and
 running limits, KV exhaustion and partial-block slack, malformed whole-vector
 completion, exact-boundary final decode, failure/release accounting, cancellation,
-time validation, lookup, statistics, and next-iteration replacement. Three
+time validation, lookup, statistics, next-iteration replacement, seeded-prefix
+admission, suffix-only work, validation rollback, and waiting cancellation. Three
 additional metrics tests cover
 exact distributions/rates, active states, empty samples, invalid IDs/duplicates,
 and time regression. Together with the ten request tests, these paths pass in
@@ -234,9 +253,11 @@ optimization is claimed. Full distributions and caveats are in
 
 ## Remaining policy limitations
 
-The baseline is strict FIFO with no priorities, aging, preemption, prefix sharing,
-or fairness tuning between long prefill and decode. Terminal request history is
-retained indefinitely. The scheduler is wired to the physical CPU paged-cache
-authority and real model executor, but work descriptions execute serially rather
-than as a tensor batch. M16's synthetic policy rates remain policy evidence; M19's
-separate benchmark is the measured CPU execution trace.
+The baseline is strict FIFO with no priorities, aging, request preemption, or
+fairness tuning between long prefill and decode. It accepts a validated reused-
+prefix count but deliberately does not hash tokens, own K/V, or choose eviction;
+those are runtime/cache responsibilities. Terminal request history is retained
+indefinitely. The scheduler is wired to the physical CPU paged-cache authority and
+real model executor, but work descriptions execute serially rather than as a
+tensor batch. M16's synthetic policy rates remain policy evidence; M19/M22's
+separate benchmarks measure CPU execution traces.

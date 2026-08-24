@@ -33,6 +33,8 @@ flowchart TD
     Executor --> Allocator[HelixAllocator]
     Executor --> Kernels[CPU / CUDA Kernels]
     Executor --> KV[KV Cache]
+    Executor --> Prefix[Prefix Index / LRU]
+    Prefix --> KV
     KV --> GPUMemory[(GPU Memory)]
     Allocator --> GPUMemory
     Kernels --> GPUMemory
@@ -42,9 +44,9 @@ flowchart TD
 
 The implemented synchronous CPU runtime executes one scheduling iteration at a
 time: admit requests, construct prefill/decode work within token and KV-memory
-budgets, execute the model serially, append paged K/V state, select tokens, and
-retire or requeue requests. CUDA model execution and asynchronous iterations remain
-later layers of this architecture.
+budgets, optionally seed exact cached prefixes, execute the model serially, append
+paged K/V state, select tokens, and retire or requeue requests. CUDA model
+execution and asynchronous iterations remain later layers of this architecture.
 
 ## Layering and dependency direction
 
@@ -54,7 +56,8 @@ flowchart TB
     Runtime[Runtime Engine]
     Model[Model Executor]
     Schedule[Request + Scheduler]
-    Attention[Attention + KV Cache]
+    Attention[Attention]
+    Cache[KV + Prefix Cache]
     Ops[Tensor Operations]
     Tensor[Tensor + Storage]
     Backend[CPU Backend | Optional CUDA Backend]
@@ -63,9 +66,12 @@ flowchart TB
     App --> Runtime
     Runtime --> Model
     Runtime --> Schedule
+    Runtime --> Cache
     Model --> Attention
     Model --> Ops
+    Attention --> Cache
     Attention --> Ops
+    Cache --> Tensor
     Attention --> Tensor
     Ops --> Tensor
     Tensor --> Backend
@@ -397,8 +403,23 @@ exact multiple of `block_tokens`. The new sequence copies block IDs into its own
 metadata table and increments physical reference counts; K/V payload is not
 copied. Because every shared block is full, both branches begin future appends on
 exclusive pages and never mutate shared payload. Logical active-token accounting
-therefore differs from unique resident-token accounting. Automatic prompt-content
-lookup, persistent prefix indexing, and eviction are not part of this primitive.
+therefore differs from unique resident-token accounting.
+
+`PagedPrefixCache` adds a bounded content-index layer over those forks. Every
+entry owns `(namespace, exact token vector, persistent anchor sequence)` and sits
+in an MRU list. A hash index is keyed by namespace, aligned token count, and an
+incremental 64-bit token digest; lookup still verifies the complete vector, so a
+digest collision affects only candidate cost and never identity. Longest lookup
+probes every aligned prefix of the query in one token pass, forks the longest
+exact anchor, and transfers release responsibility for that logical child to the
+caller. Entry-count and retained-block-reference limits evict the LRU anchors.
+
+The lock order is prefix index then paged cache. A caller must not invoke prefix
+operations while holding a `LayerReadView` from the same pool. Metadata insertion
+stages token storage, anchor ownership, list state, and hash indexing so allocation
+failure either leaves no entry or releases the staged anchor. The prefix manager
+owns a `shared_ptr` to the paged cache; destroying or clearing it releases every
+persistent anchor.
 
 The first memory-pressure policy rejects append with a typed resource error while
 preserving current sequences; an append within an already-owned partial block can
@@ -406,8 +427,9 @@ still proceed. Debug builds re-derive ownership and accounting invariants after
 every mutation. Both contiguous and paged CPU caches use one mutex per instance.
 The M13 read lease lets attention traverse written block spans without compaction;
 its exclusive lifetime lock is the current invalidation boundary. GPU-resident pool
-integration and preemption remain separate milestones; automatic prefix
-discovery/eviction remains the unfinished portion of M22.
+integration and request preemption remain separate milestones. In the CPU runtime,
+retained prefix anchors are evicted in LRU order only when their page ownership
+prevents the scheduler from making any progress.
 
 ## Request and scheduler
 
@@ -442,6 +464,11 @@ uses a caller-supplied monotonic `steady_clock` time, allowing deterministic wai
 TTFT, completion, and inter-token metric derivation. The request is not thread-safe;
 one scheduler thread owns mutation. Details and the exhaustive transition matrix
 are in `docs/SCHEDULER.md`.
+
+The scheduler can also receive a waiting request with a validated, block-aligned
+reused-prefix count. The request records that seed immediately for ownership and
+statistics, but logical prefill progress advances only when FIFO admission occurs;
+only the uncached suffix becomes model work.
 
 The implemented FIFO scheduler owns requests in a stable map, orders waiting IDs in
 a deque, and bounds running IDs in admission order. Each iteration is limited by a
@@ -581,19 +608,25 @@ claimed yet.
 ## Runtime execution and asynchronous work
 
 `CpuRuntimeEngine` is the implemented M19 orchestration baseline. It owns the
-scheduler, one model, one global paged cache, and a request/session map. The entire
-sequence below completes synchronously on its owning thread:
+scheduler, one model, one global paged cache, an optional M22 prefix manager, and a
+request/session map. The entire sequence below completes synchronously on its
+owning thread:
 
 ```mermaid
 sequenceDiagram
     participant Client
     participant Scheduler
     participant Engine
+    participant Prefix
     participant Model
     participant KV
     Client->>Engine: submit(request, optional EOS)
-    Engine->>KV: create empty sequence
-    Engine->>Scheduler: move request
+    opt prefix cache enabled
+        Engine->>Prefix: longest exact aligned lookup
+        Prefix->>KV: fork retained anchor on hit
+    end
+    Engine->>KV: create empty sequence on miss
+    Engine->>Scheduler: move request + reused-token seed
     loop inference iteration
         KV-->>Engine: actual free-block snapshot
         Engine->>Scheduler: build batch within budgets
@@ -601,6 +634,9 @@ sequenceDiagram
         Engine->>Model: prefill/decode each work item
         Model->>KV: read prior K/V
         Engine->>KV: append successful K/V
+        opt final prompt work
+            Engine->>Prefix: publish maximum reusable aligned prefix
+        end
         Model-->>Engine: logits
         Engine->>Scheduler: generated tokens/completions
         Scheduler-->>Engine: terminal requests
@@ -614,7 +650,12 @@ Complete new prompts use one full causal prefill and a transactional layer-major
 bulk append; chunked prompts retain a selectable token-at-a-time baseline. The
 default paged decode traverses block-table spans with a current-token tail; its
 compact-copy predecessor remains selectable for paired tests and benchmarks.
-Model/cache failures become failed ordered
+On a prefix hit, scheduling starts at the reused physical/logical length and the
+engine evaluates the remaining suffix sequentially. It never reuses the complete
+prompt: the retained object contains K/V but not the logits after that prompt, so
+at least one token must execute to produce fresh sampling logits. If cached anchors
+consume the free pages needed for a FIFO head and no batch can be built, the engine
+evicts LRU entries and retries scheduling. Model/cache failures become failed ordered
 completions and reclaim their sequence; cancellation reclaims waiting or running
 sessions immediately when no batch is in flight. See `docs/RUNTIME.md`.
 
@@ -648,5 +689,6 @@ host latency.
 
 The initial architecture does not promise training, autograd, arbitrary model
 graphs, arbitrary strides, production serving APIs, quantization, automatic
-prefix-cache lookup/eviction, preemption, or multi-GPU inference. Each can be
-considered only after the core runtime is correct and measured.
+cross-model prefix namespaces, partial-page prefix sharing, preemption, or
+multi-GPU inference. Each can be considered only after the core runtime is correct
+and measured.
