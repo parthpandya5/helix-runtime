@@ -321,12 +321,16 @@ allocation descriptor and a `shared_ptr` to the allocator; the final Storage own
 returns the block, while allocator segments remain cached until explicit trim or
 allocator destruction. Cleanup errors are logged from a non-throwing destructor.
 
-CUDA Tensor storage is not wired into the cache. A release event is safe only when
-all prior uses happen-before that event. Tensor currently has no per-storage stream
-ledger and therefore cannot construct the required dependency chain for multi-
-stream use automatically. `allocate_cpu_tensor` rejects a CUDA resource before any
-upstream allocation. CPU ownership/completion tests are not presented as proof of
-CUDA event behavior.
+The opt-in `allocate_cuda_tensor_on_stream` bridge wraps one pooled device block as
+mutable Tensor Storage and retains both a `StreamOrderedAllocator` and one usage
+stream through the final view. Destruction records the release event and transfers
+the exact generation-tagged handle to the pending list. Constructor rollback
+returns a never-used block immediately; release-event failure falls back to bound-
+stream synchronization before completed deallocation. A release event is safe only
+when all prior uses happen-before it, so this is explicitly a single-stream API.
+Tensor still has no per-storage stream ledger and cannot automatically aggregate
+multi-stream dependencies. These CUDA paths are compile-validated, not presented
+as physical event/reuse evidence.
 
 ## Attention
 

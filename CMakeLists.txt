@@ -127,6 +127,7 @@ if(HELIX_ENABLE_CUDA)
   target_sources(
     helix_memory
     PRIVATE
+      src/memory/cuda_tensor_storage.cpp
       src/memory/cuda_memory_resource.cpp
       src/memory/stream_ordered_allocator.cpp)
   target_link_libraries(helix_memory PUBLIC helix::cuda_runtime)

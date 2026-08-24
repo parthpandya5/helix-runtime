@@ -7,16 +7,15 @@ ownership bridge are **implemented, CPU-validated, sanitizer-validated, and host
 resource benchmarked**. Twenty-one focused allocator/deferred/bridge tests and the
 full 186-test CPU suite pass in Debug, Release, and ASan/UBSan builds. A CUDA 12.6
 warnings-as-errors build compiles `CudaMemoryResource`, `StreamOrderedAllocator`,
-three hardware-gated allocator tests, the CPU bridge, and native-CUDA comparison
-benchmarks. It passes 185 hardware-independent tests and skips 61 GPU tests without
-a driver/device (246 registered), so no CUDA allocator code has run on a physical
-GPU.
+six hardware-gated allocator/ownership tests, both Tensor bridges, and native-CUDA
+comparison benchmarks. It passes 185 hardware-independent tests and skips 64 GPU
+tests without a driver/device (249 registered), so no CUDA allocator code has run
+on a physical GPU.
 
 The event-backed adapter is therefore compile-validated rather than hardware-
-validated. The CPU bridge does not generalize to CUDA: Tensor does not yet track
-all streams that use an allocation, so it cannot satisfy the release-stream
-contract automatically. CPU ownership/completion tests do not prove CUDA event
-semantics.
+validated. The CUDA Tensor bridge has an explicit single-stream contract; Tensor
+does not yet track all streams that use an allocation. CPU ownership/completion
+tests and CUDA compilation do not prove CUDA event semantics.
 
 ## Why cache device allocations?
 
@@ -33,6 +32,9 @@ GPU latency.
 ```mermaid
 flowchart TD
     Tensor[CPU Tensor owner] --> Bridge[allocate_cpu_tensor]
+    DeviceTensor[Single-stream CUDA Tensor] --> DeviceBridge[allocate_cuda_tensor_on_stream]
+    DeviceBridge --> Deferred[StreamOrderedAllocator]
+    Deferred --> Allocator
     Bridge -->|bytes + alignment| Allocator[HelixAllocator]
     Workspace[Explicit workspace owner] -->|bytes + alignment| Allocator
     Allocator --> Scan[Best-fit metadata scan]
@@ -151,6 +153,57 @@ Callers must not destroy the last Tensor concurrently with unsynchronized access
 its data; allocator metadata itself remains protected by the allocator mutex.
 Supplying a CUDA resource is rejected before an upstream allocation because this
 simple owner has no stream-use ledger or release event.
+
+## Single-stream CUDA Tensor ownership bridge
+
+`memory::allocate_cuda_tensor_on_stream(shape, dtype, shared_allocator,
+shared_stream, alignment)` is the opt-in device counterpart. It does not change
+default CUDA Tensor factories. Its ownership sequence is:
+
+1. validate shape/byte overflow, `alignof(max_align_t)`–256-byte power-of-two
+   alignment, non-null allocator and stream, live stream handle, and equal CUDA
+   device indices;
+2. bypass the pool for zero logical bytes;
+3. allocate through `StreamOrderedAllocator` and expose the rounded capacity as
+   mutable external CUDA Storage;
+4. retain the exact allocation, shared allocator, and shared stream in one private
+   lifetime token shared by every Tensor view;
+5. after the final owner disappears, record a timing-disabled event after prior
+   work on that stream and transfer the block to the pending list;
+6. make the block reusable only when polling or blocking reclamation observes that
+   event complete.
+
+The underlying `Tensor::from_mutable_cuda_buffer` interop entry point validates
+shape capacity, declared device, ownership, and alignment, but deliberately avoids
+a CUDA pointer-attribute query on every pooled allocation. Direct callers must
+therefore guarantee the pointer's device provenance and accessible byte range; the
+owning allocator factory supplies those guarantees for the normal bridge path.
+
+```mermaid
+sequenceDiagram
+    participant T as Final Tensor/view owner
+    participant S as Bound CUDA stream
+    participant A as StreamOrderedAllocator
+    T->>S: prior kernels/copies using block P
+    T->>A: destruction requests deferred release
+    A->>S: record timing-disabled event
+    Note over A: P remains active and pending
+    S-->>A: event complete
+    A->>A: reclaim P into free list
+```
+
+Construction arms the lifetime token only after Tensor metadata and Storage are
+complete. A failure before that point returns the never-used allocation immediately.
+If release-event creation unexpectedly fails during non-throwing destruction, the
+owner logs the error, synchronizes the bound stream, and attempts a completed
+release; it never knowingly puts incomplete bytes back on the free list.
+
+This API intentionally does **not** infer arbitrary stream use. Every Helix or raw-
+pointer operation must happen on the retained stream, or other streams must feed
+an explicit dependency into it before the final owner is destroyed. Moving from
+the retained stream object while storage is live is also invalid. `Tensor::clone`,
+`to`, and default factories continue to allocate direct Storage. A future general
+pool requires per-storage record-stream tracking and dependency aggregation.
 
 ## Coalescing and explicit release
 
@@ -293,9 +346,11 @@ calls, and fragmentation must accompany any future published result.
 
 ## Current limitations
 
-- CUDA event-backed reclamation is not hardware-validated,
+- CUDA event-backed reclamation and the stream-bound Tensor bridge are not
+  hardware-validated,
 - CPU Tensor pooling is opt-in and not wired into model/runtime allocations,
-- CUDA Tensor storage has no record-stream/use-tracking integration,
+- CUDA Tensor pooling is opt-in, single-stream, and not wired into model/runtime
+  allocations,
 - correctness across multiple use streams depends on an explicit caller-created
   dependency chain into the release stream,
 - CUDA runtime correctness and allocation latency unvalidated,

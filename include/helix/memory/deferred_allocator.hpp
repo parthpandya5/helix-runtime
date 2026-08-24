@@ -30,6 +30,9 @@ public:
   DeferredAllocator& operator=(DeferredAllocator&&) = delete;
 
   [[nodiscard]] Allocation allocate(std::size_t bytes, std::size_t alignment = 0);
+  // Returns an allocation immediately after the caller has independently proved
+  // that no asynchronous use remains. Pending allocations are rejected.
+  void deallocate_completed(const Allocation& allocation);
   void defer_deallocate(const Allocation& allocation, std::unique_ptr<Completion> completion);
   [[nodiscard]] std::size_t reclaim_ready();
   [[nodiscard]] std::size_t wait_and_reclaim_all();

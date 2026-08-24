@@ -1,5 +1,6 @@
 #include "allocator_traces.hpp"
 #include "helix/memory/cuda_memory_resource.hpp"
+#include "helix/memory/cuda_tensor_storage.hpp"
 #include "helix/memory/helix_allocator.hpp"
 #include "helix/runtime/cuda/device.hpp"
 #include "helix/runtime/cuda/error.hpp"
@@ -18,6 +19,64 @@ namespace {
 constexpr std::array<std::size_t, 16> kCudaTraceSizes{
     256,    4'096,  1'024,   65'536, 512,   2'048,   8'192,  131'072,
     16'384, 32'768, 262'144, 4'096,  1'536, 524'288, 65'536, 1'048'576};
+constexpr int kTensorLifecycleWarmups = 10;
+
+void BM_CudaTensorDirectLifecycle(benchmark::State& state) {
+  if (!cuda::runtime_available()) {
+    state.SkipWithError("requires a visible NVIDIA CUDA device");
+    return;
+  }
+  cuda::set_device(0);
+  const auto elements = static_cast<Dimension>(state.range(0));
+  for (int warmup = 0; warmup < kTensorLifecycleWarmups; ++warmup) {
+    const Tensor tensor = Tensor::empty({elements}, DType::kFloat32, Device::cuda(0));
+    benchmark::DoNotOptimize(tensor.data());
+  }
+  for ([[maybe_unused]] auto iteration : state) {
+    const Tensor tensor = Tensor::empty({elements}, DType::kFloat32, Device::cuda(0));
+    benchmark::DoNotOptimize(tensor.data());
+  }
+  state.counters["logical_bytes"] =
+      static_cast<double>(elements) * static_cast<double>(sizeof(float));
+  state.SetItemsProcessed(state.iterations());
+}
+
+void BM_CudaTensorHelixStreamBoundLifecycle(benchmark::State& state) {
+  if (!cuda::runtime_available()) {
+    state.SkipWithError("requires a visible NVIDIA CUDA device");
+    return;
+  }
+  cuda::set_device(0);
+  const auto elements = static_cast<Dimension>(state.range(0));
+  auto allocator = std::make_shared<StreamOrderedAllocator>(0);
+  auto stream = std::make_shared<cuda::Stream>();
+  for (int warmup = 0; warmup < kTensorLifecycleWarmups; ++warmup) {
+    {
+      const Tensor tensor =
+          allocate_cuda_tensor_on_stream({elements}, DType::kFloat32, allocator, stream);
+      benchmark::DoNotOptimize(tensor.data());
+    }
+    static_cast<void>(allocator->wait_and_reclaim_all());
+  }
+  for ([[maybe_unused]] auto iteration : state) {
+    {
+      const Tensor tensor =
+          allocate_cuda_tensor_on_stream({elements}, DType::kFloat32, allocator, stream);
+      benchmark::DoNotOptimize(tensor.data());
+    }
+    static_cast<void>(allocator->wait_and_reclaim_all());
+  }
+  const DeferredAllocatorStats stats = allocator->stats();
+  HELIX_CHECK(stats.client_allocation_count == 0 && stats.pending_allocation_count == 0,
+              ErrorCode::kInternal, "stream-bound CUDA Tensor benchmark leaked an allocation");
+  state.counters["logical_bytes"] =
+      static_cast<double>(elements) * static_cast<double>(sizeof(float));
+  state.counters["reserved_bytes"] = static_cast<double>(stats.allocator.bytes_reserved);
+  state.counters["reuse_count"] = static_cast<double>(stats.allocator.reuse_count);
+  state.counters["upstream_allocations"] =
+      static_cast<double>(stats.allocator.underlying_allocations);
+  state.SetItemsProcessed(state.iterations());
+}
 
 void BM_CudaMallocFree(benchmark::State& state) {
   if (!cuda::runtime_available()) {
@@ -219,6 +278,8 @@ void BM_CudaHelixAllocatorWorkloadTrace(benchmark::State& state, bench::Allocati
 
 BENCHMARK(BM_CudaMallocFree)->Arg(256)->Arg(4'096)->Arg(1 << 20)->UseRealTime();
 BENCHMARK(BM_CudaHelixAllocatorFixed)->Arg(256)->Arg(4'096)->Arg(1 << 20)->UseRealTime();
+BENCHMARK(BM_CudaTensorDirectLifecycle)->Arg(1)->Arg(1'024)->Arg(1 << 20)->UseRealTime();
+BENCHMARK(BM_CudaTensorHelixStreamBoundLifecycle)->Arg(1)->Arg(1'024)->Arg(1 << 20)->UseRealTime();
 BENCHMARK(BM_CudaMallocMixedTrace)->UseRealTime();
 BENCHMARK(BM_CudaHelixAllocatorMixedTrace)->UseRealTime();
 BENCHMARK_CAPTURE(BM_CudaMallocWorkloadTrace, RandomSize, bench::AllocationTraceKind::kRandomSize)

@@ -48,6 +48,12 @@ Allocation StreamOrderedAllocator::allocate(std::size_t bytes, std::size_t align
   return deferred_.allocate(bytes, alignment);
 }
 
+void StreamOrderedAllocator::deallocate_completed(const Allocation& allocation) {
+  HELIX_CHECK(allocation.device() == device(), ErrorCode::kInvalidArgument,
+              "StreamOrderedAllocator allocation belongs to another device");
+  deferred_.deallocate_completed(allocation);
+}
+
 void StreamOrderedAllocator::defer_deallocate(const Allocation& allocation,
                                               const cuda::Stream& release_stream) {
   HELIX_CHECK(release_stream.native_handle() != nullptr, ErrorCode::kInvalidArgument,

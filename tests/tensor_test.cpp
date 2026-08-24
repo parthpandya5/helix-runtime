@@ -77,6 +77,8 @@ TEST(StorageTest, RejectsInvalidAlignmentAndUnavailableCuda) {
   EXPECT_THROW(static_cast<void>(Storage::allocate(16, Device::cpu(), kTooSmallAlignment)), Error);
 #if !HELIX_ENABLE_CUDA
   EXPECT_THROW(static_cast<void>(Storage::allocate(16, Device::cuda())), Error);
+  EXPECT_THROW(static_cast<void>(Storage::wrap_mutable_cuda(nullptr, 0, Device::cuda(), {}, 64)),
+               Error);
 #endif
 }
 
@@ -323,6 +325,11 @@ TEST(TensorTest, MutableExternalBufferRejectsInvalidBoundsPointerOwnerAndAlignme
   const Tensor empty = Tensor::from_mutable_cpu_buffer({3, 0}, DType::kFloat32, nullptr, 0, {}, 64);
   EXPECT_EQ(empty.data(), nullptr);
   EXPECT_EQ(empty.allocated_bytes(), 0U);
+#if !HELIX_ENABLE_CUDA
+  EXPECT_THROW(static_cast<void>(Tensor::from_mutable_cuda_buffer({0}, DType::kFloat32, nullptr, 0,
+                                                                  Device::cuda(), {}, 64)),
+               Error);
+#endif
 }
 
 TEST(TensorTest, ReshapeRejectsIncompatibleElementCounts) {

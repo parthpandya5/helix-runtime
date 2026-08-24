@@ -34,9 +34,10 @@ struct DeferredAllocator::Impl {
                 "DeferredAllocator requires a non-null base allocator");
   }
 
-  [[nodiscard]] bool pending_id(std::uint64_t id) const {
-    return std::any_of(pending.begin(), pending.end(),
-                       [id](const Pending& item) { return item.allocation.id() == id; });
+  [[nodiscard]] bool pending_allocation(const Allocation& allocation) const {
+    return std::any_of(pending.begin(), pending.end(), [&allocation](const Pending& item) {
+      return item.allocation == allocation;
+    });
   }
 
   std::size_t reclaim_ready_locked() {
@@ -95,6 +96,13 @@ Allocation DeferredAllocator::allocate(std::size_t bytes, std::size_t alignment)
   return impl_->allocator->allocate(bytes, alignment);
 }
 
+void DeferredAllocator::deallocate_completed(const Allocation& allocation) {
+  std::scoped_lock lock(impl_->mutex);
+  HELIX_CHECK(!impl_->pending_allocation(allocation), ErrorCode::kInvalidArgument,
+              "DeferredAllocator cannot immediately release a pending allocation");
+  impl_->allocator->deallocate(allocation);
+}
+
 void DeferredAllocator::defer_deallocate(const Allocation& allocation,
                                          std::unique_ptr<Completion> completion) {
   std::scoped_lock lock(impl_->mutex);
@@ -102,7 +110,7 @@ void DeferredAllocator::defer_deallocate(const Allocation& allocation,
               "DeferredAllocator requires a non-null completion");
   HELIX_CHECK(impl_->allocator->owns(allocation), ErrorCode::kInvalidArgument,
               "DeferredAllocator allocation is unknown or was already freed");
-  HELIX_CHECK(!impl_->pending_id(allocation.id()), ErrorCode::kInvalidArgument,
+  HELIX_CHECK(!impl_->pending_allocation(allocation), ErrorCode::kInvalidArgument,
               "DeferredAllocator allocation is already pending reclamation");
   impl_->pending.push_back(Impl::Pending{allocation, std::move(completion)});
   ++impl_->deferred_deallocation_count;
@@ -126,12 +134,12 @@ std::size_t DeferredAllocator::release_cached() {
 
 bool DeferredAllocator::owns(const Allocation& allocation) const {
   std::scoped_lock lock(impl_->mutex);
-  return impl_->allocator->owns(allocation) && !impl_->pending_id(allocation.id());
+  return impl_->allocator->owns(allocation) && !impl_->pending_allocation(allocation);
 }
 
 bool DeferredAllocator::is_pending(const Allocation& allocation) const {
   std::scoped_lock lock(impl_->mutex);
-  return impl_->pending_id(allocation.id());
+  return impl_->pending_allocation(allocation);
 }
 
 DeferredAllocatorStats DeferredAllocator::stats() const {

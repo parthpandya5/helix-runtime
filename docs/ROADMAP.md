@@ -297,8 +297,29 @@ NVCC 12.6.85 compiles this adapter and test with warnings as errors; all 68
 hardware-independent tests pass in that build and 47 GPU tests are registered.
 There is no CUDA driver/device in the container, so the event test, GPU allocation
 latency, synchronized comparison, and `cudaMallocAsync` comparison remain pending.
-CUDA Tensor integration remains pending a complete multi-stream use-recording
-contract; the event adapter alone cannot infer outstanding work on other streams.
+General CUDA Tensor integration remains pending a complete multi-stream use-
+recording contract; the event adapter alone cannot infer outstanding work on other
+streams.
+
+Single-stream Tensor follow-up (2026-08-24):
+`allocate_cuda_tensor_on_stream` now wraps a cached device allocation in shared
+Tensor Storage, retains its allocator and one usage stream through the final view,
+then records the release event automatically. The allocation stays pending and
+unavailable for reuse until that event completes. Constructor rollback returns an
+unused block immediately; a non-throwing destructor falls back to stream
+synchronization if event deferral fails. This is an explicit one-stream contract,
+not a claim of arbitrary record-stream tracking.
+
+Three new hardware-gated tests cover final-view lifetime, a host-gated stream that
+prevents premature address reuse, post-event reuse, allocator/stream ownership,
+zero work, shape/size/alignment/owner failures, and moved-from streams. During the
+same audit, pending lookup changed from local numeric ID comparison to exact
+allocator/generation-tagged handle identity, eliminating cross-pool ID collisions.
+Direct and pooled Tensor lifecycle benchmarks perform ten warmups and compare
+complete host lifecycle cost at 1, 1,024, and 1,048,576 Float32 elements. NVCC
+12.6.85 compiles all paths with warnings as errors; the CUDA suite passes 185 host
+tests and registers 64 GPU tests (249 total), all skipped without a driver/device.
+No lifecycle latency or event-correctness result is claimed.
 
 ## Phase D: transformer primitives and memory
 
@@ -490,7 +511,7 @@ workspace.
 
 NVCC 12.6.85 compiled the implementation, tests, and benchmarks with line
 information and warnings as errors. The CUDA-on suite passes 185 host tests and
-registers 61 GPU tests (246 total), all correctly skipped without a driver/device.
+registers 64 GPU tests (249 total), all correctly skipped without a driver/device.
 Static `sm_52` inspection reports 31/29 registers per thread for the paged
 score/value kernels with no shared/local memory or spills. These are compiler facts,
 not execution evidence. Runtime correctness, event timing, coalescing/occupancy

@@ -40,6 +40,28 @@ void validate_external_cpu_storage(const void* data, std::size_t size_bytes,
   }
 }
 
+#if HELIX_ENABLE_CUDA
+void validate_external_cuda_storage(const void* data, std::size_t size_bytes, Device device,
+                                    const std::shared_ptr<const void>& owner,
+                                    std::size_t alignment) {
+  HELIX_CHECK(device.is_cuda(), ErrorCode::kInvalidArgument,
+              "mutable CUDA storage requires a CUDA device");
+  HELIX_CHECK(is_power_of_two(alignment), ErrorCode::kInvalidArgument,
+              "storage alignment must be a non-zero power of two");
+  HELIX_CHECK(alignment >= alignof(std::max_align_t), ErrorCode::kInvalidArgument,
+              "storage alignment must be at least alignof(max_align_t)");
+  HELIX_CHECK((size_bytes == 0) == (data == nullptr), ErrorCode::kInvalidArgument,
+              "mutable CUDA storage requires a null pointer exactly when its size is zero");
+  HELIX_CHECK(size_bytes == 0 || owner != nullptr, ErrorCode::kInvalidArgument,
+              "non-empty mutable CUDA storage requires a lifetime owner");
+  if (data != nullptr) {
+    HELIX_CHECK(reinterpret_cast<std::uintptr_t>(data) % alignment == 0,
+                ErrorCode::kInvalidArgument,
+                "mutable CUDA storage pointer does not satisfy its declared alignment");
+  }
+}
+#endif
+
 } // namespace
 
 Storage::Storage(const void* data, std::size_t size_bytes, Device device, std::size_t alignment,
@@ -117,6 +139,24 @@ std::shared_ptr<Storage> Storage::wrap_mutable_cpu(void* data, std::size_t size_
   validate_external_cpu_storage(data, size_bytes, immutable_owner, alignment, "mutable");
   return std::shared_ptr<Storage>(new Storage(data, size_bytes, Device::cpu(), alignment, false,
                                               ReleaseKind::kExternal, std::move(immutable_owner)));
+}
+
+std::shared_ptr<Storage> Storage::wrap_mutable_cuda(void* data, std::size_t size_bytes,
+                                                    Device device, std::shared_ptr<void> owner,
+                                                    std::size_t alignment) {
+#if HELIX_ENABLE_CUDA
+  std::shared_ptr<const void> immutable_owner = std::move(owner);
+  validate_external_cuda_storage(data, size_bytes, device, immutable_owner, alignment);
+  return std::shared_ptr<Storage>(new Storage(data, size_bytes, device, alignment, false,
+                                              ReleaseKind::kExternal, std::move(immutable_owner)));
+#else
+  static_cast<void>(data);
+  static_cast<void>(size_bytes);
+  static_cast<void>(device);
+  static_cast<void>(owner);
+  static_cast<void>(alignment);
+  throw_error(ErrorCode::kUnsupported, "external CUDA storage requires a CUDA-enabled build");
+#endif
 }
 
 void* Storage::mutable_data() {

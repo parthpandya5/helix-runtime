@@ -20,6 +20,12 @@ public:
   [[nodiscard]] static std::shared_ptr<Storage>
   wrap_mutable_cpu(void* data, std::size_t size_bytes, std::shared_ptr<void> owner,
                    std::size_t alignment = kDefaultStorageAlignment);
+  // Low-level CUDA interop: the caller must guarantee that data addresses at
+  // least size_bytes on device and remains valid through owner. This function
+  // validates metadata and alignment but does not query pointer provenance.
+  [[nodiscard]] static std::shared_ptr<Storage>
+  wrap_mutable_cuda(void* data, std::size_t size_bytes, Device device, std::shared_ptr<void> owner,
+                    std::size_t alignment = kDefaultStorageAlignment);
 
   ~Storage();
 

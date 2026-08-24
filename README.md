@@ -30,8 +30,9 @@ mapping lifetime and enforced immutable Tensor views; the portable copied loader
 remains available.
 An independent opt-in CPU storage bridge now gives allocator-backed Tensors RAII
 ownership: every shallow copy/view retains the exact pool allocation and the
-allocator itself until the last shared Storage handle expires. CUDA pooling remains
-gated on complete stream-use tracking.
+allocator itself until the last shared Storage handle expires. CUDA builds also
+provide an opt-in single-stream bridge whose final Storage owner records a release
+event; automatic arbitrary multi-stream use tracking remains pending.
 M22 now includes the measured block-aligned sharing primitive, a bounded exact-
 content prefix index, persistent LRU anchors, and opt-in reuse in the CPU runtime.
 The repository
@@ -58,8 +59,8 @@ driver/device. The M8 stream-ordered allocator and M9 block-reduced RMSNorm,
 grid-stride SwiGLU, adjacent-pair RoPE, and projection adapter are also
 compile-validated, as are the M10 contiguous and M13 paged three-stage attention
 baselines. None is runtime-validated on a GPU. The CUDA-on build passes 185
-hardware-independent tests and explicitly skips 61 GPU tests without a
-driver/device (246 registered tests total). Its container lacks Python/NumPy, so
+hardware-independent tests and explicitly skips 64 GPU tests without a
+driver/device (249 registered tests total). Its container lacks Python/NumPy, so
 the separate converter integration test is not registered there; it passes in all
 three native CPU configurations.
 
@@ -286,8 +287,9 @@ fragmentation statistics. `DeferredAllocator`
 keeps logically freed allocations active until a completion object reports ready;
 `StreamOrderedAllocator` implements that completion with timing-disabled CUDA
 events recorded on an explicit release stream. The allocator/deferred metadata
-plus the CPU Tensor ownership bridge pass 21 focused CPU and sanitizer tests. CUDA
-adapters and native-CUDA comparison fixtures compile, but have not run on a GPU.
+plus the CPU Tensor ownership bridge pass 21 focused CPU and sanitizer tests. Six
+CUDA allocator/ownership tests and native-CUDA comparison fixtures compile, but
+have not run on a GPU.
 
 `allocate_cpu_tensor` is an explicit pooled factory. It stores the rounded block
 capacity in `Tensor::allocated_bytes()`, retains a shared allocator plus the exact
@@ -296,10 +298,12 @@ releases Storage. Zero-sized tensors create no pool allocation, and invalid shap
 alignment, OOM, or device requests leave no active handle. Default CPU Tensor
 factories and deep clones continue to use direct Storage allocation.
 
-Allocator-backed CUDA Tensor storage remains unavailable. Tensor does not yet
-record every stream that uses its storage, so it cannot prove that a chosen release
-event orders after all outstanding work. Design, measured host baselines, stream-
-ordering contract, and limitations are in
+`allocate_cuda_tensor_on_stream` is an explicit pooled CUDA factory. It binds the
+allocation lifetime to one shared stream and defers the exact block behind a CUDA
+event when the final Tensor/view releases Storage. This is safe only when every use
+is ordered on that stream; Tensor still has no automatic cross-stream ledger.
+Design, measured host baselines, compile-only CUDA benchmark contracts, and
+limitations are in
 [`docs/MEMORY_ALLOCATOR.md`](docs/MEMORY_ALLOCATOR.md).
 
 ## Attention
@@ -542,9 +546,9 @@ validation/roadmap work. CPU prefix reuse is exact-content, block-aligned, bound
 and opt-in; it stores only one maximum reusable prefix per completed prompt, uses
 an engine-local namespace, and does not cache next-token logits or run on the GPU.
 Partial-page sharing, model-global cache namespaces, and request preemption remain
-future work. CPU Tensor allocator ownership is opt-in and is not wired into the
-runtime; CUDA Tensor pooling remains pending complete stream-use tracking. Float16
-has no arithmetic path yet. Tensor
+future work. CPU and single-stream CUDA Tensor allocator ownership are opt-in and
+not wired into the runtime; arbitrary multi-stream pooling remains pending use
+tracking. Float16 has no arithmetic path yet. Tensor
 execution is contiguous-only; broadcasting, slicing, and general strided kernels are intentionally
 deferred. The mapped model path is POSIX/little-endian/IEEE-754 only, requires the
 source inode not be modified while a model lives, and has no cold-storage or RSS

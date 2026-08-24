@@ -408,6 +408,39 @@ Command:
   --benchmark_enable_random_interleaving=true
 ```
 
+## M8 stream-bound CUDA Tensor lifecycle gate — pending NVIDIA hardware
+
+The compile-validated paired fixture measures complete host-visible Tensor
+construction/destruction rather than kernel execution:
+
+- `BM_CudaTensorDirectLifecycle` uses default CUDA Tensor Storage, hence one
+  `cudaMalloc`/`cudaFree` pair per iteration;
+- `BM_CudaTensorHelixStreamBoundLifecycle` allocates from one warmed
+  `StreamOrderedAllocator`, destroys the final owner to record a release event, and
+  blocks until that event has been reclaimed in every iteration.
+
+Both paths use Float32 shapes of 1, 1,024, and 1,048,576 elements, touch no payload
+bytes, perform ten setup warmups, and report real host time. The pool, stream, and
+initial 64 MiB segment acquisition are outside timed iterations; Tensor metadata,
+shared-owner construction, best-fit lookup, event create/record/query/wait/destroy,
+and reclamation are inside the pooled boundary. Counters record logical bytes,
+retained bytes, reuse count, and upstream allocation count. Because no payload is
+touched, bytes-per-second would be meaningless and is not reported.
+
+```bash
+ctest --test-dir build-cuda -L gpu --output-on-failure
+./build-cuda/benchmarks/helix_benchmarks \
+  --benchmark_filter='BM_CudaTensor(Direct|HelixStreamBound)Lifecycle' \
+  --benchmark_repetitions=15 \
+  --benchmark_enable_random_interleaving=true
+```
+
+The synchronized boundary intentionally answers a narrow question: can cached
+Tensor lifecycle amortize native allocation after paying explicit safe-completion
+cost? It does not measure asynchronous throughput, a multi-stream allocator, or
+payload bandwidth. The fixture has not executed here, so there is no result row or
+optimization claim.
+
 ## M9 CPU transformer-primitive baseline — 2026-08-20
 
 Environment:

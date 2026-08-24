@@ -41,6 +41,8 @@ public:
     return device_;
   }
 
+  friend bool operator==(const Allocation&, const Allocation&) noexcept = default;
+
 private:
   friend class HelixAllocator;
 

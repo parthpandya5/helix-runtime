@@ -10,7 +10,7 @@ built and then skipped because the container had no NVIDIA driver/device.
 
 As later subsystems were added, the macOS CPU-only Debug, Release, and ASan/UBSan
 configurations reached 186 passing tests. The current CUDA-on build passes 185
-hardware-independent tests and registers 61 GPU tests (246 total), all skipped
+hardware-independent tests and registers 64 GPU tests (249 total), all skipped
 without a device; its container omits the separate Python converter test. CUDA
 correctness, resource-leak, and timing behavior remains pending a physical NVIDIA
 GPU.
@@ -116,8 +116,9 @@ compute-sanitizer --tool memcheck ./build-cuda/tests/helix_cuda_runtime_tests
 
 - No GPU runtime test has run in the current environment.
 - No pinned host allocator exists yet.
-- The allocator cache is not integrated with Tensor because multi-stream storage-use
-  tracking is not implemented yet; its event adapter is compile-only validated.
+- An opt-in allocator-backed Tensor bridge exists for an explicit single retained
+  stream; automatic multi-stream storage-use tracking is not implemented, and the
+  event path is compile-only validated.
 - Tensor transfers are synchronous at the high-level API.
 - Peer copies require runtime/driver support and have not been hardware-validated.
 - Destructor failures can only be logged; callers needing explicit cleanup status

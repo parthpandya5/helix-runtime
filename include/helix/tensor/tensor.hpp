@@ -36,6 +36,12 @@ public:
   from_mutable_cpu_buffer(Shape shape, DType dtype, void* data, std::size_t storage_bytes,
                           std::shared_ptr<void> owner,
                           std::size_t alignment = kDefaultStorageAlignment);
+  // Low-level CUDA interop with the same pointer-provenance contract as
+  // Storage::wrap_mutable_cuda. Prefer a subsystem-specific owning factory.
+  [[nodiscard]] static Tensor
+  from_mutable_cuda_buffer(Shape shape, DType dtype, void* data, std::size_t storage_bytes,
+                           Device device, std::shared_ptr<void> owner,
+                           std::size_t alignment = kDefaultStorageAlignment);
 
   [[nodiscard]] const Shape& shape() const noexcept {
     return shape_;

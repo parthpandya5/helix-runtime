@@ -92,6 +92,20 @@ Tensor Tensor::from_mutable_cpu_buffer(Shape shape, DType dtype, void* data,
   return Tensor(std::move(shape), std::move(strides), dtype, Device::cpu(), std::move(storage), 0);
 }
 
+Tensor Tensor::from_mutable_cuda_buffer(Shape shape, DType dtype, void* data,
+                                        std::size_t storage_bytes, Device device,
+                                        std::shared_ptr<void> owner, std::size_t alignment) {
+  HELIX_CHECK(device.is_cuda(), ErrorCode::kInvalidArgument,
+              "mutable CUDA Tensor buffer requires a CUDA device");
+  const std::size_t logical_bytes = checked_nbytes(shape, dtype);
+  HELIX_CHECK(storage_bytes >= logical_bytes, ErrorCode::kOutOfRange,
+              "mutable CUDA buffer is smaller than the Tensor logical byte count");
+  auto storage =
+      Storage::wrap_mutable_cuda(data, storage_bytes, device, std::move(owner), alignment);
+  auto strides = contiguous_strides(shape);
+  return Tensor(std::move(shape), std::move(strides), dtype, device, std::move(storage), 0);
+}
+
 bool Tensor::is_contiguous() const {
   return has_contiguous_strides(shape_, strides_);
 }

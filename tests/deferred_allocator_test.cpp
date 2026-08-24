@@ -97,6 +97,12 @@ TEST(DeferredAllocatorTest, RejectsNullUnknownAndDuplicateDeferrals) {
   auto base = make_allocator();
   DeferredAllocator allocator(base);
   const Allocation allocation = allocator.allocate(64);
+  auto foreign_base = make_allocator();
+  const Allocation foreign = foreign_base->allocate(64);
+  EXPECT_EQ(foreign.id(), allocation.id());
+  EXPECT_NE(foreign, allocation);
+  EXPECT_FALSE(allocator.is_pending(foreign));
+  EXPECT_THROW(allocator.deallocate_completed(foreign), Error);
   EXPECT_THROW(allocator.defer_deallocate(allocation, nullptr), Error);
   EXPECT_THROW(allocator.defer_deallocate(Allocation{}, std::make_unique<ManualCompletion>(
                                                             std::make_shared<CompletionState>())),
@@ -104,12 +110,18 @@ TEST(DeferredAllocatorTest, RejectsNullUnknownAndDuplicateDeferrals) {
 
   auto state = std::make_shared<CompletionState>();
   allocator.defer_deallocate(allocation, std::make_unique<ManualCompletion>(state));
+  EXPECT_THROW(allocator.deallocate_completed(allocation), Error);
   EXPECT_THROW(allocator.defer_deallocate(allocation, std::make_unique<ManualCompletion>(state)),
                Error);
   state->ready = true;
   EXPECT_EQ(allocator.reclaim_ready(), 1U);
   EXPECT_THROW(allocator.defer_deallocate(allocation, std::make_unique<ManualCompletion>(state)),
                Error);
+
+  const Allocation completed = allocator.allocate(64);
+  allocator.deallocate_completed(completed);
+  EXPECT_FALSE(allocator.owns(completed));
+  foreign_base->deallocate(foreign);
 }
 
 TEST(DeferredAllocatorTest, CompletionFailureLeavesPendingStateIntact) {

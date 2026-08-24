@@ -110,9 +110,11 @@ users are ordered complete creates use-after-free-style corruption on the device
 `DeferredAllocator` therefore retains a logically freed block behind a completion
 object. `StreamOrderedAllocator` records a CUDA event on the explicit release
 stream and only makes the block reusable after the event completes. This is safe
-only if that stream is ordered after every use; Tensor does not yet track arbitrary
-cross-stream use, so CUDA Tensor allocator integration remains pending. The CPU
-Tensor bridge is safe precisely because host Tensor operations have no asynchronous
+only if that stream is ordered after every use. Helix's opt-in
+`allocate_cuda_tensor_on_stream` bridge retains one stream and records the event
+when the final Tensor/view dies. It is safe for that stated single-stream contract,
+but Tensor does not yet track arbitrary cross-stream use. The CPU Tensor bridge is
+safe without this machinery because host Tensor operations have no asynchronous
 device work to outlive the final owner.
 
 ## What are CUDA streams?
