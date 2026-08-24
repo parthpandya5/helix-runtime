@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
+#include <cstdint>
 #include <cuda_runtime.h>
 #include <limits>
 #include <sstream>
@@ -81,6 +82,21 @@ __global__ void swiglu_kernel(const float* gate, const float* up, float* output,
   }
 }
 
+__global__ void transpose_outer_axes_kernel(const float* input, float* output,
+                                            std::size_t source_outer, std::size_t source_inner,
+                                            std::size_t width, std::size_t vectors) {
+  for (std::size_t output_vector = static_cast<std::size_t>(blockIdx.x); output_vector < vectors;
+       output_vector += static_cast<std::size_t>(gridDim.x)) {
+    const std::size_t destination_outer = output_vector / source_outer;
+    const std::size_t destination_inner = output_vector % source_outer;
+    const std::size_t input_vector = destination_inner * source_inner + destination_outer;
+    for (std::size_t coordinate = static_cast<std::size_t>(threadIdx.x); coordinate < width;
+         coordinate += static_cast<std::size_t>(blockDim.x)) {
+      output[output_vector * width + coordinate] = input[input_vector * width + coordinate];
+    }
+  }
+}
+
 __global__ void rope_kernel(const float* input, const float* cosine, const float* sine,
                             float* output, std::size_t pair_tasks, std::size_t vectors_per_token,
                             std::size_t pairs) {
@@ -134,8 +150,18 @@ void require_stream(const Tensor& input, const Stream& stream, std::string_view 
 
 void require_no_alias(const Tensor& input, const Tensor& output, std::string_view input_name,
                       std::string_view operation) {
+  if (input.nbytes() == 0 || output.nbytes() == 0 || input.device() != output.device()) {
+    return;
+  }
+  const auto input_begin = reinterpret_cast<std::uintptr_t>(input.data());
+  const auto output_begin = reinterpret_cast<std::uintptr_t>(output.data());
+  const auto maximum = std::numeric_limits<std::uintptr_t>::max();
+  const bool invalid_range =
+      input_begin > maximum - input.nbytes() || output_begin > maximum - output.nbytes();
+  const bool overlaps = invalid_range || (input_begin < output_begin + output.nbytes() &&
+                                          output_begin < input_begin + input.nbytes());
   HELIX_CHECK(
-      input.nbytes() == 0 || input.data() != output.data(), ErrorCode::kInvalidArgument,
+      !overlaps, ErrorCode::kInvalidArgument,
       tensor_error(operation, "output", std::string("must not alias ") + std::string(input_name)));
 }
 
@@ -155,6 +181,39 @@ void check_launch(std::string_view kernel_name) {
   std::ostringstream context;
   context << "launching " << kernel_name;
   HELIX_CUDA_CHECK_CONTEXT(cudaGetLastError(), context.str());
+}
+
+Shape transposed_outer_shape(const Tensor& input, std::string_view operation) {
+  require_cuda_float_tensor(input, "input", operation);
+  HELIX_CHECK(input.rank() == 3, ErrorCode::kInvalidArgument,
+              tensor_error(operation, "input", "must have rank three"));
+  return Shape{input.shape()[1], input.shape()[0], input.shape()[2]};
+}
+
+void transpose_outer_axes_out(const Tensor& input, Tensor& output, const Stream& stream,
+                              std::string_view operation) {
+  const Shape output_shape = transposed_outer_shape(input, operation);
+  require_cuda_float_tensor(output, "output", operation);
+  HELIX_CHECK(output.shape() == output_shape, ErrorCode::kInvalidArgument,
+              tensor_error(operation, "output", "must swap the input's first two dimensions"));
+  require_same_device(output, input, "output", operation);
+  require_stream(input, stream, operation);
+  require_no_alias(input, output, "input", operation);
+  if (input.numel() == 0) {
+    return;
+  }
+
+  const auto source_outer = static_cast<std::size_t>(input.shape()[0]);
+  const auto source_inner = static_cast<std::size_t>(input.shape()[1]);
+  const auto width = static_cast<std::size_t>(input.shape()[2]);
+  HELIX_ASSERT(source_outer != 0 && source_inner != 0 && width != 0,
+               "nonempty layout transform must have nonzero dimensions");
+  const std::size_t vectors = input.numel() / width;
+  DeviceGuard guard(stream.device_index());
+  transpose_outer_axes_kernel<<<block_count(vectors, true), kThreadsPerBlock, 0,
+                                stream.native_handle()>>>(
+      input.data_as<float>(), output.data_as<float>(), source_outer, source_inner, width, vectors);
+  check_launch("transpose_outer_axes_kernel");
 }
 
 } // namespace
@@ -222,6 +281,30 @@ void swiglu_out(const Tensor& gate, const Tensor& up, Tensor& output, const Stre
 Tensor swiglu(const Tensor& gate, const Tensor& up, const Stream& stream) {
   Tensor output = Tensor::empty(gate.shape(), DType::kFloat32, gate.device());
   swiglu_out(gate, up, output, stream);
+  return output;
+}
+
+void token_heads_to_head_major_out(const Tensor& input, Tensor& output, const Stream& stream) {
+  transpose_outer_axes_out(input, output, stream, "cuda::kernels::token_heads_to_head_major_out");
+}
+
+Tensor token_heads_to_head_major(const Tensor& input, const Stream& stream) {
+  const Shape output_shape =
+      transposed_outer_shape(input, "cuda::kernels::token_heads_to_head_major");
+  Tensor output = Tensor::empty(output_shape, DType::kFloat32, input.device());
+  token_heads_to_head_major_out(input, output, stream);
+  return output;
+}
+
+void head_major_to_token_heads_out(const Tensor& input, Tensor& output, const Stream& stream) {
+  transpose_outer_axes_out(input, output, stream, "cuda::kernels::head_major_to_token_heads_out");
+}
+
+Tensor head_major_to_token_heads(const Tensor& input, const Stream& stream) {
+  const Shape output_shape =
+      transposed_outer_shape(input, "cuda::kernels::head_major_to_token_heads");
+  Tensor output = Tensor::empty(output_shape, DType::kFloat32, input.device());
+  head_major_to_token_heads_out(input, output, stream);
   return output;
 }
 

@@ -96,6 +96,16 @@ set_tests_properties(
   PROPERTIES LABELS "benchmark;kernels;model;smoke")
 
 add_test(
+  NAME benchmark.cpu_head_layout_smoke
+  COMMAND helix_benchmarks
+          --benchmark_filter=BM_CpuTokenHeadsToHeadMajor/7/3/37$
+          --benchmark_min_time=1x
+          --benchmark_repetitions=1)
+set_tests_properties(
+  benchmark.cpu_head_layout_smoke
+  PROPERTIES LABELS "benchmark;kernels;model;smoke")
+
+add_test(
   NAME benchmark.model_load_smoke
   COMMAND helix_benchmarks
           "--benchmark_filter=BM_LlamaModelLoadFromFile/(Copied|ReadOnlyMapped)/hidden:32/intermediate:64/layers:2/heads:4/tokens:7/vocabulary:128$"

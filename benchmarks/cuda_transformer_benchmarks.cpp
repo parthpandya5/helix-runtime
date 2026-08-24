@@ -1,3 +1,4 @@
+#include "helix/kernels/cpu/reference.hpp"
 #include "helix/kernels/cuda/transformer.hpp"
 #include "helix/runtime/cuda/device.hpp"
 #include "helix/runtime/cuda/event.hpp"
@@ -128,9 +129,88 @@ void BM_CudaRope(benchmark::State& state) {
   record_elements(state, state.range(0) * state.range(1) * state.range(2), 3);
 }
 
+template <bool TokenToHead> void run_cuda_head_layout(benchmark::State& state) {
+  if (!require_runtime(state)) {
+    return;
+  }
+  set_device(0);
+  const auto tokens = static_cast<Dimension>(state.range(0));
+  const auto heads = static_cast<Dimension>(state.range(1));
+  const auto head_dimension = static_cast<Dimension>(state.range(2));
+  const Tensor token_input =
+      Tensor::random_uniform({tokens, heads, head_dimension}, 1'501, -2.0F, 2.0F);
+  const Tensor head_input = helix::cpu::token_heads_to_head_major(token_input);
+  const Tensor input_host = TokenToHead ? token_input : head_input;
+  const Tensor expected = TokenToHead ? head_input : token_input;
+  const Tensor input = input_host.to(Device::cuda(0));
+  Tensor output = Tensor::empty(expected.shape(), DType::kFloat32, Device::cuda(0));
+  Stream stream;
+  const auto execute = [&input, &output, &stream]() {
+    if constexpr (TokenToHead) {
+      token_heads_to_head_major_out(input, output, stream);
+    } else {
+      head_major_to_token_heads_out(input, output, stream);
+    }
+  };
+  for (int launch = 0; launch < kWarmupLaunches; ++launch) {
+    execute();
+  }
+  stream.synchronize();
+  const auto output_matches_or_skip = [&state, &output, &expected]() {
+    const Tensor actual = output.to(Device::cpu());
+    for (std::size_t index = 0; index < expected.numel(); ++index) {
+      if (actual.data_as<float>()[index] != expected.data_as<float>()[index]) {
+        state.SkipWithError("CUDA head-layout output does not match the CPU oracle");
+        return false;
+      }
+    }
+    return true;
+  };
+  if (!output_matches_or_skip()) {
+    return;
+  }
+
+  Event start;
+  Event stop;
+  for ([[maybe_unused]] auto iteration : state) {
+    start.record(stream);
+    execute();
+    stop.record(stream);
+    stop.synchronize();
+    state.SetIterationTime(static_cast<double>(elapsed_time_ms(start, stop)) / 1000.0);
+  }
+  if (!output_matches_or_skip()) {
+    return;
+  }
+  record_elements(state, state.range(0) * state.range(1) * state.range(2), 2);
+  state.counters["tokens"] = static_cast<double>(state.range(0));
+  state.counters["heads"] = static_cast<double>(state.range(1));
+  state.counters["head_dimension"] = static_cast<double>(state.range(2));
+}
+
+void BM_CudaTokenHeadsToHeadMajor(benchmark::State& state) {
+  run_cuda_head_layout<true>(state);
+}
+
+void BM_CudaHeadMajorToTokenHeads(benchmark::State& state) {
+  run_cuda_head_layout<false>(state);
+}
+
 BENCHMARK(BM_CudaRmsNorm)->Args({1, 4096})->Args({32, 4096})->UseManualTime();
 BENCHMARK(BM_CudaSwiGlu)->Arg(4096)->Arg(32 * 4096)->UseManualTime();
 BENCHMARK(BM_CudaRope)->Args({1, 32, 128})->Args({128, 32, 128})->UseManualTime();
+BENCHMARK(BM_CudaTokenHeadsToHeadMajor)
+    ->Args({1, 32, 128})
+    ->Args({128, 32, 128})
+    ->Args({7, 3, 37})
+    ->Args({257, 13, 65})
+    ->UseManualTime();
+BENCHMARK(BM_CudaHeadMajorToTokenHeads)
+    ->Args({1, 32, 128})
+    ->Args({128, 32, 128})
+    ->Args({7, 3, 37})
+    ->Args({257, 13, 65})
+    ->UseManualTime();
 
 } // namespace
 } // namespace helix::cuda::kernels

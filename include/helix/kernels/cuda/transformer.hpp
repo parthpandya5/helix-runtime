@@ -14,6 +14,18 @@ void rms_norm_out(const Tensor& input, const Tensor& weight, float epsilon, Tens
 void swiglu_out(const Tensor& gate, const Tensor& up, Tensor& output, const Stream& stream);
 [[nodiscard]] Tensor swiglu(const Tensor& gate, const Tensor& up, const Stream& stream);
 
+// Reorders contiguous Float32 [tokens, heads, head_dimension] storage into
+// [heads, tokens, head_dimension]. The launch is asynchronous; input and output
+// logical ranges must not overlap.
+void token_heads_to_head_major_out(const Tensor& input, Tensor& output, const Stream& stream);
+[[nodiscard]] Tensor token_heads_to_head_major(const Tensor& input, const Stream& stream);
+
+// Reorders contiguous Float32 [heads, tokens, head_dimension] storage into
+// [tokens, heads, head_dimension]. The launch is asynchronous; input and output
+// logical ranges must not overlap.
+void head_major_to_token_heads_out(const Tensor& input, Tensor& output, const Stream& stream);
+[[nodiscard]] Tensor head_major_to_token_heads(const Tensor& input, const Stream& stream);
+
 // Applies adjacent-pair rotary embedding to the complete last dimension. Input is
 // [tokens, ..., head_dimension]; cosine/sine are [tokens, head_dimension / 2].
 void rope_out(const Tensor& input, const Tensor& cosine, const Tensor& sine, Tensor& output,

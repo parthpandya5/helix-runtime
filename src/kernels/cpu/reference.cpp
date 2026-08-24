@@ -138,6 +138,37 @@ void require_distinct_output(const Tensor& input, const Tensor& output, std::str
   }
 }
 
+Shape transposed_outer_shape(const Tensor& input, std::string_view operation) {
+  require_reference_tensor(input, "input", operation);
+  HELIX_CHECK(input.rank() == 3, ErrorCode::kInvalidArgument,
+              tensor_contract_message(operation, "input", "must have rank three"));
+  return Shape{input.shape()[1], input.shape()[0], input.shape()[2]};
+}
+
+void transpose_outer_axes_out(const Tensor& input, Tensor& output, std::string_view operation) {
+  const Shape output_shape = transposed_outer_shape(input, operation);
+  require_output(output, output_shape, operation);
+  require_distinct_output(input, output, operation, "input");
+  if (input.numel() == 0) {
+    return;
+  }
+
+  const auto source_outer = static_cast<std::size_t>(input.shape()[0]);
+  const auto source_inner = static_cast<std::size_t>(input.shape()[1]);
+  const auto width = static_cast<std::size_t>(input.shape()[2]);
+  const auto* source = input.data_as<float>();
+  auto* destination = output.data_as<float>();
+  for (std::size_t destination_outer = 0; destination_outer < source_inner; ++destination_outer) {
+    for (std::size_t destination_inner = 0; destination_inner < source_outer; ++destination_inner) {
+      const std::size_t source_offset =
+          (destination_inner * source_inner + destination_outer) * width;
+      const std::size_t destination_offset =
+          (destination_outer * source_outer + destination_inner) * width;
+      std::copy_n(source + source_offset, width, destination + destination_offset);
+    }
+  }
+}
+
 } // namespace
 
 void add_out(const Tensor& lhs, const Tensor& rhs, Tensor& output) {
@@ -431,6 +462,28 @@ Tensor embedding_lookup(const Tensor& token_ids, const Tensor& table) {
   Tensor output =
       Tensor::empty({token_ids.shape()[0], table.shape()[1]}, DType::kFloat32, Device::cpu());
   embedding_lookup_out(token_ids, table, output);
+  return output;
+}
+
+void token_heads_to_head_major_out(const Tensor& input, Tensor& output) {
+  transpose_outer_axes_out(input, output, "cpu::token_heads_to_head_major_out");
+}
+
+Tensor token_heads_to_head_major(const Tensor& input) {
+  const Shape output_shape = transposed_outer_shape(input, "cpu::token_heads_to_head_major");
+  Tensor output = Tensor::empty(output_shape, DType::kFloat32, Device::cpu());
+  token_heads_to_head_major_out(input, output);
+  return output;
+}
+
+void head_major_to_token_heads_out(const Tensor& input, Tensor& output) {
+  transpose_outer_axes_out(input, output, "cpu::head_major_to_token_heads_out");
+}
+
+Tensor head_major_to_token_heads(const Tensor& input) {
+  const Shape output_shape = transposed_outer_shape(input, "cpu::head_major_to_token_heads");
+  Tensor output = Tensor::empty(output_shape, DType::kFloat32, Device::cpu());
+  head_major_to_token_heads_out(input, output);
   return output;
 }
 

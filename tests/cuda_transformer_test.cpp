@@ -1,11 +1,13 @@
 #include "helix/kernels/cpu/reference.hpp"
 #include "helix/kernels/cuda/transformer.hpp"
 #include "helix/runtime/cuda/device.hpp"
+#include "helix/runtime/cuda/memory.hpp"
 
 #include <array>
 #include <cmath>
 #include <cstddef>
 #include <gtest/gtest.h>
+#include <memory>
 #include <utility>
 #include <vector>
 
@@ -89,6 +91,64 @@ TEST_F(CudaTransformerTest, SwiGluMatchesCpuAtBoundaryAndNonBlockSizes) {
     stream.synchronize();
     expect_close(gate, expected, 3.0e-6F);
   }
+}
+
+TEST_F(CudaTransformerTest, HeadLayoutRoundTripsCpuOracleAcrossOddAndEmptyShapes) {
+  struct Shape3 final {
+    Dimension tokens;
+    Dimension heads;
+    Dimension head_dimension;
+  };
+  constexpr std::array kShapes{Shape3{0, 3, 5}, Shape3{1, 1, 1}, Shape3{3, 5, 7},
+                               Shape3{17, 13, 37}, Shape3{257, 3, 5}};
+  Stream stream;
+  for (const Shape3 shape : kShapes) {
+    const Tensor input_host =
+        Tensor::random_uniform({shape.tokens, shape.heads, shape.head_dimension}, 3'501);
+    const Tensor expected_head_major = cpu::token_heads_to_head_major(input_host);
+    const Tensor input = input_host.to(Device::cuda(0));
+
+    const Tensor head_major = token_heads_to_head_major(input, stream);
+    stream.synchronize();
+    expect_close(head_major, expected_head_major, 0.0F);
+
+    const Tensor round_trip = head_major_to_token_heads(head_major, stream);
+    stream.synchronize();
+    expect_close(round_trip, input_host, 0.0F);
+  }
+}
+
+TEST_F(CudaTransformerTest, HeadLayoutRejectsMetadataOverlapAndMovedStreamErrors) {
+  Stream stream;
+  const Tensor input = Tensor::zeros({2, 3, 5}, DType::kFloat32, Device::cuda(0));
+  Tensor output = Tensor::zeros({3, 2, 5}, DType::kFloat32, Device::cuda(0));
+  EXPECT_THROW(token_heads_to_head_major_out(
+                   Tensor::zeros({2, 15}, DType::kFloat32, Device::cuda(0)), output, stream),
+               Error);
+  EXPECT_THROW(token_heads_to_head_major_out(
+                   Tensor::zeros({2, 3, 5}, DType::kUInt32, Device::cuda(0)), output, stream),
+               Error);
+  Tensor wrong_shape = Tensor::zeros({2, 3, 5}, DType::kFloat32, Device::cuda(0));
+  EXPECT_THROW(token_heads_to_head_major_out(input, wrong_shape, stream), Error);
+  EXPECT_THROW(token_heads_to_head_major_out(Tensor::zeros({2, 3, 5}), output, stream), Error);
+
+  Tensor exact_alias = Tensor::zeros({2, 2, 3}, DType::kFloat32, Device::cuda(0));
+  EXPECT_THROW(token_heads_to_head_major_out(exact_alias, exact_alias, stream), Error);
+
+  const auto allocation = std::make_shared<Buffer>(1'536, 0);
+  const Tensor partial_input = Tensor::from_mutable_cuda_buffer(
+      {2, 2, 64}, DType::kFloat32, allocation->data(), 1'024, Device::cuda(0), allocation, 256);
+  Tensor partial_output = Tensor::from_mutable_cuda_buffer(
+      {2, 2, 64}, DType::kFloat32,
+      static_cast<void*>(static_cast<std::byte*>(allocation->data()) + 512), 1'024, Device::cuda(0),
+      allocation, 256);
+  EXPECT_THROW(token_heads_to_head_major_out(partial_input, partial_output, stream), Error);
+  EXPECT_THROW(head_major_to_token_heads_out(partial_input, partial_output, stream), Error);
+
+  Stream moved_to = std::move(stream);
+  EXPECT_THROW(token_heads_to_head_major_out(input, output, stream), Error);
+  token_heads_to_head_major_out(input, output, moved_to);
+  moved_to.synchronize();
 }
 
 TEST_F(CudaTransformerTest, RopeMatchesCpuForOddPairTaskCountsAndInPlace) {

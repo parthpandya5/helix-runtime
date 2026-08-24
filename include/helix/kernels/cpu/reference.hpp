@@ -39,6 +39,18 @@ void swiglu_out(const Tensor& gate, const Tensor& up, Tensor& output);
 void embedding_lookup_out(const Tensor& token_ids, const Tensor& table, Tensor& output);
 [[nodiscard]] Tensor embedding_lookup(const Tensor& token_ids, const Tensor& table);
 
+// Reorders contiguous Float32 [tokens, heads, head_dimension] storage into
+// [heads, tokens, head_dimension]. Input and output logical ranges must not
+// overlap.
+void token_heads_to_head_major_out(const Tensor& input, Tensor& output);
+[[nodiscard]] Tensor token_heads_to_head_major(const Tensor& input);
+
+// Reorders contiguous Float32 [heads, tokens, head_dimension] storage into
+// [tokens, heads, head_dimension]. Input and output logical ranges must not
+// overlap.
+void head_major_to_token_heads_out(const Tensor& input, Tensor& output);
+[[nodiscard]] Tensor head_major_to_token_heads(const Tensor& input);
+
 // Applies adjacent-pair rotary embedding to the complete last dimension. Input is
 // [tokens, ..., head_dimension]; cosine/sine are [tokens, head_dimension / 2].
 void rope_out(const Tensor& input, const Tensor& cosine, const Tensor& sine, Tensor& output);

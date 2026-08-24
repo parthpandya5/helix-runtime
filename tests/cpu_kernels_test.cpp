@@ -315,6 +315,67 @@ TEST(EmbeddingLookupTest, RejectsInvalidContractsWithoutPartiallyWritingOutput) 
   EXPECT_THROW(embedding_lookup_out(valid_ids, partial_table, partial_output), Error);
 }
 
+TEST(HeadLayoutTest, ReordersOddWidthVectorsAndRoundTripsExactly) {
+  std::array<float, 30> values{};
+  for (std::size_t index = 0; index < values.size(); ++index) {
+    values[index] = static_cast<float>(index);
+  }
+  const Tensor token_major = Tensor::from_values({2, 3, 5}, values);
+
+  const Tensor head_major = token_heads_to_head_major(token_major);
+  EXPECT_EQ(head_major.shape(), (Shape{3, 2, 5}));
+  expect_values_near(head_major, std::array{0.0F,  1.0F,  2.0F,  3.0F,  4.0F,  15.0F, 16.0F, 17.0F,
+                                            18.0F, 19.0F, 5.0F,  6.0F,  7.0F,  8.0F,  9.0F,  20.0F,
+                                            21.0F, 22.0F, 23.0F, 24.0F, 10.0F, 11.0F, 12.0F, 13.0F,
+                                            14.0F, 25.0F, 26.0F, 27.0F, 28.0F, 29.0F});
+
+  const Tensor round_trip = head_major_to_token_heads(head_major);
+  EXPECT_EQ(round_trip.shape(), token_major.shape());
+  expect_values_near(round_trip, values);
+}
+
+TEST(HeadLayoutTest, PreservesAllZeroExtentShapes) {
+  constexpr std::array kShapes{std::array<Dimension, 3>{0, 3, 5}, std::array<Dimension, 3>{2, 0, 5},
+                               std::array<Dimension, 3>{2, 3, 0}};
+  for (const auto shape : kShapes) {
+    const Tensor input = Tensor::zeros({shape[0], shape[1], shape[2]});
+    const Tensor head_major = token_heads_to_head_major(input);
+    EXPECT_EQ(head_major.shape(), (Shape{shape[1], shape[0], shape[2]}));
+    EXPECT_EQ(head_major.numel(), 0U);
+    const Tensor round_trip = head_major_to_token_heads(head_major);
+    EXPECT_EQ(round_trip.shape(), input.shape());
+    EXPECT_EQ(round_trip.numel(), 0U);
+  }
+}
+
+TEST(HeadLayoutTest, RejectsRankDTypeShapeAndOverlappingRanges) {
+  EXPECT_THROW(static_cast<void>(token_heads_to_head_major(Tensor::zeros({2, 6}))), Error);
+  EXPECT_THROW(
+      static_cast<void>(token_heads_to_head_major(Tensor::zeros({2, 3, 4}, DType::kFloat16))),
+      Error);
+
+  const Tensor input = Tensor::zeros({2, 3, 4});
+  Tensor wrong_output = Tensor::zeros({3, 2, 5});
+  EXPECT_THROW(token_heads_to_head_major_out(input, wrong_output), Error);
+  Tensor wrong_reverse = Tensor::zeros({2, 4, 3});
+  EXPECT_THROW(head_major_to_token_heads_out(token_heads_to_head_major(input), wrong_reverse),
+               Error);
+
+  Tensor exact_alias = Tensor::zeros({2, 2, 3});
+  EXPECT_THROW(token_heads_to_head_major_out(exact_alias, exact_alias), Error);
+
+  struct alignas(64) OverlappingStorage final {
+    std::array<float, 24> values{};
+  };
+  const auto owner = std::make_shared<OverlappingStorage>();
+  const Tensor partial_input = Tensor::from_mutable_cpu_buffer(
+      {2, 2, 3}, DType::kFloat32, owner->values.data(), 12 * sizeof(float), owner, 16);
+  Tensor partial_output = Tensor::from_mutable_cpu_buffer(
+      {2, 2, 3}, DType::kFloat32, owner->values.data() + 8, 12 * sizeof(float), owner, 16);
+  EXPECT_THROW(token_heads_to_head_major_out(partial_input, partial_output), Error);
+  EXPECT_THROW(head_major_to_token_heads_out(partial_input, partial_output), Error);
+}
+
 TEST(RopeTest, RotatesAdjacentPairsForEveryTokenAndHead) {
   const Tensor input = Tensor::from_values(
       {2, 2, 4}, std::array{1.0F, 2.0F, 3.0F, 4.0F, 5.0F, 6.0F, 7.0F, 8.0F, 9.0F, 10.0F, 11.0F,

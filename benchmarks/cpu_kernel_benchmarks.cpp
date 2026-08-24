@@ -146,6 +146,44 @@ void BM_CpuEmbeddingLookup(benchmark::State& state) {
   state.counters["width"] = static_cast<double>(state.range(2));
 }
 
+template <bool TokenToHead> void run_cpu_head_layout(benchmark::State& state) {
+  const auto tokens = static_cast<Dimension>(state.range(0));
+  const auto heads = static_cast<Dimension>(state.range(1));
+  const auto head_dimension = static_cast<Dimension>(state.range(2));
+  const Tensor token_input =
+      Tensor::random_uniform({tokens, heads, head_dimension}, 1'313, -2.0F, 2.0F);
+  const Tensor head_input = token_heads_to_head_major(token_input);
+  const Tensor input = TokenToHead ? token_input : head_input;
+  Tensor output = Tensor::empty(TokenToHead ? Shape{heads, tokens, head_dimension}
+                                            : Shape{tokens, heads, head_dimension});
+  const auto execute = [&input, &output]() {
+    if constexpr (TokenToHead) {
+      token_heads_to_head_major_out(input, output);
+    } else {
+      head_major_to_token_heads_out(input, output);
+    }
+  };
+  for (int warmup = 0; warmup < 10; ++warmup) {
+    execute();
+  }
+  for ([[maybe_unused]] auto iteration : state) {
+    execute();
+    benchmark::ClobberMemory();
+  }
+  finish_elementwise_iteration(state, state.range(0) * state.range(1) * state.range(2), 2);
+  state.counters["tokens"] = static_cast<double>(state.range(0));
+  state.counters["heads"] = static_cast<double>(state.range(1));
+  state.counters["head_dimension"] = static_cast<double>(state.range(2));
+}
+
+void BM_CpuTokenHeadsToHeadMajor(benchmark::State& state) {
+  run_cpu_head_layout<true>(state);
+}
+
+void BM_CpuHeadMajorToTokenHeads(benchmark::State& state) {
+  run_cpu_head_layout<false>(state);
+}
+
 BENCHMARK(BM_CpuAdd)->Arg(1)->Arg(1024)->Arg(1 << 20);
 BENCHMARK(BM_CpuSilu)->Arg(1)->Arg(1024)->Arg(1 << 20);
 BENCHMARK(BM_CpuSoftmax)->Args({1, 128})->Args({32, 128})->Args({16, 1023});
@@ -159,6 +197,16 @@ BENCHMARK(BM_CpuEmbeddingLookup)
     ->Args({1, 4096, 256})
     ->Args({128, 4096, 256})
     ->Args({1, 32000, 1024});
+BENCHMARK(BM_CpuTokenHeadsToHeadMajor)
+    ->Args({1, 32, 128})
+    ->Args({128, 32, 128})
+    ->Args({7, 3, 37})
+    ->Args({257, 13, 65});
+BENCHMARK(BM_CpuHeadMajorToTokenHeads)
+    ->Args({1, 32, 128})
+    ->Args({128, 32, 128})
+    ->Args({7, 3, 37})
+    ->Args({257, 13, 65});
 
 } // namespace
 } // namespace helix::cpu

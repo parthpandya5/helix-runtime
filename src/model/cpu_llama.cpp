@@ -54,38 +54,6 @@ RopeCache make_rope_cache(std::size_t tokens, std::size_t head_dimension, float 
   return RopeCache{std::move(cosine), std::move(sine)};
 }
 
-Tensor token_major_to_head_major(const Tensor& input, std::size_t tokens, std::size_t heads,
-                                 std::size_t head_dimension) {
-  Tensor output = Tensor::empty({dimension(heads), dimension(tokens), dimension(head_dimension)});
-  const auto* source = input.data_as<float>();
-  auto* destination = output.data_as<float>();
-  for (std::size_t token = 0; token < tokens; ++token) {
-    for (std::size_t head = 0; head < heads; ++head) {
-      for (std::size_t coordinate = 0; coordinate < head_dimension; ++coordinate) {
-        destination[(head * tokens + token) * head_dimension + coordinate] =
-            source[(token * heads + head) * head_dimension + coordinate];
-      }
-    }
-  }
-  return output;
-}
-
-Tensor head_major_to_token_major(const Tensor& input, std::size_t tokens, std::size_t heads,
-                                 std::size_t head_dimension) {
-  Tensor output = Tensor::empty({dimension(tokens), dimension(heads * head_dimension)});
-  const auto* source = input.data_as<float>();
-  auto* destination = output.data_as<float>();
-  for (std::size_t head = 0; head < heads; ++head) {
-    for (std::size_t token = 0; token < tokens; ++token) {
-      for (std::size_t coordinate = 0; coordinate < head_dimension; ++coordinate) {
-        destination[token * heads * head_dimension + head * head_dimension + coordinate] =
-            source[(head * tokens + token) * head_dimension + coordinate];
-      }
-    }
-  }
-  return output;
-}
-
 struct ForwardArtifacts {
   std::vector<Tensor> layer_hidden_states;
   std::vector<Tensor> layer_keys;
@@ -135,18 +103,18 @@ ForwardArtifacts execute_forward(const LlamaConfig& config, const LlamaWeights& 
     const Tensor rotated_query = cpu::rope(query_token_heads, rope.cosine, rope.sine);
     const Tensor rotated_key = cpu::rope(key_token_heads, rope.cosine, rope.sine);
 
-    const Tensor query = token_major_to_head_major(rotated_query, tokens, heads, head_dimension);
-    const Tensor key = token_major_to_head_major(rotated_key, tokens, heads, head_dimension);
-    const Tensor value =
-        token_major_to_head_major(value_token_heads, tokens, heads, head_dimension);
+    const Tensor query = cpu::token_heads_to_head_major(rotated_query);
+    const Tensor key = cpu::token_heads_to_head_major(rotated_key);
+    const Tensor value = cpu::token_heads_to_head_major(value_token_heads);
     if (capture_kv) {
       layer_keys.push_back(key);
       layer_values.push_back(value);
     }
     const Tensor attention_context =
         attention::cpu::scaled_dot_product_attention(query, key, value);
+    const Tensor attention_token_heads = cpu::head_major_to_token_heads(attention_context);
     const Tensor merged_attention =
-        head_major_to_token_major(attention_context, tokens, heads, head_dimension);
+        attention_token_heads.reshape({dimension(tokens), dimension(heads * head_dimension)});
     const Tensor attention_output = cpu::linear(merged_attention, layer.attention_output_weight);
     hidden = cpu::add(hidden, attention_output);
 
@@ -296,16 +264,15 @@ CpuLlamaDecodeResult execute_decode_one(const LlamaConfig& config, const LlamaWe
         value_projection.reshape({1, dimension(heads), dimension(head_dimension)});
     const Tensor rotated_query = cpu::rope(query_token_heads, rope.cosine, rope.sine);
     const Tensor rotated_key = cpu::rope(key_token_heads, rope.cosine, rope.sine);
-    const Tensor query = token_major_to_head_major(rotated_query, 1, heads, head_dimension);
-    const Tensor current_key = token_major_to_head_major(rotated_key, 1, heads, head_dimension);
-    const Tensor current_value =
-        token_major_to_head_major(value_token_heads, 1, heads, head_dimension);
+    const Tensor query = cpu::token_heads_to_head_major(rotated_query);
+    const Tensor current_key = cpu::token_heads_to_head_major(rotated_key);
+    const Tensor current_value = cpu::token_heads_to_head_major(value_token_heads);
 
     const Tensor attention_context =
         cached_attention(query, current_key, current_value, cache, sequence, layer_index, position,
                          heads, head_dimension, paged_decode_mode);
-    const Tensor merged_attention =
-        head_major_to_token_major(attention_context, 1, heads, head_dimension);
+    const Tensor attention_token_heads = cpu::head_major_to_token_heads(attention_context);
+    const Tensor merged_attention = attention_token_heads.reshape({1, dimension(layer_elements)});
     const Tensor attention_output = cpu::linear(merged_attention, layer.attention_output_weight);
     hidden = cpu::add(hidden, attention_output);
 
