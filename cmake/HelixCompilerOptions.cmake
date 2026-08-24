@@ -22,6 +22,10 @@ function(helix_configure_target target_name)
         $<$<COMPILE_LANGUAGE:CXX>:-Werror>
         $<$<COMPILE_LANGUAGE:CUDA>:--Werror=all-warnings>)
     endif()
+    if(HELIX_ENABLE_CUDA_LINEINFO)
+      target_compile_options(
+        ${target_name} PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>)
+    endif()
   endif()
 
   if(HELIX_ENABLE_SANITIZERS)

@@ -269,8 +269,8 @@ a generation-checked reusable active-slot registry reduced median cached-trace C
 time by 53.1%–66.7%. Final host results retain both outcomes: random/large/LLM-like
 traces were 3.13x–9.41x faster than direct aligned allocation, while small-heavy/
 bursty remained 2.34x–2.45x slower. Debug, Release, and ASan/UBSan suites pass
-185/185; the CUDA-on build passes 184 host tests and explicitly skips all 57 GPU
-tests (241 total) without a driver/device.
+186/186; the CUDA-on build passes 185 host tests and explicitly skips all 57 GPU
+tests (242 total) without a driver/device.
 
 ### M8 — Implemented and CPU/compile-validated; GPU runtime validation pending
 
@@ -781,6 +781,20 @@ uncommitted-tail attention the measured default while retaining compact copy in
 
 These items remain optional until the single-device runtime is correct and
 profiled.
+
+### Profiling foundation — Implemented and contract/compile-validated
+
+`scripts/profile_cuda.sh` selects one exact CUDA benchmark and emits bounded
+Nsight Systems, Nsight Compute, or combined commands. Actual collection requires a
+visible device and records the exact command, benchmark, launch bounds, Git/build
+state, GPU/driver/toolkit/profiler versions, OS, CPU, and RAM next to ignored
+reports. Existing/symlink outputs and unsafe stems are rejected; `--force` is
+explicit. A CPU CTest verifies dry-run purity, bounds, failure cases, and force
+propagation. `HELIX_ENABLE_CUDA_LINEINFO` adds profiler source correlation only to
+CUDA compilation. The option and all CUDA targets compile with CUDA 12.6.85 and
+warnings as errors; no report was collected without NVIDIA hardware. Full usage
+and the rule excluding profiler-perturbed timings from benchmark claims are in
+`docs/PERFORMANCE.md`.
 
 ### M20 — Stream overlap — Optional
 

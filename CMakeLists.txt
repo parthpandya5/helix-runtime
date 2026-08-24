@@ -13,6 +13,8 @@ include(GNUInstallDirs)
 include(HelixCompilerOptions)
 
 option(HELIX_ENABLE_CUDA "Build the optional CUDA backend" OFF)
+option(HELIX_ENABLE_CUDA_LINEINFO
+       "Emit CUDA line information for profiler source correlation" OFF)
 option(HELIX_BUILD_TESTS "Build Helix unit tests" ${BUILD_TESTING})
 option(HELIX_BUILD_BENCHMARKS "Build Helix microbenchmarks" ON)
 option(HELIX_BUILD_EXAMPLES "Build Helix examples" ON)
@@ -293,6 +295,7 @@ install(
 
 message(STATUS "Helix ${PROJECT_VERSION}")
 message(STATUS "  CUDA backend:       ${HELIX_ENABLE_CUDA}")
+message(STATUS "  CUDA line info:     ${HELIX_ENABLE_CUDA_LINEINFO}")
 message(STATUS "  Tests:              ${HELIX_BUILD_TESTS}")
 message(STATUS "  Benchmarks:         ${HELIX_BUILD_BENCHMARKS}")
 message(STATUS "  Tools:              ${HELIX_BUILD_TOOLS}")

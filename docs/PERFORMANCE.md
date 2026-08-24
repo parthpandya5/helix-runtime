@@ -18,6 +18,84 @@ Every recorded experiment must include:
 - warmup iterations, measured iterations, and repetitions,
 - timing mechanism and synchronization boundary.
 
+## CUDA profiling workflow
+
+Profiling is hardware-gated, just like CUDA correctness and timing. The current
+Apple Silicon host cannot collect an NVIDIA profile, so this section documents an
+implemented workflow rather than any profiler observation. First build a Release
+CUDA binary with optional source correlation and pass the GPU correctness gate:
+
+```bash
+cmake -S . -B build-cuda \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DHELIX_ENABLE_CUDA=ON \
+  -DHELIX_ENABLE_CUDA_LINEINFO=ON \
+  -DHELIX_BUILD_TESTS=ON \
+  -DHELIX_BUILD_BENCHMARKS=ON
+cmake --build build-cuda -j
+ctest --test-dir build-cuda -L gpu --output-on-failure
+```
+
+`HELIX_ENABLE_CUDA_LINEINFO` adds `-lineinfo` only to CUDA compilation. It leaves
+the normal build unchanged and gives Nsight Compute source/line correlation without
+enabling device debug code. Inspect the exact bounded commands on any host without
+creating output:
+
+```bash
+./scripts/profile_cuda.sh all --dry-run --output-name tiled-gemm-contract
+```
+
+On a machine with a visible NVIDIA GPU, CUDA driver, and profiler CLIs:
+
+```bash
+./scripts/profile_cuda.sh nsys --output-name tiled-gemm-systems
+./scripts/profile_cuda.sh ncu --output-name tiled-gemm-kernel
+```
+
+The default target is exactly
+`BM_CudaMatmulTiled/256/256/256/manual_time`. It performs ten explicit warmup
+launches, then the runner requests exactly five measured Google Benchmark
+iterations. Nsight Compute skips the ten matching warmup kernels and profiles the
+first measured kernel with the `full` section set. The runner uses arrays rather
+than command evaluation, validates its numeric and report-stem inputs, requires
+the filter to select exactly one registered CUDA case, checks both `nvidia-smi`
+inventory and a one-iteration CUDA benchmark preflight, and refuses existing or
+symbolic-link outputs unless an exact stem is explicitly forced. Captures are kept
+under ignored `profiles/` by default.
+
+Each collection writes an adjacent environment manifest with the exact command,
+selected case, iteration/launch bounds, Git state, GPU inventory, driver, CUDA,
+profiler, CMake, OS, CPU, RAM, and relevant cache settings where available.
+Nsight Systems emits a CUDA/NVTX/OS-runtime timeline plus summary statistics with
+CPU sampling and context-switch tracing disabled. It is the first tool for kernel
+launch count, CUDA API synchronization, copies, stream dependencies, and overlap.
+Nsight Compute replays a bounded kernel for detailed occupancy, instruction,
+memory, shared-memory, and warp metrics. The command options follow NVIDIA's
+official [Nsight Systems CLI guide](https://docs.nvidia.com/nsight-systems/UserGuide/index.html)
+and [Nsight Compute CLI guide](https://docs.nvidia.com/nsight-compute/NsightComputeCli/).
+
+Launch bounds count kernels, not benchmark operations. Contiguous attention has
+three visible kernels per operation, so its ten warmups require a skip of 30 and a
+count of 3 to profile the first complete measured operation:
+
+```bash
+./scripts/profile_cuda.sh ncu \
+  --output-name attention-decode-1024 \
+  --benchmark-filter '^BM_CudaContiguousAttention/8/1/1024/64/64/manual_time$' \
+  --iterations 1 \
+  --launch-skip 30 \
+  --launch-count 3
+```
+
+Profiler replay and instrumentation perturb execution. Google Benchmark timing
+printed during an Nsight Compute collection is therefore diagnostic output, not a
+publishable ordinary-latency result. Performance claims still require a separate
+same-stream CUDA-event run with warmup, repetitions, variation, full environment,
+and an appropriate baseline. `scripts/profile_cuda.sh` has a CPU CTest contract
+for dry-run purity, argument rejection, command bounds, and overwrite propagation;
+the CUDA 12.6 build with line information also compiles. Actual report collection
+remains pending NVIDIA hardware.
+
 ## Experiment log
 
 | Experiment | Baseline | Change | Result | Interpretation |

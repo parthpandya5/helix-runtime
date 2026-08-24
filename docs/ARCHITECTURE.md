@@ -102,6 +102,8 @@ required.
 `HELIX_ENABLE_CUDA=ON` explicitly requires a CUDA compiler and toolkit. It adds
 CUDA sources, runtime wrappers, GPU storage, kernels, and hardware-gated tests. A
 missing toolkit is a clear configuration error rather than a silent fallback.
+`HELIX_ENABLE_CUDA_LINEINFO=ON` is an independent opt-in that adds CUDA source-line
+metadata for profiler correlation without enabling device-debug execution.
 
 CUDA validation has three distinct levels:
 

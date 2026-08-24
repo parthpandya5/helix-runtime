@@ -267,10 +267,10 @@ Eleven engine tests exercise:
 - automatic LRU-anchor eviction and continued progress in a three-block pool.
 
 The bulk cache, scheduler final-token rule, and paged model decode have additional
-focused tests. The full Debug, Release, and ASan/UBSan CPU suites pass 185/185,
+focused tests. The full Debug, Release, and ASan/UBSan CPU suites pass 186/186,
 including the independent model-converter integration test. A CUDA 12.6 warnings-
-as-errors build passes 184 hardware-independent tests and registers 57 GPU tests,
-all explicitly skipped without an NVIDIA driver/device (241 total); Python/NumPy is
+as-errors build passes 185 hardware-independent tests and registers 57 GPU tests,
+all explicitly skipped without an NVIDIA driver/device (242 total); Python/NumPy is
 not installed in that compile container.
 
 ## Current limitations

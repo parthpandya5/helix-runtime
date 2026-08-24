@@ -384,6 +384,26 @@ decode, odd, and prefill shapes, but have not executed. Tensor layout, causal
 offset semantics, memory traffic, CPU baselines, and limitations are detailed in
 `docs/ATTENTION.md`.
 
+## Reproducible profiling
+
+`scripts/profile_cuda.sh` turns one exact CUDA Google Benchmark case into a
+bounded Nsight Systems timeline, Nsight Compute kernel report, or both. It records
+the selected benchmark, exact command, launch bounds, source revision, build
+settings, CPU/RAM, CUDA/driver/profiler versions, and GPU inventory beside the
+capture. `HELIX_ENABLE_CUDA_LINEINFO=ON` emits CUDA line information for source
+correlation. The runner performs no collection in `--dry-run`, rejects unsafe
+report stems and invalid counts, requires exactly one registered CUDA case,
+refuses accidental overwrite, and will not collect until both `nvidia-smi` and a
+one-iteration benchmark preflight demonstrate CUDA visibility.
+
+All single-kernel fixtures currently perform ten explicit warmup launches. The
+default Nsight Compute skip/count pair is therefore 10/1. Contiguous attention
+launches score/mask, shared softmax, and probability-times-V for each operation;
+profiling the first complete measured operation requires skip/count 30/3. Nsight
+Compute replay output is not accepted as a latency benchmark. See the complete
+commands and result-publication gate in
+[`docs/PERFORMANCE.md`](PERFORMANCE.md#cuda-profiling-workflow).
+
 ## Planned evolution
 
 The caching device allocator retains direct `cudaMalloc`/`cudaFree` as its benchmark

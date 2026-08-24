@@ -47,7 +47,7 @@ weight format, performs greedy generation through a contiguous KV cache, and
 executes scheduler batches against a shared paged KV pool with optional prompt-
 prefix reuse. On
 2026-08-24, Apple Clang 17 built the project on macOS arm64 with warnings as
-errors; 185/185 CPU tests passed in Debug, Release, and ASan/UBSan configurations.
+errors; 186/186 CPU tests passed in Debug, Release, and ASan/UBSan configurations.
 
 CUDA is optional at configure time. The current Apple Silicon development host has
 no NVIDIA GPU or native CUDA toolkit, so no CUDA execution or performance claim is
@@ -57,8 +57,8 @@ compile-validated in an ARM64 CUDA 12.6 development container without a
 driver/device. The M8 stream-ordered allocator and M9 block-reduced RMSNorm,
 grid-stride SwiGLU, adjacent-pair RoPE, and projection adapter are also
 compile-validated, as is the M10 three-stage contiguous attention baseline. None is
-runtime-validated on a GPU. The CUDA-on build passes 184 hardware-independent
-tests and explicitly skips 57 GPU tests without a driver/device (241 registered
+runtime-validated on a GPU. The CUDA-on build passes 185 hardware-independent
+tests and explicitly skips 57 GPU tests without a driver/device (242 registered
 tests total). Its container lacks Python/NumPy, so the separate converter
 integration test is not registered there; it passes in all three native CPU
 configurations.
@@ -141,7 +141,7 @@ cmake --build build --target format-check
 Helix targets. `HELIX_BUILD_TOOLS=OFF` omits the model pack/inspection utilities;
 it does not affect the runtime libraries. The one Python converter integration
 test auto-registers only when the selected Python 3 interpreter can import NumPy;
-otherwise the 184-test C++/benchmark suite remains available.
+otherwise the 185-test C++/benchmark suite remains available.
 
 ## Benchmarks
 
@@ -213,6 +213,33 @@ lookup win is claimed. In a separate steady-state CPU runtime trace, opt-in reus
 was 68.7% slower for an 8-token prompt, but 1.80x and 6.04x faster for 16- and
 32-token prompts. Each result uses the exact disclosed tiny model/workload in
 [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md); none is a production or GPU result.
+
+## Profiling
+
+Helix includes a bounded Nsight runner for an actual CUDA machine. The default
+profiles one exact 256x256x256 tiled-SGEMM case, uses its ten explicit warmup
+launches to select the first measured kernel, records the environment beside each
+report, and refuses accidental overwrite. CUDA line information is opt-in:
+
+```bash
+cmake -S . -B build-cuda \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DHELIX_ENABLE_CUDA=ON \
+  -DHELIX_ENABLE_CUDA_LINEINFO=ON
+cmake --build build-cuda -j
+
+./scripts/profile_cuda.sh all --dry-run
+./scripts/profile_cuda.sh nsys --output-name tiled-gemm-systems
+./scripts/profile_cuda.sh ncu --output-name tiled-gemm-kernel
+```
+
+Actual collection requires `nvidia-smi`, a successful one-iteration CUDA
+preflight, a visible NVIDIA GPU, and the selected `nsys`/`ncu` CLI. The current
+development host has none, so only the script contract and CUDA compilation have
+been validated. Profiler captures are not
+ordinary benchmark timings; exact launch-count rules, attention's three-kernel
+case, environment fields, and interpretation guidance are in
+[`docs/PERFORMANCE.md`](docs/PERFORMANCE.md#cuda-profiling-workflow).
 
 ## Tensor runtime
 

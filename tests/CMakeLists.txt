@@ -1,5 +1,22 @@
 include(GoogleTest)
 
+if(UNIX)
+  find_program(HELIX_BASH_EXECUTABLE bash)
+  if(HELIX_BASH_EXECUTABLE)
+    add_test(
+      NAME profiling.script_contract
+      COMMAND
+        "${CMAKE_COMMAND}"
+        "-DBASH_EXECUTABLE=${HELIX_BASH_EXECUTABLE}"
+        "-DPROFILE_SCRIPT=${PROJECT_SOURCE_DIR}/scripts/profile_cuda.sh"
+        "-DTEST_BINARY_DIR=${PROJECT_BINARY_DIR}"
+        -P "${CMAKE_CURRENT_SOURCE_DIR}/profile_script_contract.cmake")
+    set_tests_properties(
+      profiling.script_contract
+      PROPERTIES LABELS "profiling;smoke" TIMEOUT 10)
+  endif()
+endif()
+
 add_executable(helix_core_tests core_test.cpp)
 target_link_libraries(helix_core_tests PRIVATE helix::core GTest::gtest_main)
 helix_configure_target(helix_core_tests)
