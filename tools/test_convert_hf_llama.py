@@ -576,6 +576,25 @@ class ConverterIntegrationTest(unittest.TestCase):
             self.assertIn("validation=passed", validated.stdout)
             self.assertIn("logit_count=7", validated.stdout)
 
+            generated = run_validator(checkpoint, output, tokens, "--generate", "4")
+            self.assertEqual(generated.returncode, 0, generated.stderr)
+            self.assertIn("generation_validation=passed", generated.stdout)
+            self.assertIn("generation_stop_reason=max_new_tokens", generated.stdout)
+            self.assertIn("generation_cached_token_count=6", generated.stdout)
+
+            context_limited = run_validator(
+                checkpoint, output, tokens, "--generate", "20"
+            )
+            self.assertEqual(context_limited.returncode, 0, context_limited.stderr)
+            self.assertIn("generation_stop_reason=context_limit", context_limited.stdout)
+            self.assertIn("generation_cached_token_count=12", context_limited.stdout)
+
+            negative_generation = run_validator(
+                checkpoint, output, tokens, "--generate", "-1"
+            )
+            self.assertNotEqual(negative_generation.returncode, 0)
+            self.assertIn("--generate must be nonnegative", negative_generation.stderr)
+
             rejected_tokens = run_validator(checkpoint, output, (config["vocab_size"],))
             self.assertNotEqual(rejected_tokens.returncode, 0)
             self.assertIn("outside the checkpoint vocabulary", rejected_tokens.stderr)

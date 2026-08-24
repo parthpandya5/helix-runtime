@@ -1,4 +1,5 @@
 #include "helix/model/format.hpp"
+#include "helix/model/generation.hpp"
 
 #include <charconv>
 #include <cmath>
@@ -44,10 +45,12 @@ std::size_t parameter_count(const helix::model::LlamaWeights& weights) {
 
 void print_usage(std::ostream& output) {
   output << "Usage: helix_model_inspect MODEL.helix "
-            "[--smoke | --last-logits TOKEN[,TOKEN...]]\n"
+            "[--smoke | --last-logits TOKEN[,TOKEN...] | "
+            "--greedy-tokens TOKEN[,TOKEN...] MAX_NEW_TOKENS]\n"
             "Loads and validates the complete HELIXLM1 file. --smoke also runs a "
             "one-token CPU forward pass. --last-logits prints the final row as exact "
-            "hexadecimal floats for validation tooling.\n";
+            "hexadecimal floats. --greedy-tokens runs cached CPU greedy decode for "
+            "validation tooling.\n";
 }
 
 std::vector<std::uint32_t> parse_tokens(std::string_view text) {
@@ -73,11 +76,22 @@ std::vector<std::uint32_t> parse_tokens(std::string_view text) {
   return tokens;
 }
 
+std::size_t parse_count(std::string_view text) {
+  std::size_t count = 0;
+  const char* const begin = text.data();
+  const char* const end = begin + text.size();
+  const auto [cursor, error] = std::from_chars(begin, end, count);
+  if (text.empty() || error != std::errc{} || cursor != end) {
+    throw std::invalid_argument("MAX_NEW_TOKENS must be a nonnegative integer");
+  }
+  return count;
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
   try {
-    if (argc < 2 || argc > 4) {
+    if (argc < 2 || argc > 5) {
       throw std::invalid_argument("expected a model path and optional validation mode");
     }
     const std::string_view first(argv[1]);
@@ -87,12 +101,16 @@ int main(int argc, char** argv) {
     }
     bool smoke = false;
     std::vector<std::uint32_t> requested_tokens;
+    std::optional<std::size_t> generation_count;
     if (argc >= 3) {
       const std::string_view option(argv[2]);
       if (option == "--smoke" && argc == 3) {
         smoke = true;
       } else if (option == "--last-logits" && argc == 4) {
         requested_tokens = parse_tokens(argv[3]);
+      } else if (option == "--greedy-tokens" && argc == 5) {
+        requested_tokens = parse_tokens(argv[3]);
+        generation_count = parse_count(argv[4]);
       } else {
         throw std::invalid_argument("invalid validation mode or argument count");
       }
@@ -108,7 +126,22 @@ int main(int argc, char** argv) {
               << "attention_head_count=" << loaded.config.attention_head_count << '\n'
               << "max_sequence_length=" << loaded.config.max_sequence_length << '\n'
               << "parameter_count=" << parameters << '\n';
-    if (smoke || !requested_tokens.empty()) {
+    if (generation_count.has_value()) {
+      helix::model::CpuLlamaGenerator generator(
+          helix::model::CpuLlamaModel(loaded.config, std::move(loaded.weights)));
+      const helix::model::GenerationResult result = generator.generate(
+          requested_tokens, helix::model::GenerationOptions{*generation_count, std::nullopt});
+      std::cout << "generated_token_ids=";
+      for (std::size_t index = 0; index < result.generated_tokens.size(); ++index) {
+        if (index != 0) {
+          std::cout << ',';
+        }
+        std::cout << result.generated_tokens[index];
+      }
+      std::cout << "\ngeneration_stop_reason="
+                << helix::model::generation_stop_reason_name(result.stop_reason)
+                << "\ngeneration_cached_token_count=" << result.cached_token_count << '\n';
+    } else if (smoke || !requested_tokens.empty()) {
       helix::model::CpuLlamaModel model(loaded.config, std::move(loaded.weights));
       const std::vector<std::uint32_t> tokens =
           smoke ? std::vector<std::uint32_t>{0} : std::move(requested_tokens);

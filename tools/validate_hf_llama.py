@@ -103,6 +103,13 @@ class ReferenceConfig:
         )
 
 
+@dataclass(frozen=True)
+class GreedyResult:
+    tokens: tuple[int, ...]
+    stop_reason: str
+    cached_token_count: int
+
+
 def parse_config(path: Path) -> ReferenceConfig:
     document = read_json(path)
     if document.get("model_type") != "llama":
@@ -537,6 +544,32 @@ def reference_last_logits(
     return reference_linear(normalized, head)[-1]
 
 
+def reference_greedy(
+    config: ReferenceConfig,
+    checkpoint: Checkpoint,
+    prompt: Sequence[int],
+    max_new_tokens: int,
+    first_logits: np.ndarray[Any, Any],
+) -> GreedyResult:
+    generated: list[int] = []
+    context = list(prompt)
+    cached_token_count = len(context)
+    logits = first_logits
+    stop_reason = "max_new_tokens"
+    while len(generated) < max_new_tokens:
+        token = int(np.argmax(logits))
+        generated.append(token)
+        if len(generated) == max_new_tokens:
+            break
+        if cached_token_count == config.max_sequence_length:
+            stop_reason = "context_limit"
+            break
+        context.append(token)
+        cached_token_count += 1
+        logits = reference_last_logits(config, checkpoint, context)
+    return GreedyResult(tuple(generated), stop_reason, cached_token_count)
+
+
 def parse_tokens(text: str) -> tuple[int, ...]:
     try:
         values = tuple(int(field, 10) for field in text.split(","))
@@ -574,9 +607,62 @@ def inspector_logits(inspector: Path, model: Path, tokens: Sequence[int]) -> np.
     return result
 
 
-def transformers_logits(
-    checkpoint: Path, tokens: Sequence[int]
-) -> tuple[np.ndarray[Any, Any], str, str]:
+def inspector_greedy(
+    inspector: Path, model: Path, tokens: Sequence[int], max_new_tokens: int
+) -> GreedyResult:
+    command = [
+        str(inspector),
+        str(model),
+        "--greedy-tokens",
+        ",".join(str(token) for token in tokens),
+        str(max_new_tokens),
+    ]
+    try:
+        completed = subprocess.run(command, capture_output=True, text=True, check=False)
+    except OSError as error:
+        raise ValidationError(f"could not execute Helix inspector: {error}") from error
+    if completed.returncode != 0:
+        detail = completed.stderr.strip() or completed.stdout.strip()
+        raise ValidationError(f"Helix inspector generation failed: {detail}")
+    fields: dict[str, str] = {}
+    for line in completed.stdout.splitlines():
+        if "=" in line:
+            key, value = line.split("=", 1)
+            if key in {
+                "generated_token_ids",
+                "generation_stop_reason",
+                "generation_cached_token_count",
+            }:
+                if key in fields:
+                    raise ValidationError(f"Helix inspector emitted duplicate field {key}")
+                fields[key] = value
+    required = {
+        "generated_token_ids",
+        "generation_stop_reason",
+        "generation_cached_token_count",
+    }
+    if set(fields) != required:
+        raise ValidationError("Helix inspector omitted a generation result field")
+    try:
+        generated = (
+            tuple(int(value, 10) for value in fields["generated_token_ids"].split(","))
+            if fields["generated_token_ids"]
+            else ()
+        )
+        cached = int(fields["generation_cached_token_count"], 10)
+    except ValueError as error:
+        raise ValidationError("Helix inspector emitted an invalid generation integer") from error
+    if any(token < 0 for token in generated) or cached < 0:
+        raise ValidationError("Helix inspector emitted a negative generation integer")
+    return GreedyResult(generated, fields["generation_stop_reason"], cached)
+
+
+def transformers_reference(
+    checkpoint: Path,
+    tokens: Sequence[int],
+    config: ReferenceConfig,
+    max_new_tokens: int | None,
+) -> tuple[np.ndarray[Any, Any], GreedyResult | None, str, str]:
     try:
         import torch
         import transformers
@@ -597,14 +683,42 @@ def transformers_logits(
         with torch.no_grad():
             output = model(
                 input_ids=torch.tensor([tokens], dtype=torch.long),
-                use_cache=False,
-            ).logits[0, -1]
-        result = output.detach().cpu().numpy().astype(np.float32, copy=False)
+                use_cache=max_new_tokens is not None and max_new_tokens > 0,
+            )
+            initial_logits = (
+                output.logits[0, -1].detach().cpu().numpy().astype(np.float32, copy=True)
+            )
+            greedy: GreedyResult | None = None
+            if max_new_tokens is not None:
+                generated: list[int] = []
+                cached_token_count = len(tokens)
+                stop_reason = "max_new_tokens"
+                current_logits = output.logits[:, -1]
+                past = output.past_key_values
+                while len(generated) < max_new_tokens:
+                    token = int(torch.argmax(current_logits, dim=-1).item())
+                    generated.append(token)
+                    if len(generated) == max_new_tokens:
+                        break
+                    if cached_token_count == config.max_sequence_length:
+                        stop_reason = "context_limit"
+                        break
+                    output = model(
+                        input_ids=torch.tensor([[token]], dtype=torch.long),
+                        past_key_values=past,
+                        use_cache=True,
+                    )
+                    past = output.past_key_values
+                    current_logits = output.logits[:, -1]
+                    cached_token_count += 1
+                greedy = GreedyResult(
+                    tuple(generated), stop_reason, cached_token_count
+                )
     except (OSError, RuntimeError, ValueError) as error:
         raise ValidationError(f"Transformers reference execution failed: {error}") from error
-    if not bool(np.isfinite(result).all()):
+    if not bool(np.isfinite(initial_logits).all()):
         raise ValidationError("Transformers reference emitted non-finite logits")
-    return result, str(torch.__version__), str(transformers.__version__)
+    return initial_logits, greedy, str(torch.__version__), str(transformers.__version__)
 
 
 def comparison_errors(
@@ -631,6 +745,34 @@ def comparison_errors(
             f"rel_error={relative[index]:.9g}"
         )
     return float(np.max(absolute)), float(np.max(relative))
+
+
+def compare_greedy(actual: GreedyResult, expected: GreedyResult, label: str) -> None:
+    if actual.tokens != expected.tokens:
+        mismatch = next(
+            (
+                index
+                for index, (actual_token, expected_token) in enumerate(
+                    zip(actual.tokens, expected.tokens)
+                )
+                if actual_token != expected_token
+            ),
+            min(len(actual.tokens), len(expected.tokens)),
+        )
+        raise ValidationError(
+            f"{label} greedy token mismatch at step {mismatch}: "
+            f"Helix={actual.tokens}, reference={expected.tokens}"
+        )
+    if actual.stop_reason != expected.stop_reason:
+        raise ValidationError(
+            f"{label} stop-reason mismatch: Helix={actual.stop_reason!r}, "
+            f"reference={expected.stop_reason!r}"
+        )
+    if actual.cached_token_count != expected.cached_token_count:
+        raise ValidationError(
+            f"{label} cached-token mismatch: Helix={actual.cached_token_count}, "
+            f"reference={expected.cached_token_count}"
+        )
 
 
 def sha256(path: Path) -> str:
@@ -667,9 +809,13 @@ def validate(options: argparse.Namespace) -> None:
         or options.atol < 0.0
     ):
         raise ValidationError("--rtol and --atol must be finite and nonnegative")
+    if options.generate is not None and options.generate < 0:
+        raise ValidationError("--generate must be nonnegative")
 
     expected = reference_last_logits(config, checkpoint, tokens)
-    actual = inspector_logits(options.inspector.resolve(), options.model.resolve(), tokens)
+    inspector = options.inspector.resolve()
+    model = options.model.resolve()
+    actual = inspector_logits(inspector, model, tokens)
     source_max_absolute, source_max_relative = comparison_errors(
         actual,
         expected,
@@ -678,10 +824,27 @@ def validate(options: argparse.Namespace) -> None:
         atol=options.atol,
     )
 
-    framework_result: tuple[float, float, str, str] | None = None
+    source_generation: GreedyResult | None = None
+    helix_generation: GreedyResult | None = None
+    if options.generate is not None:
+        source_generation = reference_greedy(
+            config, checkpoint, tokens, options.generate, expected
+        )
+        helix_generation = inspector_greedy(
+            inspector, model, tokens, options.generate
+        )
+        compare_greedy(
+            helix_generation,
+            source_generation,
+            "source-layout oracle",
+        )
+
+    framework_result: tuple[float, float, str, str, GreedyResult | None] | None = None
     if options.transformers:
-        external, torch_version, transformers_version = transformers_logits(
-            checkpoint.directory, tokens
+        external, external_generation, torch_version, transformers_version = (
+            transformers_reference(
+                checkpoint.directory, tokens, config, options.generate
+            )
         )
         framework_max_absolute, framework_max_relative = comparison_errors(
             actual,
@@ -695,7 +858,12 @@ def validate(options: argparse.Namespace) -> None:
             framework_max_relative,
             torch_version,
             transformers_version,
+            external_generation,
         )
+        if source_generation is not None:
+            assert external_generation is not None
+            assert helix_generation is not None
+            compare_greedy(helix_generation, external_generation, "Transformers")
 
     print("validation=passed")
     print(f"tokens={','.join(str(token) for token in tokens)}")
@@ -705,15 +873,31 @@ def validate(options: argparse.Namespace) -> None:
     print(f"atol={options.atol:.9g}")
     print(f"source_max_abs_error={source_max_absolute:.9g}")
     print(f"source_max_rel_error={source_max_relative:.9g}")
-    if framework_result is not None:
-        framework_max_absolute, framework_max_relative, torch_version, transformers_version = (
-            framework_result
+    if source_generation is not None:
+        print("generation_validation=passed")
+        print(
+            "generated_token_ids="
+            + ",".join(str(token) for token in source_generation.tokens)
         )
+        print(f"generation_stop_reason={source_generation.stop_reason}")
+        print(
+            f"generation_cached_token_count={source_generation.cached_token_count}"
+        )
+    if framework_result is not None:
+        (
+            framework_max_absolute,
+            framework_max_relative,
+            torch_version,
+            transformers_version,
+            external_generation,
+        ) = framework_result
         print("transformers_validation=passed")
         print(f"torch_version={torch_version}")
         print(f"transformers_version={transformers_version}")
         print(f"transformers_max_abs_error={framework_max_absolute:.9g}")
         print(f"transformers_max_rel_error={framework_max_relative:.9g}")
+        if external_generation is not None:
+            print("transformers_generation_validation=passed")
     print(f"config_sha256={sha256(config_path)}")
     for path in checkpoint.source_files():
         print(f"weights_sha256[{path.name}]={sha256(path)}")
@@ -730,6 +914,11 @@ def parse_arguments(arguments: Sequence[str]) -> argparse.Namespace:
     parser.add_argument("--rtol", type=float, default=2.0e-5)
     parser.add_argument("--atol", type=float, default=2.0e-6)
     parser.add_argument("--max-parameters", type=int, default=5_000_000)
+    parser.add_argument(
+        "--generate",
+        type=int,
+        help="also compare this many cached greedy tokens with full-prefix reference execution",
+    )
     parser.add_argument(
         "--transformers",
         action="store_true",
