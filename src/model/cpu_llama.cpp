@@ -3,13 +3,12 @@
 #include "helix/core/error.hpp"
 #include "helix/kernels/cpu/reference.hpp"
 #include "helix/model/llama.hpp"
+#include "llama_detail.hpp"
 
 #include <algorithm>
 #include <array>
-#include <cmath>
 #include <cstddef>
 #include <cstdint>
-#include <limits>
 #include <utility>
 
 namespace helix::model {
@@ -25,33 +24,6 @@ Tensor embed_tokens(std::span<const std::uint32_t> token_ids, const Tensor& embe
                "validated Llama embedding geometry changed during execution");
   const Tensor indices = Tensor::from_values({dimension(token_ids.size())}, token_ids);
   return cpu::embedding_lookup(indices, embedding);
-}
-
-struct RopeCache {
-  Tensor cosine;
-  Tensor sine;
-};
-
-RopeCache make_rope_cache(std::size_t tokens, std::size_t head_dimension, float theta,
-                          std::size_t position_offset = 0) {
-  HELIX_CHECK(position_offset <= std::numeric_limits<std::size_t>::max() - tokens,
-              ErrorCode::kOutOfRange, "model::CpuLlamaModel: RoPE position range overflows");
-  const std::size_t pairs = head_dimension / 2;
-  Tensor cosine = Tensor::empty({dimension(tokens), dimension(pairs)});
-  Tensor sine = Tensor::empty({dimension(tokens), dimension(pairs)});
-  auto* cosine_values = cosine.data_as<float>();
-  auto* sine_values = sine.data_as<float>();
-  for (std::size_t token = 0; token < tokens; ++token) {
-    for (std::size_t pair = 0; pair < pairs; ++pair) {
-      const double exponent =
-          -2.0 * static_cast<double>(pair) / static_cast<double>(head_dimension);
-      const double frequency = std::pow(static_cast<double>(theta), exponent);
-      const double angle = static_cast<double>(position_offset + token) * frequency;
-      cosine_values[token * pairs + pair] = static_cast<float>(std::cos(angle));
-      sine_values[token * pairs + pair] = static_cast<float>(std::sin(angle));
-    }
-  }
-  return RopeCache{std::move(cosine), std::move(sine)};
 }
 
 struct ForwardArtifacts {
@@ -73,7 +45,7 @@ ForwardArtifacts execute_forward(const LlamaConfig& config, const LlamaWeights& 
   const std::size_t tokens = token_ids.size();
   const std::size_t heads = config.attention_head_count;
   const std::size_t head_dimension = config.hidden_size / heads;
-  const RopeCache rope = make_rope_cache(tokens, head_dimension, config.rope_theta);
+  const detail::RopeCache rope = detail::make_rope_cache(tokens, head_dimension, config.rope_theta);
   Tensor hidden = embed_tokens(token_ids, weights.token_embedding(), config.hidden_size,
                                config.vocabulary_size);
   std::vector<Tensor> layer_hidden_states;
@@ -238,7 +210,8 @@ CpuLlamaDecodeResult execute_decode_one(const LlamaConfig& config, const LlamaWe
   const std::size_t heads = config.attention_head_count;
   const std::size_t head_dimension = config.hidden_size / heads;
   const std::array<std::uint32_t, 1> input_ids{token_id};
-  const RopeCache rope = make_rope_cache(1, head_dimension, config.rope_theta, position);
+  const detail::RopeCache rope =
+      detail::make_rope_cache(1, head_dimension, config.rope_theta, position);
   Tensor hidden = embed_tokens(input_ids, weights.token_embedding(), config.hidden_size,
                                config.vocabulary_size);
   Tensor token_keys =

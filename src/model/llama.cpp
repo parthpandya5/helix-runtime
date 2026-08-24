@@ -19,9 +19,11 @@ Dimension model_dimension(std::size_t value, std::string_view name) {
   return static_cast<Dimension>(value);
 }
 
-void require_weight(const Tensor& tensor, const Shape& expected, std::string_view name) {
-  HELIX_CHECK(tensor.device().is_cpu(), ErrorCode::kInvalidArgument,
-              "model::LlamaWeights: " + std::string(name) + " must be on CPU");
+void require_weight(const Tensor& tensor, const Shape& expected, std::string_view name,
+                    Device expected_device) {
+  HELIX_CHECK(tensor.device() == expected_device, ErrorCode::kInvalidArgument,
+              "model::LlamaWeights: " + std::string(name) + " must be on " +
+                  expected_device.to_string());
   HELIX_CHECK(tensor.dtype() == DType::kFloat32, ErrorCode::kInvalidArgument,
               "model::LlamaWeights: " + std::string(name) + " must have dtype float32");
   HELIX_CHECK(tensor.is_contiguous(), ErrorCode::kInvalidArgument,
@@ -89,7 +91,7 @@ LlamaWeights::LlamaWeights(Tensor token_embedding, std::vector<LlamaLayerWeights
       final_norm_weight_(std::move(final_norm_weight)), lm_head_weight_(std::move(lm_head_weight)) {
 }
 
-void LlamaWeights::validate(const LlamaConfig& config) const {
+void LlamaWeights::validate(const LlamaConfig& config, Device expected_device) const {
   config.validate();
   HELIX_CHECK(layers_.size() == config.layer_count, ErrorCode::kInvalidArgument,
               "model::LlamaWeights: layer count does not match configuration");
@@ -97,24 +99,44 @@ void LlamaWeights::validate(const LlamaConfig& config) const {
   const Dimension vocabulary = model_dimension(config.vocabulary_size, "vocabulary size");
   const Dimension hidden = model_dimension(config.hidden_size, "hidden size");
   const Dimension intermediate = model_dimension(config.intermediate_size, "intermediate size");
-  require_weight(token_embedding_, Shape{vocabulary, hidden}, "token embedding");
-  require_weight(final_norm_weight_, Shape{hidden}, "final norm weight");
-  require_weight(lm_head_weight_, Shape{hidden, vocabulary}, "LM head weight");
+  require_weight(token_embedding_, Shape{vocabulary, hidden}, "token embedding", expected_device);
+  require_weight(final_norm_weight_, Shape{hidden}, "final norm weight", expected_device);
+  require_weight(lm_head_weight_, Shape{hidden, vocabulary}, "LM head weight", expected_device);
 
   for (std::size_t index = 0; index < layers_.size(); ++index) {
     const LlamaLayerWeights& layer = layers_[index];
     const std::string prefix = "layer " + std::to_string(index) + ' ';
-    require_weight(layer.attention_norm_weight, Shape{hidden}, prefix + "attention norm");
-    require_weight(layer.query_weight, Shape{hidden, hidden}, prefix + "query weight");
-    require_weight(layer.key_weight, Shape{hidden, hidden}, prefix + "key weight");
-    require_weight(layer.value_weight, Shape{hidden, hidden}, prefix + "value weight");
+    require_weight(layer.attention_norm_weight, Shape{hidden}, prefix + "attention norm",
+                   expected_device);
+    require_weight(layer.query_weight, Shape{hidden, hidden}, prefix + "query weight",
+                   expected_device);
+    require_weight(layer.key_weight, Shape{hidden, hidden}, prefix + "key weight", expected_device);
+    require_weight(layer.value_weight, Shape{hidden, hidden}, prefix + "value weight",
+                   expected_device);
     require_weight(layer.attention_output_weight, Shape{hidden, hidden},
-                   prefix + "attention output weight");
-    require_weight(layer.ffn_norm_weight, Shape{hidden}, prefix + "FFN norm");
-    require_weight(layer.gate_weight, Shape{hidden, intermediate}, prefix + "gate weight");
-    require_weight(layer.up_weight, Shape{hidden, intermediate}, prefix + "up weight");
-    require_weight(layer.down_weight, Shape{intermediate, hidden}, prefix + "down weight");
+                   prefix + "attention output weight", expected_device);
+    require_weight(layer.ffn_norm_weight, Shape{hidden}, prefix + "FFN norm", expected_device);
+    require_weight(layer.gate_weight, Shape{hidden, intermediate}, prefix + "gate weight",
+                   expected_device);
+    require_weight(layer.up_weight, Shape{hidden, intermediate}, prefix + "up weight",
+                   expected_device);
+    require_weight(layer.down_weight, Shape{intermediate, hidden}, prefix + "down weight",
+                   expected_device);
   }
+}
+
+LlamaWeights LlamaWeights::to(Device target) const {
+  std::vector<LlamaLayerWeights> transferred_layers;
+  transferred_layers.reserve(layers_.size());
+  for (const LlamaLayerWeights& layer : layers_) {
+    transferred_layers.emplace_back(
+        layer.attention_norm_weight.to(target), layer.query_weight.to(target),
+        layer.key_weight.to(target), layer.value_weight.to(target),
+        layer.attention_output_weight.to(target), layer.ffn_norm_weight.to(target),
+        layer.gate_weight.to(target), layer.up_weight.to(target), layer.down_weight.to(target));
+  }
+  return LlamaWeights(token_embedding_.to(target), std::move(transferred_layers),
+                      final_norm_weight_.to(target), lm_head_weight_.to(target));
 }
 
 const Tensor& LlamaWeights::token_embedding() const noexcept {

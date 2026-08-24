@@ -341,6 +341,29 @@ TEST(LlamaWeightsTest, ValidatesEveryLayerAndTopLevelShape) {
   EXPECT_THROW(wrong_layer.validate(config), Error);
 }
 
+TEST(LlamaWeightsTest, TransfersEveryTensorDeeplyAndValidatesTheExpectedDevice) {
+  const LlamaConfig config = tiny_config();
+  const RawWeights raw = make_raw_weights(config);
+  LlamaWeights source = materialize_weights(config, raw);
+
+  LlamaWeights copied = source.to(Device::cpu());
+  EXPECT_NO_THROW(copied.validate(config, Device::cpu()));
+  EXPECT_THROW(source.validate(config, Device::cuda(0)), Error);
+  EXPECT_NE(copied.token_embedding().data(), source.token_embedding().data());
+  ASSERT_EQ(copied.layers().size(), source.layers().size());
+  EXPECT_NE(copied.layers()[0].query_weight.data(), source.layers()[0].query_weight.data());
+  for (std::size_t index = 0; index < source.token_embedding().numel(); ++index) {
+    EXPECT_FLOAT_EQ(copied.token_embedding().data_as<float>()[index],
+                    source.token_embedding().data_as<float>()[index]);
+  }
+
+  Tensor mutable_copy = copied.token_embedding();
+  const float original = source.token_embedding().data_as<float>()[0];
+  mutable_copy.data_as<float>()[0] += 1.0F;
+  EXPECT_FLOAT_EQ(source.token_embedding().data_as<float>()[0], original);
+  EXPECT_NE(copied.token_embedding().data_as<float>()[0], original);
+}
+
 TEST(CpuLlamaModelTest, MatchesIndependentOracleAcrossFullCausalPrefill) {
   const LlamaConfig config = tiny_config();
   const RawWeights raw = make_raw_weights(config);

@@ -29,6 +29,7 @@ if(HELIX_ENABLE_CUDA)
       cuda_elementwise_benchmarks.cpp
       cuda_allocator_benchmarks.cpp
       cuda_matmul_benchmarks.cpp
+      cuda_model_benchmarks.cpp
       cuda_overlap_benchmarks.cpp
       cuda_reduction_benchmarks.cpp
       cuda_transfer_benchmarks.cpp
@@ -164,3 +165,18 @@ add_test(
 set_tests_properties(
   benchmark.kv_prefix_index_smoke
   PROPERTIES LABELS "benchmark;kv_cache;smoke")
+
+if(HELIX_ENABLE_CUDA)
+  add_test(
+    NAME benchmark.cuda_model_smoke
+    COMMAND helix_benchmarks
+            "--benchmark_filter=BM_CudaLlamaSynchronousPrefill/hidden:32/intermediate:64/layers:2/heads:4/tokens:7/vocabulary:128/manual_time$"
+            --benchmark_min_time=1x
+            --benchmark_repetitions=1)
+  set_tests_properties(
+    benchmark.cuda_model_smoke
+    PROPERTIES
+      LABELS "benchmark;gpu;model;smoke"
+      SKIP_REGULAR_EXPRESSION "requires a visible NVIDIA CUDA device"
+      TIMEOUT 300)
+endif()

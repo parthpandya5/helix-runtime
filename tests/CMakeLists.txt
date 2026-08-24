@@ -277,6 +277,18 @@ if(HELIX_ENABLE_CUDA)
     DISCOVERY_MODE PRE_TEST
     PROPERTIES LABELS gpu TIMEOUT 180)
 
+  add_executable(helix_cuda_llama_model_tests cuda_llama_model_test.cpp)
+  target_link_libraries(
+    helix_cuda_llama_model_tests
+    PRIVATE helix::model helix::cuda_runtime GTest::gtest_main)
+  helix_configure_target(helix_cuda_llama_model_tests)
+
+  gtest_discover_tests(
+    helix_cuda_llama_model_tests
+    TEST_PREFIX "cuda_llama_model."
+    DISCOVERY_MODE PRE_TEST
+    PROPERTIES LABELS gpu TIMEOUT 300)
+
   add_executable(helix_cuda_allocator_tests cuda_allocator_test.cpp)
   target_link_libraries(
     helix_cuda_allocator_tests

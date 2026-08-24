@@ -55,7 +55,8 @@ public:
   LlamaWeights(LlamaWeights&&) noexcept = default;
   LlamaWeights& operator=(LlamaWeights&&) noexcept = default;
 
-  void validate(const LlamaConfig& config) const;
+  void validate(const LlamaConfig& config, Device expected_device = Device::cpu()) const;
+  [[nodiscard]] LlamaWeights to(Device target) const;
 
   [[nodiscard]] const Tensor& token_embedding() const noexcept;
   [[nodiscard]] std::span<const LlamaLayerWeights> layers() const noexcept;
