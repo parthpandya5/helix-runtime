@@ -9,7 +9,10 @@ sanitized, and benchmarked in Float32. The CPU runtime can opt into longest-pref
 reuse and pressure-driven LRU anchor eviction. These paths expose the memory-
 capacity, compaction, direct-traversal, lookup-scaling, and reuse tradeoffs between
 a per-sequence allocation and a global fixed-block pool. There is not yet a GPU-
-resident KV cache or CUDA paged-attention/prefix-reuse path.
+resident KV cache or CUDA prefix-reuse path. A compile-validated CUDA paged-
+attention baseline accepts separately packed layer-local device pages and an
+immutable uploaded block table; it is deliberately not presented as cache/runtime
+integration.
 
 ## Why cache keys and values?
 
@@ -384,8 +387,8 @@ destructor reclamation, and concurrent lookup/fork/release lifecycles. Runtime
 tests compare reused-suffix output with full recomputation, verify cancellation
 ownership, and force anchor eviction in a three-page pool. The complete native
 Debug, Release, and ASan/UBSan suites pass 186/186. The CUDA-on compile-validation
-suite passes 185 hardware-independent tests and explicitly skips 57 GPU tests
-without a device (242 total); its missing Python/NumPy omits the separate converter
+suite passes 185 hardware-independent tests and explicitly skips 61 GPU tests
+without a device (246 total); its missing Python/NumPy omits the separate converter
 integration test.
 
 ## Direct block-table attention lease

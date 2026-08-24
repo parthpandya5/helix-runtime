@@ -139,10 +139,12 @@ always better” rule.
 Threads in a warp should access addresses that the memory system can serve with a
 small number of aligned transactions. Helix elementwise kernels use grid-stride
 loops over consecutive elements. Tiled GEMM loads adjacent matrix elements into
-shared memory. RoPE assigns threads to adjacent coordinate pairs. Paged attention
-needs additional care because logical neighbors can cross physical pages; the CPU
-path proves semantics, while GPU coalescing analysis remains pending a device
-implementation and profiler run.
+shared memory. RoPE assigns threads to adjacent coordinate pairs. The CUDA paged-
+attention baseline maps logical neighbors through an immutable device table. Its
+value threads read adjacent output dimensions, but score threads' inner-dimension
+loads are separated by a head width. That is a visible correctness baseline;
+coalescing quality remains pending a physical profiler run and likely motivates a
+warp-grouped page tile.
 
 ## Explain warp execution
 
@@ -220,7 +222,10 @@ capacity before consuming a free block so metadata allocation or block exhaustio
 cannot partially change the mapping. Release prevalidates physical references,
 decrements once per table entry, and returns a page to the FIFO only at zero. A
 move-only read lease pins storage/table state while direct paged attention traverses
-spans.
+spans. The separate CUDA baseline currently accepts one layer already packed as
+`[block,head,token_in_block,dimension]`; its move-only table owns an immutable
+device copy and must outlive all enqueued stream work. That kernel contract is not
+yet a GPU cache-manager integration.
 
 ## How does Helix share a KV prefix?
 

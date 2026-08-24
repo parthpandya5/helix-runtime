@@ -3,7 +3,8 @@
 ## Validation status
 
 The Milestone 4 elementwise, Milestone 5 reduction/softmax, Milestone 6 SGEMM,
-Milestone 9 transformer kernels, and Milestone 10 attention baseline are **CUDA
+Milestone 9 transformer kernels, and Milestone 10/Milestone 13 contiguous/paged
+attention baselines are **CUDA
 compile-validated, not GPU runtime-validated**. NVCC 12.6.85 and GCC 13.2 compiled
 the implementations, hardware-gated
 correctness tests, and CUDA-event benchmarks in the ARM64 CUDA 12.6 development
@@ -217,6 +218,8 @@ measurements, and may change with architecture/toolchain:
 | RoPE adjacent-pair | 27 | 0 B | 0 B |
 | attention score/scale/mask | 29 | 0 B | 0 B |
 | attention probabilities x V | 32 | 0 B | 0 B |
+| paged attention score/scale/mask | 31 | 0 B | 0 B |
+| paged attention probabilities x V | 29 | 0 B | 0 B |
 
 This table helps make occupancy/resource hypotheses concrete, but occupancy cannot
 be concluded from registers/shared memory alone; launch geometry, architecture
@@ -377,12 +380,36 @@ behind a fused or library call. Static `sm_52` inspection reports 29 and 32
 registers/thread for the custom stages with no shared memory or spills; the
 softmax stage retains its documented 5,120-byte shared scratch.
 
+The preallocated `_out` form is asynchronous and requires caller-owned scratch to
+outlive stream work. The allocating convenience form synchronizes explicitly before
+destroying its private score workspace; it does not rely on allocator-specific
+`cudaFree` synchronization for lifetime. All attention benchmarks use `_out`.
+
 CPU-oracle GPU tests cover known causal values/probabilities, one-token decode,
 odd dimensions through head width 37/value width 41, empty queries, contracts, and
 alias rejection. Ten-warmup event fixtures time the full three-stage sequence at
 decode, odd, and prefill shapes, but have not executed. Tensor layout, causal
 offset semantics, memory traffic, CPU baselines, and limitations are detailed in
 `docs/ATTENTION.md`.
+
+## Paged attention baseline
+
+Milestone 13 adds a separately named path over layer-local K/V tensors shaped
+`[physical_blocks, heads, block_tokens, width]`. A move-only immutable device table
+maps each logical block to a checked `uint32` physical ID. The score kernel resolves
+one page for each `(head, query, key)` task; the value kernel resolves pages while
+each `(head, query, value_dimension)` task traverses logical KV tokens. `kv_tokens`
+bounds the final partial page, so no padded slot participates in attention.
+
+The straightforward score mapping is not coalesced across the inner head dimension,
+and the value path repeats table lookup arithmetic for each output coordinate. It
+is retained as the correctness and profiling baseline. Static `sm_52` inspection
+reports 31 and 29 registers/thread respectively, no static shared/local memory,
+and no spills. Four additional GPU tests exercise reordered pages, poisoned tail
+padding, odd dimensions, empty queries, move-only table ownership, and invalid
+geometry/alias contracts. Four event-timed fixtures pair the contiguous logical
+shapes with reversed page mappings. Neither tests nor timings have run without a
+physical NVIDIA device.
 
 ## Reproducible profiling
 
@@ -397,11 +424,11 @@ refuses accidental overwrite, and will not collect until both `nvidia-smi` and a
 one-iteration benchmark preflight demonstrate CUDA visibility.
 
 All single-kernel fixtures currently perform ten explicit warmup launches. The
-default Nsight Compute skip/count pair is therefore 10/1. Contiguous attention
-launches score/mask, shared softmax, and probability-times-V for each operation;
-profiling the first complete measured operation requires skip/count 30/3. Nsight
-Compute replay output is not accepted as a latency benchmark. See the complete
-commands and result-publication gate in
+default Nsight Compute skip/count pair is therefore 10/1. Contiguous and paged
+attention each launch score/mask, shared softmax, and probability-times-V for every
+operation; profiling the first complete measured operation requires skip/count
+30/3. Nsight Compute replay output is not accepted as a latency benchmark. See the
+complete commands and result-publication gate in
 [`docs/PERFORMANCE.md`](PERFORMANCE.md#cuda-profiling-workflow).
 
 ## Planned evolution

@@ -9,10 +9,11 @@ All 49 hardware-independent tests passed in that CUDA-on build. Six GPU tests we
 built and then skipped because the container had no NVIDIA driver/device.
 
 As later subsystems were added, the macOS CPU-only Debug, Release, and ASan/UBSan
-configurations reached 185 passing tests. The current CUDA-on build passes 184
-hardware-independent tests and registers 57 GPU tests, all skipped without a
-device; its container omits the separate Python converter test. CUDA correctness,
-resource-leak, and timing behavior remains pending a physical NVIDIA GPU.
+configurations reached 186 passing tests. The current CUDA-on build passes 185
+hardware-independent tests and registers 61 GPU tests (246 total), all skipped
+without a device; its container omits the separate Python converter test. CUDA
+correctness, resource-leak, and timing behavior remains pending a physical NVIDIA
+GPU.
 
 ## Error handling
 

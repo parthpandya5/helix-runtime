@@ -8,8 +8,8 @@ resource benchmarked**. Twenty-one focused allocator/deferred/bridge tests and t
 full 186-test CPU suite pass in Debug, Release, and ASan/UBSan builds. A CUDA 12.6
 warnings-as-errors build compiles `CudaMemoryResource`, `StreamOrderedAllocator`,
 three hardware-gated allocator tests, the CPU bridge, and native-CUDA comparison
-benchmarks. It passes 185 hardware-independent tests and skips 57 GPU tests without
-a driver/device (242 registered), so no CUDA allocator code has run on a physical
+benchmarks. It passes 185 hardware-independent tests and skips 61 GPU tests without
+a driver/device (246 registered), so no CUDA allocator code has run on a physical
 GPU.
 
 The event-backed adapter is therefore compile-validated rather than hardware-

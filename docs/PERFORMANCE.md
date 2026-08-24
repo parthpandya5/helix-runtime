@@ -671,7 +671,41 @@ Command:
 
 These are CPU layout/locality measurements. They say nothing about device block-
 table fetches, warp grouping, coalescing, register pressure, occupancy, or GPU
-latency. Those require a CUDA paged cache/kernel and physical NVIDIA execution.
+latency. A CUDA baseline now exists, but those questions still require physical
+NVIDIA execution.
+
+## M13 CUDA paged-attention benchmark gate — pending NVIDIA hardware
+
+The compile-validated fixture pairs contiguous and paged three-stage attention at
+the same four logical shapes. The paged side stores Float32 K/V as
+`[physical_blocks,heads,block_tokens,width]`, reverses the logical page mapping,
+and reserves two unused physical pages. Standard cases use 16-token pages; the odd
+`3x17x29x37x41` case uses eight-token pages. Both paths preallocate output and the
+exact `4*H*Q*K` score workspace. Paged pool tensors and the synchronous immutable
+table upload are outside timing.
+
+Each case performs ten untimed warmups. Every measured operation records CUDA
+events around all three same-stream launches and synchronizes the stop event before
+reporting manual time. Counters expose nominal dense dot FLOP/s, workspace bytes,
+block-table bytes, active logical K/V bytes, and reserved physical K/V bytes. The
+nominal numerator is comparable between paths but includes causally masked score
+coordinates that the score kernel skips; it is not an instruction count.
+
+On a CUDA host, first pass the GPU oracle tests and then run paired repetitions:
+
+```bash
+ctest --test-dir build-cuda -L gpu --output-on-failure
+./build-cuda/benchmarks/helix_benchmarks \
+  --benchmark_filter='BM_Cuda(Contiguous|Paged)Attention' \
+  --benchmark_repetitions=5 \
+  --benchmark_report_aggregates_only=true
+```
+
+No benchmark has executed in the current environment, so this section contains no
+latency, bandwidth, or speedup result. CUDA 12.6 `sm_52` compiler inspection found
+31/29 registers per thread for the paged score/value kernels and no static shared/
+local memory or spills. Architecture-specific profiler data and
+`compute-sanitizer` must still gate any optimization.
 
 ## M15 FIFO scheduler host-policy baseline — 2026-08-21
 

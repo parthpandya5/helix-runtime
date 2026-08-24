@@ -245,6 +245,9 @@ Tensor scaled_dot_product_attention(const Tensor& query, const Tensor& key, cons
                                          DType::kFloat32, query.device());
   scaled_dot_product_attention_out(query, key, value, query_position_offset, output,
                                    score_workspace, stream);
+  if (score_workspace.numel() != 0) {
+    stream.synchronize();
+  }
   return output;
 }
 

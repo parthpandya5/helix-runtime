@@ -56,12 +56,12 @@ reduction/stable-softmax baselines, and M6 naive/tiled SGEMM are separately
 compile-validated in an ARM64 CUDA 12.6 development container without a
 driver/device. The M8 stream-ordered allocator and M9 block-reduced RMSNorm,
 grid-stride SwiGLU, adjacent-pair RoPE, and projection adapter are also
-compile-validated, as is the M10 three-stage contiguous attention baseline. None is
-runtime-validated on a GPU. The CUDA-on build passes 185 hardware-independent
-tests and explicitly skips 57 GPU tests without a driver/device (242 registered
-tests total). Its container lacks Python/NumPy, so the separate converter
-integration test is not registered there; it passes in all three native CPU
-configurations.
+compile-validated, as are the M10 contiguous and M13 paged three-stage attention
+baselines. None is runtime-validated on a GPU. The CUDA-on build passes 185
+hardware-independent tests and explicitly skips 61 GPU tests without a
+driver/device (246 registered tests total). Its container lacks Python/NumPy, so
+the separate converter integration test is not registered there; it passes in all
+three native CPU configurations.
 
 ## Architecture
 
@@ -310,8 +310,11 @@ supports both prefill and decode through an explicit query-position offset, and
 keeps score, stable softmax, and probability-times-V stages visible. Its default
 CPU value path uses a measured 32-coordinate stack tile; the original dimension-
 major loop remains benchmarkable. The M13 CPU path reads written K/V spans directly
-through a paged cache read lease without compacting history. CPU paths are tested,
-sanitized, and benchmarked; only contiguous CUDA attention is compile-validated.
+through a paged cache read lease without compacting history. A separate M13 CUDA
+baseline resolves logical token positions through an immutable device block table
+into layer-local `[physical_blocks, heads, block_tokens, width]` K/V tensors. CPU
+paths are tested, sanitized, and benchmarked; both CUDA paths are compile-validated
+with hardware-gated CPU-oracle tests and event-timed fixtures.
 See [`docs/ATTENTION.md`](docs/ATTENTION.md).
 
 ## KV cache
@@ -523,10 +526,12 @@ Ownership, protocol, measurements, and limitations are in
 
 ## Limitations
 
-The CUDA runtime, M4–M6/M9–M10 kernels, and M7–M8 CUDA allocator adapters are
+The CUDA runtime, M4–M6/M9–M10/M13 kernels, and M7–M8 CUDA allocator adapters are
 compile-validated only; physical GPU correctness, timing, and resource validation
-remain pending. KV caches, paged attention, and continuous batching are host-only;
-the CPU engine integrates the scheduler with physical paged-KV capacity and model
+remain pending. KV caches and continuous batching are host-only; the CUDA paged-
+attention baseline consumes separately packed layer-local device pages but is not
+wired to a GPU-resident cache, allocator, scheduler, or model executor. The CPU
+engine integrates the scheduler with physical paged-KV capacity and model
 execution, but scheduled work items run serially and no tensor batch is formed.
 Transformer execution currently supports CPU Float32 prefill, contiguous-KV
 single-sequence generation, and paged-KV multi-request orchestration. The narrow

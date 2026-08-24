@@ -6,12 +6,12 @@ The Milestone 10 contiguous CPU reference, Milestone 13 direct paged CPU path, a
 post-M19 paged-history-plus-tail decode path are **implemented, CPU-validated,
 sanitizer-validated, and benchmarked**. Ten focused attention tests and the full
 186-test CPU suite pass in Debug, Release, and ASan/UBSan builds. The contiguous
-CUDA baseline, four GPU tests, and CUDA-event benchmark fixtures compile with NVCC
-12.6.85 and warnings as errors, but have not run without an NVIDIA driver/device.
-The CUDA-on build passes 185 hardware-independent tests and explicitly skips 57
-hardware-gated GPU tests (242 total); the Python converter test is unavailable in
-that container.
-Paged attention is CPU-only. No GPU correctness or performance claim is made.
+and paged CUDA baselines, eight attention GPU tests, and CUDA-event benchmark
+fixtures compile with NVCC 12.6.85 and warnings as errors, but have not run without
+an NVIDIA driver/device. The CUDA-on build passes 185 hardware-independent tests
+and explicitly skips 61 hardware-gated GPU tests (246 total); the Python converter
+test is unavailable in that container. No GPU correctness or performance claim is
+made.
 
 ## Tensor contract
 
@@ -65,7 +65,9 @@ workspace bytes = 4 * heads * query_tokens * kv_tokens
 The same bytes hold scaled/masked scores and then probabilities after exact in-
 place softmax. Output bytes are separate. The `_out` API requires both output and
 workspace so model execution and benchmarks can reuse their allocations. The
-allocating convenience API creates both internally.
+allocating convenience API creates both internally. On CUDA, that convenience form
+explicitly synchronizes before releasing its private workspace; callers that need
+asynchronous execution use `_out` and own both lifetimes.
 
 All input/output/workspace aliasing is rejected. The current Tensor API cannot
 construct partial overlapping slices, but exact pointer checks make the present
@@ -142,7 +144,7 @@ They also cover zero query work, shape/range/dtype failures, and output/workspac
 tail alias rejection. A KV-cache test independently proves storage pinning and
 written-prefix visibility.
 
-## CUDA baseline
+## Contiguous CUDA baseline
 
 The CUDA path preserves the three stages as separate same-stream launches:
 
@@ -169,9 +171,66 @@ Static CUDA 12.6 `sm_52` compiler inspection—not runtime measurement—reports
 The softmax stage retains its separately documented 5,120-byte static shared
 scratch. Register counts alone do not establish occupancy or achieved performance.
 
-All launches are asynchronous on the caller's stream and checked immediately for
-launch errors. Q/K/V, output, and workspace must remain alive until stream
-completion. Tests synchronize before copying output to the CPU oracle.
+The `_out` launches are asynchronous on the caller's stream and checked immediately
+for launch errors. Q/K/V, output, and workspace must remain alive until stream
+completion. The allocating convenience form synchronizes before its local workspace
+is destroyed instead of relying on implicit `cudaFree` behavior. Benchmarks use
+`_out`; tests synchronize before copying output to the CPU oracle.
+
+## Paged CUDA baseline
+
+The M13 CUDA path keeps the same visible score, softmax, and value stages but reads
+K/V through a device-resident logical-to-physical table. Its layer-local layout is:
+
+```text
+Q:      [heads, query_tokens, key_dimension]
+K pool: [physical_blocks, heads, block_tokens, key_dimension]
+V pool: [physical_blocks, heads, block_tokens, value_dimension]
+table:  logical_block -> uint32 physical_block
+```
+
+`kv_tokens` is the logical history length. The table must contain exactly
+`ceil(kv_tokens / block_tokens)` entries; each entry is checked against the packed
+physical capacity before a synchronous host-to-device upload. Duplicate physical
+IDs are permitted because the K/V inputs are read-only and this is compatible with
+future prefix sharing. The final page is bounded by `kv_tokens`, so padding and
+stale bytes beyond the written prefix are never addressed.
+
+```mermaid
+flowchart LR
+    Token[Logical key position] --> Logical[logical block + token offset]
+    Logical --> Table[immutable device block table]
+    Table --> Physical[physical block]
+    Physical --> K[K page]
+    Physical --> V[V page]
+    K --> Score[score kernel]
+    V --> Values[value kernel]
+```
+
+One score thread performs the table lookup and then serially traverses the key
+width. One output-coordinate thread traverses all logical tokens and resolves each
+V page. This is deliberately straightforward and adds repeated table arithmetic;
+it does not claim the warp-grouped, page-tiled access pattern of an optimized paged-
+attention kernel. Adjacent score threads still select adjacent logical tokens, but
+their inner-dimension loads are separated by a full head width. Adjacent value
+threads select adjacent output dimensions and therefore issue adjacent V loads for
+each logical token.
+
+The move-only `PagedBlockTable` owns its device allocation and is immutable after
+construction. The caller must retain it, the three input tensors, output,
+workspace, and stream until all `_out` work completes. Host validation prevents an
+out-of-range table from launching; each device kernel also converts a corrupted
+physical ID to NaN without dereferencing outside the packed pool. This defensive
+check is not a substitute for stream-safe ownership.
+
+GPU tests compare reordered, non-identity page tables with the contiguous CPU
+oracle, poison unwritten tail slots, cover multiple heads and odd widths through
+key/value dimensions 37/41, accept empty query work, and reject invalid tables,
+capacities, devices, shapes, offsets, and aliases. The allocating and preallocated
+APIs share the same validation. CUDA 12.6 static `sm_52` inspection reports 31
+registers/thread for the paged score kernel and 29 for the paged value kernel, with
+no static shared/local memory or spills. That does not establish occupancy or
+runtime performance.
 
 ## CPU benchmark results
 
@@ -191,9 +250,12 @@ operations are excluded from that FLOP numerator but included in elapsed time.
 The host load average was 15.64 at measurement start, so these are local reference
 baselines, not optimization claims. Full methodology is in `docs/PERFORMANCE.md`.
 
-CUDA fixtures use the same shapes, preallocate all tensors, issue ten warmups, and
-time the complete three-stage sequence with same-stream CUDA events and stop-event
-synchronization. They have not executed, so there are no GPU result rows.
+Contiguous and paged CUDA fixtures use the same logical shapes, preallocate all
+tensors, issue ten warmups, and time the complete three-stage sequence with same-
+stream CUDA events and stop-event synchronization. The paged fixture uses reversed
+non-identity mappings, a 16-token page for the standard shapes (8 for the odd
+case), and two spare physical pages; allocation and table upload are outside the
+timed region. The fixtures have not executed, so there are no GPU result rows.
 
 The M13 same-process run retained both dimension-major baselines and applied the
 same 32-coordinate value tile to contiguous and paged storage. Median CPU times:
@@ -231,11 +293,13 @@ timing boundaries, and commands are in `docs/PERFORMANCE.md`.
 - no batch dimension or ragged packed-sequence metadata exists yet,
 - CPU and CUDA paths are Float32 only,
 - the CUDA dot products are educational serial-per-output baselines,
-- the paged path uses one exclusive cache-wide read lease,
-- no CUDA paged storage/kernel, attention fusion, GQA, or GPU page-table analysis
+- the CPU paged path uses one exclusive cache-wide read lease,
+- the CUDA paged baseline uses a direct `cudaMalloc` table and caller-packed layer
+  tensors; it is not integrated with `PagedKvCache` or `HelixAllocator`,
+- no attention fusion, GQA, GPU page-pool lifetime, or measured page-table analysis
   is claimed.
 
-GPU paged attention remains the next hardware-dependent implementation and must be
-validated against this CPU oracle before optimization. A future concurrent CPU or
-GPU executor also needs a finer-grained lifetime mechanism than the current
-cache-wide read lease.
+GPU runtime correctness against the CPU oracle is the next mandatory gate before
+optimizing this paged baseline. Integrating it into a concurrent GPU executor also
+requires device-resident KV allocation and a stream/event lifetime mechanism rather
+than the CPU cache's coarse read lease.

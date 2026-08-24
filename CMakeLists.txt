@@ -192,7 +192,11 @@ add_library(helix::attention ALIAS helix_attention)
 target_compile_features(helix_attention PUBLIC cxx_std_20)
 target_link_libraries(helix_attention PUBLIC helix::cpu_kernels helix::kv_cache)
 if(HELIX_ENABLE_CUDA)
-  target_sources(helix_attention PRIVATE src/attention/cuda.cu)
+  target_sources(
+    helix_attention
+    PRIVATE
+      src/attention/cuda.cu
+      src/attention/cuda_paged.cu)
   target_link_libraries(helix_attention PUBLIC helix::cuda_kernels helix::cuda_runtime)
 endif()
 target_include_directories(

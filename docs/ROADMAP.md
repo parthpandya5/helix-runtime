@@ -433,7 +433,7 @@ for the 128 KiB and 2 MiB histories because it traverses 8 and 32 blocks; the od
 25,752-byte case was within run-to-run variation. See `docs/KV_CACHE.md` and
 `docs/PERFORMANCE.md` for exact methodology and limitations.
 
-### M13 — Paged attention — CPU-validated, sanitized, and benchmarked; GPU path pending
+### M13 — Paged attention — CPU measured; CUDA baseline compile-validated
 
 - correctness path reading K/V through sequence block tables
 - comparison with contiguous attention
@@ -477,10 +477,25 @@ Isolated paired measurements reduced median CPU time by 13.3%–27.7% and remove
 2 KiB–1 MiB of temporary combined K/V, while full tiny runtime traces improved by
 only 0.08%–6.23%.
 
-This completes the CPU correctness and measurement gate, not the GPU portion of
-M13. There is no device-resident block pool/table or CUDA paged-attention kernel,
-so coalescing, occupancy, GPU latency, and capacity remain pending NVIDIA hardware
-and implementation.
+CUDA baseline record (2026-08-24): an immutable move-only device block table and
+Float32 page kernels now consume layer-local
+`[physical_blocks,heads,block_tokens,width]` K/V tensors without compaction. The
+three explicit stages remain paged score/causal mask, shared stable softmax, and
+paged probability-times-V. Four GPU tests compare reordered/non-divisible pages
+with the contiguous CPU oracle, poison unwritten tail slots, cover odd dimensions
+and empty work, and exercise invalid table/shape/offset/device/alias contracts.
+Four CUDA-event fixtures pair the existing logical attention sizes with reversed
+page mappings and account for active bytes, physical capacity, table bytes, and
+workspace.
+
+NVCC 12.6.85 compiled the implementation, tests, and benchmarks with line
+information and warnings as errors. The CUDA-on suite passes 185 host tests and
+registers 61 GPU tests (246 total), all correctly skipped without a driver/device.
+Static `sm_52` inspection reports 31/29 registers per thread for the paged
+score/value kernels with no shared/local memory or spills. These are compiler facts,
+not execution evidence. Runtime correctness, event timing, coalescing/occupancy
+profiling, a GPU-resident KV pool, and allocator/executor integration remain gated
+on NVIDIA hardware and later work.
 
 ## Phase E: requests and continuous execution
 

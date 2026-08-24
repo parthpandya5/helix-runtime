@@ -380,8 +380,13 @@ but intentionally coarse: one long read blocks unrelated sequences in the same
 cache. The final logical block exposes only its written prefix, so stale bytes in
 unused slots or recycled blocks are unreachable. CPU measurements compare retained
 dimension-major baselines, equal tiled traversals, and the page-table overhead.
-There is no CUDA paged-attention implementation yet; CPU locality results are not
-GPU coalescing evidence.
+A compile-validated CUDA baseline instead consumes layer-local device tensors
+`K/V[physical_blocks,heads,block_tokens,width]` and a move-only immutable device
+table. Kernels translate each logical token to `(physical block, token offset)` and
+bound the final partial page by the explicit logical KV length. This establishes a
+visible device traversal contract, but it is not connected to the CPU
+`PagedKvCache`, `HelixAllocator`, or model executor. Its compiler resource report is
+not GPU coalescing or performance evidence.
 
 The runtime decode variant logically extends the leased history with an
 uncommitted contiguous `[heads,tail_tokens,head_dimension]` K/V tail. Tail query
