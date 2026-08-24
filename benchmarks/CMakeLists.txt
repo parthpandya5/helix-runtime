@@ -43,6 +43,16 @@ add_test(
 set_tests_properties(benchmark.smoke PROPERTIES LABELS "benchmark;smoke")
 
 add_test(
+  NAME benchmark.allocator_trace_smoke
+  COMMAND helix_benchmarks
+          "--benchmark_filter=BM_(SystemResource|HelixAllocator)WorkloadTrace/(RandomSize|SmallHeavy|LargeHeavy|Bursty|LlmLike)$"
+          --benchmark_min_time=1x
+          --benchmark_repetitions=1)
+set_tests_properties(
+  benchmark.allocator_trace_smoke
+  PROPERTIES LABELS "benchmark;memory;smoke")
+
+add_test(
   NAME benchmark.tensor_allocator_smoke
   COMMAND helix_benchmarks
           "--benchmark_filter=BM_Tensor(DirectAllocation|HelixAllocator)SteadyState/elements:1024$"

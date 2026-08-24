@@ -46,7 +46,7 @@ private:
 
   Allocation(void* pointer, std::size_t requested_bytes, std::size_t allocated_bytes,
              std::size_t alignment, std::uint64_t id, std::uint64_t allocator_id,
-             Device device) noexcept;
+             std::size_t active_slot, Device device) noexcept;
 
   void* pointer_ = nullptr;
   std::size_t requested_bytes_ = 0;
@@ -54,6 +54,7 @@ private:
   std::size_t alignment_ = 0;
   std::uint64_t id_ = 0;
   std::uint64_t allocator_id_ = 0;
+  std::size_t active_slot_ = std::numeric_limits<std::size_t>::max();
   Device device_ = Device::cpu();
 };
 

@@ -7,12 +7,13 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <iterator>
 #include <limits>
 #include <mutex>
 #include <optional>
 #include <sstream>
 #include <string>
-#include <unordered_map>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -81,16 +82,23 @@ std::uint64_t next_allocator_id() {
 } // namespace
 
 struct HelixAllocator::Impl {
+  static constexpr std::size_t kNoActiveSlot = std::numeric_limits<std::size_t>::max();
+
   struct Block {
     std::size_t offset = 0;
     std::size_t bytes = 0;
     std::size_t requested_bytes = 0;
     std::uint64_t allocation_id = 0;
+    std::size_t active_slot = kNoActiveSlot;
 
     [[nodiscard]] bool allocated() const noexcept {
       return allocation_id != 0;
     }
   };
+
+  static_assert(std::is_nothrow_move_constructible_v<Block> &&
+                    std::is_nothrow_move_assignable_v<Block>,
+                "in-place block-table updates rely on non-throwing Block moves");
 
   struct Segment {
     std::uint64_t id = 0;
@@ -109,12 +117,58 @@ struct HelixAllocator::Impl {
     std::size_t alignment = 0;
   };
 
+  struct ActiveSlot {
+    ActiveRecord record;
+    std::uint64_t allocation_id = 0;
+    std::size_t next_free = kNoActiveSlot;
+    bool occupied = false;
+  };
+
+  static_assert(std::is_nothrow_move_constructible_v<ActiveSlot> &&
+                    std::is_nothrow_move_assignable_v<ActiveSlot>,
+                "active-slot growth relies on non-throwing ActiveSlot moves");
+
   struct Candidate {
     std::size_t segment_index = 0;
     std::size_t block_index = 0;
     std::size_t padding = 0;
     std::size_t waste = 0;
   };
+
+  [[nodiscard]] std::size_t acquire_active_slot(const ActiveRecord& record,
+                                                std::uint64_t allocation_id) {
+    std::size_t slot_index = kNoActiveSlot;
+    if (free_active_slot != kNoActiveSlot) {
+      slot_index = free_active_slot;
+      HELIX_ASSERT(slot_index < active_slots.size(),
+                   "active-slot free list contains an out-of-range slot");
+      ActiveSlot& slot = active_slots[slot_index];
+      HELIX_ASSERT(!slot.occupied, "active-slot free list contains an occupied slot");
+      free_active_slot = slot.next_free;
+      slot.record = record;
+      slot.allocation_id = allocation_id;
+      slot.next_free = kNoActiveSlot;
+      slot.occupied = true;
+    } else {
+      slot_index = active_slots.size();
+      active_slots.push_back(ActiveSlot{record, allocation_id, kNoActiveSlot, true});
+    }
+    ++active_count;
+    return slot_index;
+  }
+
+  void release_active_slot(std::size_t slot_index) {
+    HELIX_ASSERT(slot_index < active_slots.size(), "released active slot is out of range");
+    ActiveSlot& slot = active_slots[slot_index];
+    HELIX_ASSERT(slot.occupied, "released active slot is already free");
+    HELIX_ASSERT(active_count != 0, "active-slot count underflow");
+    slot.record = ActiveRecord{};
+    slot.allocation_id = 0;
+    slot.next_free = free_active_slot;
+    slot.occupied = false;
+    free_active_slot = slot_index;
+    --active_count;
+  }
 
   Impl(std::shared_ptr<MemoryResource> upstream, AllocatorConfig allocator_config)
       : resource(std::move(upstream)), config(allocator_config), allocator_id(next_allocator_id()) {
@@ -171,7 +225,7 @@ struct HelixAllocator::Impl {
     segment.bytes = segment_bytes;
     segment.alignment = segment_alignment;
     segment.blocks.reserve(1);
-    segment.blocks.push_back(Block{0, segment_bytes, 0, 0});
+    segment.blocks.push_back(Block{0, segment_bytes, 0, 0, kNoActiveSlot});
     segment.base = resource->allocate(segment_bytes, segment_alignment);
     HELIX_CHECK(segment.base != nullptr, ErrorCode::kResourceExhausted,
                 "memory resource returned a null segment");
@@ -211,40 +265,65 @@ struct HelixAllocator::Impl {
     const std::uint64_t allocation_id = next_allocation_id;
     void* pointer = offset_pointer(segment.base, allocation_offset);
 
-    std::vector<Block> replacement;
-    replacement.reserve(segment.blocks.size() + 2);
-    for (std::size_t index = 0; index < segment.blocks.size(); ++index) {
-      if (index != candidate.block_index) {
-        replacement.push_back(segment.blocks[index]);
-        continue;
+    const std::size_t added_blocks = static_cast<std::size_t>(candidate.padding != 0) +
+                                     static_cast<std::size_t>(suffix_bytes != 0);
+    const std::size_t required_blocks =
+        checked_add(segment.blocks.size(), added_blocks, "allocator block-count overflow");
+    if (required_blocks > segment.blocks.capacity()) {
+      std::size_t new_capacity = std::max<std::size_t>(segment.blocks.capacity(), 8);
+      while (new_capacity < required_blocks) {
+        if (new_capacity > segment.blocks.max_size() / 2) {
+          new_capacity = required_blocks;
+          break;
+        }
+        new_capacity *= 2;
       }
-      if (candidate.padding != 0) {
-        replacement.push_back(Block{free_block.offset, candidate.padding, 0, 0});
-      }
-      replacement.push_back(
-          Block{allocation_offset, allocated_bytes, requested_bytes, allocation_id});
-      if (suffix_bytes != 0) {
-        replacement.push_back(Block{suffix_offset, suffix_bytes, 0, 0});
-      }
+      segment.blocks.reserve(new_capacity);
     }
+
+    // Complete every potentially throwing metadata allocation before publishing
+    // the active record. With reserved capacity and non-throwing Block moves, the
+    // split below cannot strand a partially committed allocation.
+
+    const std::size_t new_bytes_allocated = checked_add(
+        bytes_allocated, allocated_bytes, "HelixAllocator allocated-byte counter overflow");
+    const std::size_t new_bytes_requested = checked_add(
+        bytes_requested, requested_bytes, "HelixAllocator requested-byte counter overflow");
 
     const ActiveRecord record{segment.id,      allocation_offset, pointer,
                               requested_bytes, allocated_bytes,   alignment};
-    const auto [active_iterator, inserted] = active.emplace(allocation_id, record);
-    static_cast<void>(active_iterator);
-    HELIX_ASSERT(inserted, "allocation id unexpectedly collided");
-    segment.blocks.swap(replacement);
+    const std::size_t active_slot = acquire_active_slot(record, allocation_id);
+
+    const Block allocated_block{allocation_offset, allocated_bytes, requested_bytes, allocation_id,
+                                active_slot};
+    if (candidate.padding == 0) {
+      segment.blocks[candidate.block_index] = allocated_block;
+      if (suffix_bytes != 0) {
+        segment.blocks.insert(segment.blocks.begin() +
+                                  static_cast<std::ptrdiff_t>(candidate.block_index + 1),
+                              Block{suffix_offset, suffix_bytes, 0, 0, kNoActiveSlot});
+      }
+    } else {
+      segment.blocks[candidate.block_index] =
+          Block{free_block.offset, candidate.padding, 0, 0, kNoActiveSlot};
+      segment.blocks.insert(segment.blocks.begin() +
+                                static_cast<std::ptrdiff_t>(candidate.block_index + 1),
+                            allocated_block);
+      if (suffix_bytes != 0) {
+        segment.blocks.insert(segment.blocks.begin() +
+                                  static_cast<std::ptrdiff_t>(candidate.block_index + 2),
+                              Block{suffix_offset, suffix_bytes, 0, 0, kNoActiveSlot});
+      }
+    }
 
     ++next_allocation_id;
-    bytes_allocated = checked_add(bytes_allocated, allocated_bytes,
-                                  "HelixAllocator allocated-byte counter overflow");
-    bytes_requested = checked_add(bytes_requested, requested_bytes,
-                                  "HelixAllocator requested-byte counter overflow");
+    bytes_allocated = new_bytes_allocated;
+    bytes_requested = new_bytes_requested;
     peak_bytes_allocated = std::max(peak_bytes_allocated, bytes_allocated);
     ++allocation_count;
     assert_invariants();
     return Allocation(pointer, requested_bytes, allocated_bytes, alignment, allocation_id,
-                      allocator_id, resource->device());
+                      allocator_id, active_slot, resource->device());
   }
 
   void assert_invariants() const {
@@ -268,10 +347,12 @@ struct HelixAllocator::Impl {
         if (block.allocated()) {
           HELIX_ASSERT(block.requested_bytes != 0 && block.requested_bytes <= block.bytes,
                        "allocated block has invalid requested bytes");
-          const auto active_iterator = active.find(block.allocation_id);
-          HELIX_ASSERT(active_iterator != active.end(),
-                       "allocated block has no active allocation record");
-          const ActiveRecord& record = active_iterator->second;
+          HELIX_ASSERT(block.active_slot < active_slots.size(),
+                       "allocated block has an invalid active slot");
+          const ActiveSlot& slot = active_slots[block.active_slot];
+          HELIX_ASSERT(slot.occupied && slot.allocation_id == block.allocation_id,
+                       "allocated block has no matching active slot");
+          const ActiveRecord& record = slot.record;
           HELIX_ASSERT(record.segment_id == segment.id && record.offset == block.offset &&
                            record.requested_bytes == block.requested_bytes &&
                            record.allocated_bytes == block.bytes &&
@@ -284,6 +365,8 @@ struct HelixAllocator::Impl {
           ++scanned_active;
         } else {
           HELIX_ASSERT(block.requested_bytes == 0, "free block retains non-zero requested bytes");
+          HELIX_ASSERT(block.active_slot == kNoActiveSlot,
+                       "free block retains an active-slot index");
           HELIX_ASSERT(!previous_was_free, "adjacent free blocks were not coalesced");
         }
         previous_was_free = !block.allocated();
@@ -298,8 +381,35 @@ struct HelixAllocator::Impl {
                  "allocator allocated-byte counter disagrees with blocks");
     HELIX_ASSERT(scanned_requested == bytes_requested,
                  "allocator requested-byte counter disagrees with blocks");
-    HELIX_ASSERT(scanned_active == active.size(),
-                 "allocator active map disagrees with allocated blocks");
+    std::size_t occupied_slots = 0;
+    for (std::size_t index = 0; index < active_slots.size(); ++index) {
+      const ActiveSlot& slot = active_slots[index];
+      if (slot.occupied) {
+        ++occupied_slots;
+        std::size_t references = 0;
+        for (const Segment& segment : segments) {
+          references += static_cast<std::size_t>(
+              std::count_if(segment.blocks.begin(), segment.blocks.end(), [&](const Block& block) {
+                return block.allocated() && block.active_slot == index;
+              }));
+        }
+        HELIX_ASSERT(references == 1, "occupied active slot must have exactly one block");
+      }
+    }
+    std::size_t free_slots = 0;
+    std::size_t free_cursor = free_active_slot;
+    while (free_cursor != kNoActiveSlot) {
+      HELIX_ASSERT(free_cursor < active_slots.size(), "active-slot free list is out of range");
+      HELIX_ASSERT(!active_slots[free_cursor].occupied,
+                   "active-slot free list contains an occupied slot");
+      ++free_slots;
+      HELIX_ASSERT(free_slots <= active_slots.size(), "active-slot free list contains a cycle");
+      free_cursor = active_slots[free_cursor].next_free;
+    }
+    HELIX_ASSERT(occupied_slots == active_count && scanned_active == active_count,
+                 "active-slot count disagrees with allocated blocks");
+    HELIX_ASSERT(free_slots + occupied_slots == active_slots.size(),
+                 "active-slot free list does not cover every unoccupied slot");
 #endif
   }
 
@@ -314,7 +424,9 @@ struct HelixAllocator::Impl {
       }
     }
     segments.clear();
-    active.clear();
+    active_slots.clear();
+    free_active_slot = kNoActiveSlot;
+    active_count = 0;
   }
 
   std::shared_ptr<MemoryResource> resource;
@@ -322,7 +434,9 @@ struct HelixAllocator::Impl {
   const std::uint64_t allocator_id;
   mutable std::mutex mutex;
   std::vector<Segment> segments;
-  std::unordered_map<std::uint64_t, ActiveRecord> active;
+  std::vector<ActiveSlot> active_slots;
+  std::size_t free_active_slot = kNoActiveSlot;
+  std::size_t active_count = 0;
   std::uint64_t next_segment_id = 1;
   std::uint64_t next_allocation_id = 1;
   std::size_t bytes_reserved = 0;
@@ -337,9 +451,10 @@ struct HelixAllocator::Impl {
 
 Allocation::Allocation(void* pointer, std::size_t requested_bytes, std::size_t allocated_bytes,
                        std::size_t alignment, std::uint64_t id, std::uint64_t allocator_id,
-                       Device device) noexcept
+                       std::size_t active_slot, Device device) noexcept
     : pointer_(pointer), requested_bytes_(requested_bytes), allocated_bytes_(allocated_bytes),
-      alignment_(alignment), id_(id), allocator_id_(allocator_id), device_(device) {}
+      alignment_(alignment), id_(id), allocator_id_(allocator_id), active_slot_(active_slot),
+      device_(device) {}
 
 HelixAllocator::HelixAllocator(std::shared_ptr<MemoryResource> resource, AllocatorConfig config)
     : impl_(std::make_unique<Impl>(std::move(resource), config)) {}
@@ -383,10 +498,13 @@ void HelixAllocator::deallocate(const Allocation& allocation) {
               "HelixAllocator cannot deallocate an empty handle");
   HELIX_CHECK(allocation.allocator_id_ == impl_->allocator_id, ErrorCode::kInvalidArgument,
               "HelixAllocator allocation belongs to another allocator instance");
-  const auto active_iterator = impl_->active.find(allocation.id());
-  HELIX_CHECK(active_iterator != impl_->active.end(), ErrorCode::kInvalidArgument,
+  HELIX_CHECK(allocation.active_slot_ < impl_->active_slots.size(), ErrorCode::kInvalidArgument,
               "HelixAllocator allocation is unknown or was already freed");
-  const Impl::ActiveRecord& record = active_iterator->second;
+  const Impl::ActiveSlot& active_slot = impl_->active_slots[allocation.active_slot_];
+  HELIX_CHECK(active_slot.occupied && active_slot.allocation_id == allocation.id(),
+              ErrorCode::kInvalidArgument,
+              "HelixAllocator allocation is unknown or was already freed");
+  const Impl::ActiveRecord record = active_slot.record;
   HELIX_CHECK(record.pointer == allocation.pointer() &&
                   record.requested_bytes == allocation.requested_bytes() &&
                   record.allocated_bytes == allocation.allocated_bytes() &&
@@ -398,32 +516,40 @@ void HelixAllocator::deallocate(const Allocation& allocation) {
   const auto segment_iterator =
       std::find_if(impl_->segments.begin(), impl_->segments.end(),
                    [&](const Impl::Segment& item) { return item.id == record.segment_id; });
-  HELIX_ASSERT(segment_iterator != impl_->segments.end(),
-               "active allocation references a missing segment");
+  HELIX_CHECK(segment_iterator != impl_->segments.end(), ErrorCode::kInternal,
+              "active allocation references a missing segment");
   Impl::Segment& segment = *segment_iterator;
-  bool found_block = false;
-  std::vector<Impl::Block> replacement;
-  replacement.reserve(segment.blocks.size());
-  for (const Impl::Block& existing : segment.blocks) {
-    Impl::Block block = existing;
-    if (existing.offset == record.offset && existing.allocation_id == allocation.id()) {
-      block.requested_bytes = 0;
-      block.allocation_id = 0;
-      found_block = true;
-    }
-    if (!replacement.empty() && !replacement.back().allocated() && !block.allocated()) {
-      HELIX_ASSERT(replacement.back().offset + replacement.back().bytes == block.offset,
-                   "allocator free blocks are not adjacent in sorted order");
-      replacement.back().bytes += block.bytes;
-    } else {
-      replacement.push_back(block);
-    }
+  const auto block_iterator =
+      std::find_if(segment.blocks.begin(), segment.blocks.end(), [&](const Impl::Block& block) {
+        return block.offset == record.offset && block.allocation_id == allocation.id() &&
+               block.active_slot == allocation.active_slot_;
+      });
+  HELIX_CHECK(block_iterator != segment.blocks.end(), ErrorCode::kInternal,
+              "active allocation has no matching block");
+  std::size_t block_index =
+      static_cast<std::size_t>(std::distance(segment.blocks.begin(), block_iterator));
+  segment.blocks[block_index].requested_bytes = 0;
+  segment.blocks[block_index].allocation_id = 0;
+  segment.blocks[block_index].active_slot = Impl::kNoActiveSlot;
+
+  if (block_index != 0 && !segment.blocks[block_index - 1].allocated()) {
+    Impl::Block& previous = segment.blocks[block_index - 1];
+    HELIX_ASSERT(previous.offset + previous.bytes == segment.blocks[block_index].offset,
+                 "allocator free blocks are not adjacent in sorted order");
+    previous.bytes += segment.blocks[block_index].bytes;
+    segment.blocks.erase(segment.blocks.begin() + static_cast<std::ptrdiff_t>(block_index));
+    --block_index;
   }
-  HELIX_ASSERT(found_block, "active allocation has no matching block");
-  segment.blocks.swap(replacement);
+  if (block_index + 1 < segment.blocks.size() && !segment.blocks[block_index + 1].allocated()) {
+    Impl::Block& current = segment.blocks[block_index];
+    HELIX_ASSERT(current.offset + current.bytes == segment.blocks[block_index + 1].offset,
+                 "allocator free blocks are not adjacent in sorted order");
+    current.bytes += segment.blocks[block_index + 1].bytes;
+    segment.blocks.erase(segment.blocks.begin() + static_cast<std::ptrdiff_t>(block_index + 1));
+  }
   impl_->bytes_allocated -= record.allocated_bytes;
   impl_->bytes_requested -= record.requested_bytes;
-  impl_->active.erase(active_iterator);
+  impl_->release_active_slot(allocation.active_slot_);
   impl_->assert_invariants();
 }
 
@@ -432,8 +558,12 @@ bool HelixAllocator::owns(const Allocation& allocation) const {
   if (allocation.allocator_id_ != impl_->allocator_id) {
     return false;
   }
-  const auto iterator = impl_->active.find(allocation.id());
-  return iterator != impl_->active.end() && iterator->second.pointer == allocation.pointer();
+  if (allocation.active_slot_ >= impl_->active_slots.size()) {
+    return false;
+  }
+  const Impl::ActiveSlot& slot = impl_->active_slots[allocation.active_slot_];
+  return slot.occupied && slot.allocation_id == allocation.id() &&
+         slot.record.pointer == allocation.pointer();
 }
 
 AllocatorStats HelixAllocator::stats() const {
@@ -445,7 +575,7 @@ AllocatorStats HelixAllocator::stats() const {
   result.bytes_free = impl_->bytes_reserved - impl_->bytes_allocated;
   result.peak_bytes_allocated = impl_->peak_bytes_allocated;
   result.segment_count = impl_->segments.size();
-  result.active_allocation_count = impl_->active.size();
+  result.active_allocation_count = impl_->active_count;
   result.allocation_count = impl_->allocation_count;
   result.reuse_count = impl_->reuse_count;
   result.underlying_allocations = impl_->underlying_allocations;

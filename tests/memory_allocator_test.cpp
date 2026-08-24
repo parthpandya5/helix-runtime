@@ -242,12 +242,21 @@ TEST(HelixAllocatorTest, DetectsDoubleFreeAndStaleHandleAbaReuse) {
   allocator.deallocate(original);
   EXPECT_THROW(allocator.deallocate(stale_copy), Error);
 
-  const Allocation replacement = allocator.allocate(128);
-  EXPECT_EQ(replacement.pointer(), original.pointer());
-  EXPECT_NE(replacement.id(), original.id());
+  std::uint64_t previous_id = original.id();
+  for (std::size_t iteration = 0; iteration < 1'024; ++iteration) {
+    const Allocation replacement = allocator.allocate(128);
+    EXPECT_EQ(replacement.pointer(), original.pointer());
+    EXPECT_GT(replacement.id(), previous_id);
+    EXPECT_FALSE(allocator.owns(stale_copy));
+    if (iteration % 127 == 0) {
+      EXPECT_THROW(allocator.deallocate(stale_copy), Error);
+    }
+    EXPECT_TRUE(allocator.owns(replacement));
+    previous_id = replacement.id();
+    allocator.deallocate(replacement);
+  }
   EXPECT_THROW(allocator.deallocate(stale_copy), Error);
-  EXPECT_TRUE(allocator.owns(replacement));
-  allocator.deallocate(replacement);
+  EXPECT_EQ(allocator.stats().active_allocation_count, 0U);
 }
 
 TEST(HelixAllocatorTest, RejectsHandleFromAnotherAllocatorWithSameAddressAndLocalId) {
