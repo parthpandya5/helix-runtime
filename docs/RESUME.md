@@ -53,8 +53,10 @@ that into a GPU performance claim.
 - Built a bounded-memory Hugging Face Llama safetensors converter for sharded
   F32/F16/BF16 checkpoints, including strict architecture/path validation,
   projection transposition, RoPE coordinate remapping, atomic output replacement,
-  and an independent source-layout logits oracle; broad checkpoint compatibility
-  is deliberately not claimed.
+  and an independent bounded source-layout logits oracle; validated all 128,000
+  logits from four raw-token sequences on one revision-pinned public checkpoint
+  against both Helix and a CPU Float32 Transformers reference, while explicitly
+  rejecting broader compatibility claims.
 - Built transactional single-sequence prefill/decode and greedy generation over a
   contiguous KV cache; matched cached logits/tokens against full-prefix
   recomputation and measured 3.69x–56.79x next-position CPU speedups across

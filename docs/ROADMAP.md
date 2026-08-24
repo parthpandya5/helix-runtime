@@ -595,9 +595,9 @@ source-layout oracle compares Hugging Face-style half-split-RoPE logits with the
 converted Helix model. Debug, Release, and ASan/UBSan CPU suites pass 172/172.
 The CUDA 12.6 compile container builds both C++ tools, passes 171 host tests, and
 explicitly skips 57 GPU tests (228 total); its absent Python/NumPy means the one
-converter integration test is not registered there. No downloaded public
-checkpoint or tokenizer has been validated, so broad compatibility is not
-claimed. Details are in `docs/MODEL_SUPPORT.md`.
+converter integration test is not registered there. At that checkpoint, neither
+a downloaded public model nor a tokenizer had been validated, so broad
+compatibility was not claimed. Details are in `docs/MODEL_SUPPORT.md`.
 
 Immutable-loading follow-up (2026-08-24, commit `fc7fff5`): Tensor/Storage now
 supports aligned externally owned CPU ranges with an enforced read-only contract.
@@ -616,6 +616,26 @@ not a cold-disk, RSS, inference, or GPU result. Debug, Release, and ASan/UBSan
 native suites pass 177/177. The CUDA 12.6 compile container passes 176 C++ host
 tests and explicitly skips 57 GPU tests without a device (233 total); its separate
 converter integration test remains unavailable because Python/NumPy is absent.
+
+Public-checkpoint validation follow-up (2026-08-24, commit `d433760`): a bounded
+offline validator independently parses source-layout safetensors, evaluates the
+supported Llama equations including half-split RoPE, and compares the complete
+last-token logit vector emitted by the C++ inspector. Its default five-million-
+parameter ceiling keeps the explicit reference loops scoped to small correctness
+models. Synthetic integration now covers success, vocabulary rejection, budget
+refusal, and a deliberately mismatched source/model pair in addition to the
+converter checks above.
+
+The revision-pinned public artifact
+`llamafactory/tiny-random-Llama-3@c17693c90450da4160582668bfe65a60175d43e5`
+converted to a deterministic 1,032,272-parameter Float32 `HELIXLM1` file. Four
+raw-token sequences spanning one through seven positions and token IDs 0 through
+31,999 produced 128,000 logits; every element passed `rtol=2e-5`, `atol=2e-6`
+against both the independent NumPy source oracle and optional CPU Float32 PyTorch
+2.0.1 / Transformers 4.32.0 execution. Maximum absolute errors were `2.98e-8`
+and `8.94e-8`, respectively. Exact input/output hashes are recorded in
+`docs/MODEL_SUPPORT.md`. This is one random checkpoint and no tokenizer, broad
+compatibility, learned language quality, or CUDA model result is claimed.
 
 ### M18 — Autoregressive generation — Implemented, CPU-validated, sanitized, and benchmarked
 

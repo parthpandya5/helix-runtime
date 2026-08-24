@@ -11,8 +11,9 @@ The implementation, native weight container, unit tests, sanitizer suite, CPU
 benchmarks, and a narrowly checked Hugging Face Llama safetensors conversion path
 are complete. Native files can be loaded through either portable owned copies or
 an opt-in immutable POSIX mapping. CUDA model execution, fused tensor batching,
-tokenizer integration, and validation against a downloaded public checkpoint
-remain later gates.
+and tokenizer/text-prompt integration remain later gates. One revision-pinned
+public tiny-random checkpoint has been validated at the raw-token/logit boundary;
+that single artifact does not imply broad checkpoint compatibility.
 
 ## Exact architecture contract
 
@@ -238,6 +239,12 @@ cmake --build build --target helix_model_pack helix_model_inspect
   --packer ./build/tools/helix_model_pack
 
 ./build/tools/helix_model_inspect ./models/model.helix --smoke
+
+.venv-convert/bin/python tools/validate_hf_llama.py \
+  --checkpoint ./models/hf-llama \
+  --model ./models/model.helix \
+  --inspector ./build/tools/helix_model_inspect \
+  --tokens 1,42,7
 ```
 
 `helix_model_inspect` loads and validates every payload, reports geometry and
@@ -257,6 +264,101 @@ ctest --test-dir build-converter -L converter --output-on-failure
 
 If Python/NumPy is absent, CMake reports converter tests as off; this never blocks
 the C++ runtime, tools, or the remaining test suite.
+
+### Revision-pinned public checkpoint validation — 2026-08-24
+
+Helix has one deliberately narrow public-checkpoint result. The artifact is
+[`llamafactory/tiny-random-Llama-3`](https://huggingface.co/llamafactory/tiny-random-Llama-3/tree/c17693c90450da4160582668bfe65a60175d43e5)
+at immutable revision `c17693c90450da4160582668bfe65a60175d43e5`, not that
+repository's moving `main` branch. Its Apache-2.0 model card and configuration
+describe a two-layer `LlamaForCausalLM` with `H=16`, `I=64`, four attention and
+four K/V heads, default full RoPE, a 32,000-token vocabulary, and F16 weights.
+The exact downloaded inputs were:
+
+| File | Bytes | SHA-256 |
+|---|---:|---|
+| `config.json` | 629 | `fa37499d22425657fa3a03a0dceaeb8c6c4d1161c0c254aa0d16e2390628f02a` |
+| `model.safetensors` | 2,066,736 | `893f1e09fc17a2148c1aab60bdb8a5c50b69f14d3ce40afa893901482dba4f54` |
+
+Starting from an empty `/tmp/helix-public-checkpoint`, the pinned download and
+conversion commands are:
+
+```bash
+mkdir -p /tmp/helix-public-checkpoint
+curl -fL --output /tmp/helix-public-checkpoint/config.json \
+  https://huggingface.co/llamafactory/tiny-random-Llama-3/resolve/c17693c90450da4160582668bfe65a60175d43e5/config.json
+curl -fL --output /tmp/helix-public-checkpoint/model.safetensors \
+  https://huggingface.co/llamafactory/tiny-random-Llama-3/resolve/c17693c90450da4160582668bfe65a60175d43e5/model.safetensors
+shasum -a 256 /tmp/helix-public-checkpoint/config.json \
+  /tmp/helix-public-checkpoint/model.safetensors
+
+.venv-convert/bin/python tools/convert_hf_llama.py \
+  --input /tmp/helix-public-checkpoint \
+  --output /tmp/helix-public-checkpoint/model.helix \
+  --packer ./build-release/tools/helix_model_pack \
+  --chunk-mib 1
+shasum -a 256 /tmp/helix-public-checkpoint/model.helix
+```
+
+Conversion through commit `d433760`, using Python 3.14.3, NumPy 2.5.2, and the
+Release Apple Clang 17 packer, produced a deterministic 4,130,944-byte Float32
+`HELIXLM1` file with 1,032,272 parameters and SHA-256
+`a855bb813b69b71d613347be1e31d7bf21f73d2be0b5b60227e5cd4c944177cd`.
+Downloaded inputs and generated weights remained outside the repository.
+
+`tools/validate_hf_llama.py` is a bounded correctness oracle, not an alternate
+runtime. It independently parses source-layout safetensors, evaluates bias-free
+Llama with `[output,input]` projections and half-split RoPE, invokes the C++
+inspector, and compares the complete last-token logits vector. It refuses more
+than five million logical parameters by default so an accidental 7B-model command
+does not enter a path built from explicit reference loops. The CTest integration
+covers mixed F32/F16/BF16 shards, success, out-of-vocabulary input, size refusal,
+and a deliberately mismatched source/model pair.
+
+Four public-model sequences were checked:
+
+```text
+0
+1,42,7
+31999,0,17,2048,3
+5,1,31,7,99,2,1234
+```
+
+All 128,000 logits passed at `rtol=2e-5`, `atol=2e-6`. Maximum absolute error
+against the independent NumPy source-layout oracle was `2.98023224e-8`. The same
+four sequences were also run through the source checkpoint with PyTorch 2.0.1 /
+Transformers 4.32.0 on CPU, forced to Float32, eager execution, one host thread,
+and `use_cache=False` under Python 3.11.14 on the Apple M3 Pro/macOS 26.0.1 arm64
+host; maximum absolute Helix/framework error was
+`8.94069672e-8`. Relative maxima are less informative near logits that round close
+to zero, so pass/fail uses the disclosed combined relative/absolute tolerance.
+
+The core validation is reproducible with the NumPy-only conversion environment.
+`--transformers` is optional and imports external packages only when requested:
+
+```bash
+.venv-convert/bin/python tools/validate_hf_llama.py \
+  --checkpoint /tmp/helix-public-checkpoint \
+  --model /tmp/helix-public-checkpoint/model.helix \
+  --inspector ./build-release/tools/helix_model_inspect \
+  --tokens 1,42,7
+
+# Exact optional external-reference environment used for the recorded run:
+python3.11 -m venv .venv-hf-validation
+.venv-hf-validation/bin/python -m pip install \
+  numpy==1.26.4 torch==2.0.1 transformers==4.32.0 safetensors==0.3.3
+HF_HOME=/tmp/helix-hf-cache \
+  .venv-hf-validation/bin/python tools/validate_hf_llama.py \
+  --checkpoint /tmp/helix-public-checkpoint \
+  --model /tmp/helix-public-checkpoint/model.helix \
+  --inspector ./build-release/tools/helix_model_inspect \
+  --tokens 1,42,7 \
+  --transformers
+```
+
+This validates weight mapping and CPU Float32 forward semantics for one random
+model. It does not validate learned language quality, tokenization, text prompts,
+generation parity, GQA/MQA, scaled RoPE, CUDA execution, or other checkpoints.
 
 ## Native model file v1
 
@@ -391,10 +493,11 @@ separate NumPy oracle evaluates the source `[output,input]` projections with
 Hugging Face half-split RoPE and compares its final logits with converted Helix
 execution. Tied-embedding fallback, atomic `--force`, GQA rejection, wrong shapes,
 non-finite inputs, and shard path escape are also covered. This is strong mapping
-evidence, but it is not a claim that a downloaded public checkpoint or tokenizer
-has been exercised.
+evidence. The separate bounded validator then exercises the exact source-layout
+math, failure detection, and the revision-pinned public checkpoint described
+above; tokenizer/text-prompt behavior remains untested.
 
-Validation on 2026-08-24 through mapped-loader commit `fc7fff5`:
+Validation on 2026-08-24 through checkpoint-validator commit `d433760`:
 
 - Debug, Release, and Apple Clang ASan/UBSan CPU suites: 177/177 tests passed;
 - all Release tests and benchmark smoke workloads passed;
@@ -455,7 +558,8 @@ results, not evidence about a future CUDA paged-attention kernel.
 - The standalone generator supports one sequence and greedy selection only. The
   runtime supports several paged sessions but executes work items serially and has
   no sampling or fused tensor batch.
-- No tokenizer; no downloaded public checkpoint has been validated end to end.
+- No tokenizer or text-prompt path. One public tiny-random checkpoint is validated
+  from raw token IDs through full logits, not through meaningful text generation.
 - The offline converter supports only the documented standard Llama safetensors
   layout. No GQA/MQA, biases, partial/scaled RoPE, sliding windows, mixture-of-
   experts blocks, quantization, adapters, or arbitrary model graphs. Tied input

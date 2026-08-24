@@ -612,6 +612,7 @@ The offline checkpoint boundary is intentionally outside runtime execution:
 ```mermaid
 flowchart LR
     HF[Hugging Face Llama config + safetensors] --> Py[Python/NumPy converter]
+    HF --> Oracle[Bounded source-layout oracle]
     Py --> Raw[Canonical staged Float32 payloads]
     Raw --> Packer[C++ model packer]
     Packer --> File[HELIXLM1]
@@ -620,6 +621,11 @@ flowchart LR
     Loader -->|POSIX read-only map| Mapped[Immutable Tensor views]
     Owned --> Model[CpuLlamaModel]
     Mapped --> Model
+    Model --> Inspector[C++ exact-logit inspector]
+    Oracle --> Compare[Full-vector tolerance comparison]
+    Inspector --> Compare
+    HF -. optional local CPU Float32 .-> External[Transformers reference]
+    External -.-> Compare
 ```
 
 Python owns only strict safetensors/index parsing and chunked dtype/layout
@@ -630,6 +636,13 @@ shape-derived sizes, finite little-endian Float32 values, aliasing, and checksum
 Packing occurs in a private same-filesystem temporary directory, and the final
 path changes only through atomic replacement after success. The runtime has no
 Python dependency.
+
+The bounded validation tool is a correctness harness rather than another runtime:
+it independently reads source-layout tensors, evaluates the supported equations,
+and compares the complete final logit row emitted by the C++ inspector. An opt-in
+external Transformers comparison is isolated to validation. One revision-pinned
+public tiny-random checkpoint passes both paths; exact artifact hashes, tolerances,
+and exclusions are recorded in `docs/MODEL_SUPPORT.md`.
 
 Both native load paths share header/directory validation and scan every payload
 for checksum and finite-value correctness. The portable path decodes into aligned
@@ -644,11 +657,11 @@ either contiguous or paged K/V storage, repacking token-major Q/K/V tensors arou
 the existing head-major attention API. Greedy selection, EOS/length/context stops,
 a token-ID CLI, and scheduler-driven multi-request paged decode are implemented.
 The runtime schedules several requests per iteration but executes their model work
-serially; a fused tensor batch, tokenizer integration, downloaded-checkpoint
-validation, and CUDA model dispatch remain later work. The implemented converter
-supports only the documented ordinary Hugging Face Llama safetensors layout and
-rejects GQA/MQA, biases, scaled/partial RoPE, quantization, and arbitrary model
-graphs rather than guessing compatibility.
+serially; a fused tensor batch, tokenizer integration, validation of additional
+checkpoint architectures, and CUDA model dispatch remain later work. The
+implemented converter supports only the documented ordinary Hugging Face Llama
+safetensors layout and rejects GQA/MQA, biases, scaled/partial RoPE, quantization,
+and arbitrary model graphs rather than guessing compatibility.
 
 ## Runtime execution and asynchronous work
 

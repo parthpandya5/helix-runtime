@@ -19,10 +19,13 @@ the M14–M16 request and continuous-batching scheduler, the M17 narrow Llama-st
 CPU prefill runtime, the M18 single-sequence cached generation path, and the M19
 synchronous multi-request CPU execution engine are implemented and CPU-validated.
 The narrow M17 model path now has an offline Hugging Face Llama safetensors
-converter with an independent source-layout logits oracle; no downloaded public
-checkpoint result is claimed yet. Its native loader now also has an opt-in,
-read-only POSIX memory-mapped path with shared mapping lifetime and enforced
-immutable Tensor views; the portable copied loader remains available.
+converter with an independent source-layout logits oracle. A revision-pinned
+public tiny-random Llama checkpoint has been converted and all 128,000 logits from
+four raw-token sequences agree with both that oracle and a local CPU Float32
+Transformers reference at the documented tolerances; this is not broad model or
+tokenizer compatibility. Its native loader also has an opt-in, read-only POSIX
+memory-mapped path with shared mapping lifetime and enforced immutable Tensor
+views; the portable copied loader remains available.
 M22 now includes the measured block-aligned sharing primitive, a bounded exact-
 content prefix index, persistent LRU anchors, and opt-in reuse in the CPU runtime.
 The repository
@@ -367,6 +370,12 @@ cmake --build build --target helix_model_pack helix_model_inspect
   --packer ./build/tools/helix_model_pack
 
 ./build/tools/helix_model_inspect ./models/model.helix --smoke
+
+.venv-convert/bin/python tools/validate_hf_llama.py \
+  --checkpoint ./models/hf-llama \
+  --model ./models/model.helix \
+  --inspector ./build/tools/helix_model_inspect \
+  --tokens 1,42,7
 ```
 
 Compatibility is rejected rather than guessed: the converter currently requires
@@ -375,7 +384,20 @@ RoPE, and standard tensor names/shapes. It does not support GQA/MQA, partial or
 scaled RoPE, biases, quantization, adapters, or arbitrary `transformers` models.
 The synthetic integration test covers sharding, all three source dtypes, exact
 layout conversion, atomic replacement, invalid input, and source-style versus C++
-logits; a downloaded checkpoint and tokenizer remain separate validation gates.
+logits. The bounded validator refuses models above five million parameters by
+default, independently parses source-layout weights, and compares every final
+logit. Its opt-in `--transformers` mode adds an external local CPU Float32
+reference without making PyTorch a runtime or conversion dependency.
+
+The public validation uses
+[`llamafactory/tiny-random-Llama-3`](https://huggingface.co/llamafactory/tiny-random-Llama-3/tree/c17693c90450da4160582668bfe65a60175d43e5)
+at revision `c17693c90450da4160582668bfe65a60175d43e5`: 1,032,272 parameters,
+two layers, hidden size 16, four Q/K/V heads, and F16 source weights promoted to
+Float32. Across four one-to-seven-token sequences, all 128,000 logits passed at
+`rtol=2e-5`, `atol=2e-6`; maximum absolute error was `2.98e-8` versus the
+independent NumPy oracle and `8.94e-8` versus PyTorch 2.0.1 / Transformers 4.32.0.
+Exact source hashes, commands, and limitations are in
+[`docs/MODEL_SUPPORT.md`](docs/MODEL_SUPPORT.md).
 
 ## Autoregressive generation
 
@@ -445,9 +467,10 @@ the CPU engine integrates the scheduler with physical paged-KV capacity and mode
 execution, but scheduled work items run serially and no tensor batch is formed.
 Transformer execution currently supports CPU Float32 prefill, contiguous-KV
 single-sequence generation, and paged-KV multi-request orchestration. The narrow
-Hugging Face Llama converter is synthetically validated, but downloaded public-
-checkpoint execution, tokenization, GPU-resident paged KV, and CUDA model dispatch
-remain validation/roadmap work. CPU prefix reuse is exact-content, block-aligned, bounded,
+Hugging Face Llama converter has one revision-pinned public tiny-random checkpoint
+validated from raw token IDs, but tokenizer/text-prompt integration, additional
+checkpoint architectures, GPU-resident paged KV, and CUDA model dispatch remain
+validation/roadmap work. CPU prefix reuse is exact-content, block-aligned, bounded,
 and opt-in; it stores only one maximum reusable prefix per completed prompt, uses
 an engine-local namespace, and does not cache next-token logits or run on the GPU.
 Partial-page sharing, model-global cache namespaces, and request preemption remain

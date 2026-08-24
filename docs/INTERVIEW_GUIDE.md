@@ -348,9 +348,13 @@ so `--force` does not destroy an old output before the replacement is complete.
 The strongest test is semantic, not just structural: a synthetic sharded mixed-
 precision checkpoint is evaluated by an independent source-layout NumPy oracle,
 then its final logits are compared with C++ Helix execution after conversion.
-That does not justify claiming every public Llama-family checkpoint; GQA/MQA,
-biases, scaled/partial RoPE, quantization, adapters, tokenization, and downloaded-
-checkpoint validation remain outside the supported boundary.
+A bounded offline version of that oracle also validates one revision-pinned public
+tiny-random checkpoint. Four raw-token sequences produced 128,000 checked logits;
+maximum absolute error was `2.98e-8` versus the source-layout oracle and `8.94e-8`
+versus an optional CPU Float32 PyTorch/Transformers reference at `rtol=2e-5`,
+`atol=2e-6`. This still does not justify claiming every Llama-family checkpoint:
+GQA/MQA, biases, scaled/partial RoPE, quantization, adapters, tokenization, and
+other model layouts remain outside the supported boundary.
 
 ## What did Helix implement itself versus delegate to libraries?
 
@@ -360,10 +364,12 @@ KV layouts, paged attention, requests, scheduling/metrics, the CPU transformer,
 cached generation session, exact bounded prefix index/LRU, paged multi-request CPU
 engine with suffix reuse, greedy selection, native file parser/packer, and the
 narrow safetensors metadata/layout converter. It also implements read-only
-external Tensor ownership and the checked POSIX model-mapping path. It delegates
-numerical array transposition in the one-time converter to NumPy, CUDA driver/
-runtime operations to the CUDA Runtime API, and testing/benchmark harnesses to
-GoogleTest/Google Benchmark.
+external Tensor ownership, the checked POSIX model-mapping path, and an independent
+bounded source-layout oracle. It delegates numerical array transposition and
+reference arrays in offline tools to NumPy, CUDA driver/runtime operations to the
+CUDA Runtime API, and testing/benchmark harnesses to GoogleTest/Google Benchmark.
+PyTorch/Transformers is an opt-in external correctness cross-check for one public
+checkpoint, not an execution dependency or implementation path.
 No PyTorch runtime, BLAS, cuBLAS, NCCL, or external model graph executes Helix
 inference today. cuBLAS and NCCL remain explicitly labeled future library paths.
 
