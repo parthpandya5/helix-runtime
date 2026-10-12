@@ -28,6 +28,7 @@ if(HELIX_ENABLE_CUDA)
       cuda_embedding_benchmarks.cpp
       cuda_elementwise_benchmarks.cpp
       cuda_allocator_benchmarks.cpp
+      cuda_kv_cache_benchmarks.cpp
       cuda_matmul_benchmarks.cpp
       cuda_model_benchmarks.cpp
       cuda_overlap_benchmarks.cpp
@@ -168,6 +169,32 @@ set_tests_properties(
 
 if(HELIX_ENABLE_CUDA)
   add_test(
+    NAME benchmark.cuda_paged_kv_cache_smoke
+    COMMAND helix_benchmarks
+            "--benchmark_filter=BM_CudaPagedKvSynchronousAppend/layers:1/heads:1/head_dimension:32/block_tokens:8/manual_time$"
+            --benchmark_min_time=1x
+            --benchmark_repetitions=1)
+  set_tests_properties(
+    benchmark.cuda_paged_kv_cache_smoke
+    PROPERTIES
+      LABELS "benchmark;gpu;kv_cache;smoke"
+      SKIP_REGULAR_EXPRESSION "requires a visible NVIDIA CUDA device"
+      TIMEOUT 300)
+
+  add_test(
+    NAME benchmark.cuda_paged_tail_attention_smoke
+    COMMAND helix_benchmarks
+            "--benchmark_filter=BM_CudaPagedAttentionWithTail/8/0/1/64/64/16/manual_time$"
+            --benchmark_min_time=1x
+            --benchmark_repetitions=1)
+  set_tests_properties(
+    benchmark.cuda_paged_tail_attention_smoke
+    PROPERTIES
+      LABELS "attention;benchmark;gpu;smoke"
+      SKIP_REGULAR_EXPRESSION "requires a visible NVIDIA CUDA device"
+      TIMEOUT 300)
+
+  add_test(
     NAME benchmark.cuda_model_smoke
     COMMAND helix_benchmarks
             "--benchmark_filter=BM_CudaLlamaSynchronousPrefill/hidden:32/intermediate:64/layers:2/heads:4/tokens:7/vocabulary:128/manual_time$"
@@ -175,6 +202,19 @@ if(HELIX_ENABLE_CUDA)
             --benchmark_repetitions=1)
   set_tests_properties(
     benchmark.cuda_model_smoke
+    PROPERTIES
+      LABELS "benchmark;gpu;model;smoke"
+      SKIP_REGULAR_EXPRESSION "requires a visible NVIDIA CUDA device"
+      TIMEOUT 300)
+
+  add_test(
+    NAME benchmark.cuda_model_decode_smoke
+    COMMAND helix_benchmarks
+            "--benchmark_filter=BM_CudaLlamaSynchronousPagedDecode/hidden:32/intermediate:64/layers:2/heads:4/history:0/vocabulary:128/block_tokens:8/manual_time$"
+            --benchmark_min_time=1x
+            --benchmark_repetitions=1)
+  set_tests_properties(
+    benchmark.cuda_model_decode_smoke
     PROPERTIES
       LABELS "benchmark;gpu;model;smoke"
       SKIP_REGULAR_EXPRESSION "requires a visible NVIDIA CUDA device"

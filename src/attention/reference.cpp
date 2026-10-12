@@ -88,7 +88,7 @@ void require_shape(const Tensor& tensor, const Shape& expected, std::string_view
 
 void require_no_alias(const Tensor& tensor, const Tensor& output, std::string_view tensor_name,
                       std::string_view output_name, std::string_view operation) {
-  HELIX_CHECK(tensor.nbytes() == 0 || tensor.data() != output.data(), ErrorCode::kInvalidArgument,
+  HELIX_CHECK(!tensor.overlaps_logical_range(output), ErrorCode::kInvalidArgument,
               tensor_error(operation, output_name,
                            std::string("must not alias ") + std::string(tensor_name)));
 }
@@ -184,10 +184,11 @@ void scaled_dot_product_attention_out_impl(const Tensor& query, const Tensor& ke
       const std::size_t score_offset = (head * dimensions.queries + query_index) * dimensions.keys;
       const std::size_t output_offset =
           (head * dimensions.queries + query_index) * dimensions.value_dimension;
+      const std::size_t visible_keys = query_position_offset + query_index + 1;
       if (value_traversal == ValueTraversal::kDimensionMajor) {
         for (std::size_t dimension = 0; dimension < dimensions.value_dimension; ++dimension) {
           double accumulator = 0.0;
-          for (std::size_t key_index = 0; key_index < dimensions.keys; ++key_index) {
+          for (std::size_t key_index = 0; key_index < visible_keys; ++key_index) {
             const std::size_t value_offset =
                 (head * dimensions.keys + key_index) * dimensions.value_dimension;
             accumulator += static_cast<double>(scores[score_offset + key_index]) *
@@ -206,7 +207,7 @@ void scaled_dot_product_attention_out_impl(const Tensor& query, const Tensor& ke
         const std::size_t tile_dimensions =
             std::min(kValueDimensionTile, dimensions.value_dimension - dimension_start);
         std::array<double, kValueDimensionTile> accumulators{};
-        for (std::size_t key_index = 0; key_index < dimensions.keys; ++key_index) {
+        for (std::size_t key_index = 0; key_index < visible_keys; ++key_index) {
           const std::size_t value_offset =
               (head * dimensions.keys + key_index) * dimensions.value_dimension + dimension_start;
           const double probability = static_cast<double>(scores[score_offset + key_index]);

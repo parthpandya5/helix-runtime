@@ -200,8 +200,9 @@ traffic of multi-pass softmax. Results remain pending GPU hardware.
 
 ## Static compiler resource inspection
 
-`cuobjdump --dump-resource-usage` was run on the CUDA 12.6 Release archive compiled
-for the container's default `sm_52` target. These are compiler outputs, not runtime
+The CUDA 12.6 Release archive was inspected with compiler resource reports
+(`cuobjdump` for retained kernels and `ptxas -v` for the current attention build)
+at the container's default `sm_52` target. These are compiler outputs, not runtime
 measurements, and may change with architecture/toolchain:
 
 | Kernel | Registers/thread | Static shared | Dynamic shared at launch |
@@ -220,6 +221,8 @@ measurements, and may change with architecture/toolchain:
 | attention probabilities x V | 32 | 0 B | 0 B |
 | paged attention score/scale/mask | 31 | 0 B | 0 B |
 | paged attention probabilities x V | 29 | 0 B | 0 B |
+| paged-tail attention score/scale/mask | 30 | 0 B | 0 B |
+| paged-tail attention probabilities x V | 32 | 0 B | 0 B |
 
 This table helps make occupancy/resource hypotheses concrete, but occupancy cannot
 be concluded from registers/shared memory alone; launch geometry, architecture
@@ -472,17 +475,27 @@ one page for each `(head, query, key)` task; the value kernel resolves pages whi
 each `(head, query, value_dimension)` task traverses logical KV tokens. `kv_tokens`
 bounds the final partial page, so no padded slot participates in attention.
 
+The tail variant keeps history immutable and reads current K/V from contiguous
+`[heads,tail_tokens,width]` tensors. Query row `q` resolves every history page and
+tail rows only through `q`. A zero-entry device table is valid when history is
+empty and owns no allocation. Value kernels traverse only the visible prefix, so
+masked future non-finite values cannot leak through `0 * NaN`. The operation does
+not commit the tail. `CudaLlamaModel` now composes that transaction boundary and
+returns current all-layer K/V only after complete decode success; a future GPU
+cache owner still performs the actual page commit.
+
 The straightforward score mapping is not coalesced across the inner head dimension,
 and the value path repeats table lookup arithmetic for each output coordinate. It
 is retained as the correctness and profiling baseline. Static `sm_52` inspection
-reports 31 and 29 registers/thread respectively, no static shared/local memory,
-and no spills. Four additional GPU tests exercise reordered pages, poisoned tail
-padding, odd dimensions, empty queries, move-only table ownership, and invalid
-geometry/alias contracts. Four event-timed fixtures pair the contiguous logical
-shapes with reversed page mappings. Neither tests nor timings have run without a
-physical NVIDIA device.
+reports 31 and 29 registers/thread for ordinary paged score/value and 30 and 32 for
+tail score/value, with no stack, static shared memory, or spills. Seven paged GPU
+tests exercise reordered pages, poisoned padding, odd dimensions, empty queries
+and history, move-only table ownership, partial overlap, moved streams, non-finite
+masking, and invalid contracts. Four ordinary and four tail event-timed fixtures
+use reversed page mappings and CPU-oracle gates. None has run without a physical
+NVIDIA device.
 
-## Full-prefill composition baseline
+## Full-prefill and paged-decode composition baselines
 
 Milestone 17 composes the custom kernels into `CudaLlamaModel` for the same narrow
 Float32 architecture as the CPU model. No new fused kernel is hidden at this
@@ -490,6 +503,11 @@ boundary: embedding, RMSNorm, tiled custom SGEMM projections, RoPE, token/head
 layout copies, causal score/softmax/value attention, residual add, SwiGLU, final
 norm, and the LM-head projection remain individually visible launches. Attention
 uses an explicit layer-local `[heads,tokens,tokens]` Float32 score workspace.
+The one-token path consumes one packed page tensor per layer—either externally
+owned or borrowed from `CudaPagedKvCache`—applies position-specific RoPE, invokes
+paged-tail attention with a `[heads,1,history+1]` workspace, and copies the current
+key/value into aggregate `[layers,heads,width]` transaction results. No cache
+mutation is hidden inside model execution; the cache commits only after return.
 
 The first composition prioritizes pointer lifetime over concurrency. Every
 operation in a layer is issued to one caller-owned stream. All layer-local Tensor
@@ -505,17 +523,30 @@ The existing standalone analyses describe thread layout, coalescing, shared
 memory, and register usage for each constituent kernel. Composition does not alter
 those launch configurations. It does expose additional global-memory copies at the
 token/head boundary, direct allocation cost, quadratic attention scratch, many
-launches, and `layers+1` synchronizations. Those are profiling hypotheses, not
-measured bottlenecks.
+launches, and `layers+1` synchronizations. Decode additionally issues two D2D
+result copies per layer and resolves history through the block table. Those are
+profiling hypotheses, not measured bottlenecks.
 
-Three hardware-gated model tests use deterministic weights and compare full logits
-with the CPU model for one-token and odd-five-token prompts, then exercise input,
-device, and moved-stream failures plus the invalid-device-ID NaN sentinel. The
-matching event fixture preloads long-lived inputs, performs ten complete warmups,
-and checks the CPU oracle before and after timing. CUDA 12.6 compiles and links all
-paths, but no model test, sanitizer workload, or timing has run on a physical GPU.
+Six hardware-gated model tests use deterministic weights. Three compare full
+prefill logits or exercise input/device/moved-stream and invalid-device-ID sentinel
+contracts. Two compare paged decode logits plus every returned K/V value at zero
+and odd history, poison unused page slots, and reject malformed cross-layer page
+geometry. One runs successive cache lease/decode/commit transactions against CPU
+full-prefix recomputation. Matching prefill and decode wall-time fixtures preload
+long-lived inputs, perform ten complete warmups, and check their CPU oracles before
+and after timing. Wall time is required because the current calls synchronize
+internally before a CUDA stop event could be submitted.
+CUDA 12.6 compiles and links all paths, but no model test, sanitizer workload, or
+timing has run on a physical GPU.
 See `docs/MODEL_SUPPORT.md` for ownership and architecture boundaries and
 `docs/PERFORMANCE.md` for the exact future measurement scope.
+
+The compile-validated `CudaLlamaGenerator` adds no hidden numerical kernel. It
+owns one stream and paged cache, repeatedly invokes the synchronous one-token
+composition for staged prompt/decode work, commits returned K/V, and performs an
+explicit logits D2H copy for CPU greedy selection. Three additional GPU-gated
+tests cover that orchestration; it has no benchmark until physical-GPU correctness
+is established.
 
 ## Reproducible profiling
 

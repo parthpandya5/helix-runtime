@@ -126,7 +126,7 @@ void require_shape(const Tensor& tensor, const Shape& expected, std::string_view
 
 void require_no_alias(const Tensor& tensor, const Tensor& output, std::string_view tensor_name,
                       std::string_view output_name, std::string_view operation) {
-  HELIX_CHECK(tensor.nbytes() == 0 || tensor.data() != output.data(), ErrorCode::kInvalidArgument,
+  HELIX_CHECK(!tensor.overlaps_logical_range(output), ErrorCode::kInvalidArgument,
               tensor_error(operation, output_name,
                            std::string("must not alias ") + std::string(tensor_name)));
 }
@@ -287,6 +287,7 @@ void paged_scaled_dot_product_attention_out_impl(
       const std::size_t score_offset = (head * dimensions.queries + query_index) * dimensions.keys;
       const std::size_t output_offset =
           (head * dimensions.queries + query_index) * dimensions.head_dimension;
+      const std::size_t visible_keys = query_position_offset + query_index + 1;
       if (value_traversal == ValueTraversal::kDimensionMajor) {
         for (std::size_t dimension = 0; dimension < dimensions.head_dimension; ++dimension) {
           double accumulator = 0.0;
@@ -299,6 +300,9 @@ void paged_scaled_dot_product_attention_out_impl(
                          "paged attention value span has an inconsistent size");
             for (std::size_t token = 0; token < tokens_in_block; ++token) {
               const std::size_t key_index = value_start + token;
+              if (key_index >= visible_keys) {
+                continue;
+              }
               const std::size_t value_offset = token * dimensions.head_dimension + dimension;
               accumulator += static_cast<double>(scores[score_offset + key_index]) *
                              static_cast<double>(values[value_offset]);
@@ -310,6 +314,9 @@ void paged_scaled_dot_product_attention_out_impl(
           if (has_tail) {
             for (std::size_t token = 0; token < dimensions.tail_keys; ++token) {
               const std::size_t key_index = dimensions.history_keys + token;
+              if (key_index >= visible_keys) {
+                continue;
+              }
               const std::size_t value_offset =
                   (head * dimensions.tail_keys + token) * dimensions.head_dimension + dimension;
               accumulator += static_cast<double>(scores[score_offset + key_index]) *
@@ -335,6 +342,9 @@ void paged_scaled_dot_product_attention_out_impl(
                        "paged attention value span has an inconsistent size");
           for (std::size_t token = 0; token < tokens_in_block; ++token) {
             const std::size_t key_index = value_start + token;
+            if (key_index >= visible_keys) {
+              continue;
+            }
             const std::size_t value_offset = token * dimensions.head_dimension + dimension_start;
             const double probability = static_cast<double>(scores[score_offset + key_index]);
             for (std::size_t tile_dimension = 0; tile_dimension < tile_dimensions;
@@ -350,6 +360,9 @@ void paged_scaled_dot_product_attention_out_impl(
         if (has_tail) {
           for (std::size_t token = 0; token < dimensions.tail_keys; ++token) {
             const std::size_t key_index = dimensions.history_keys + token;
+            if (key_index >= visible_keys) {
+              continue;
+            }
             const std::size_t value_offset =
                 (head * dimensions.tail_keys + token) * dimensions.head_dimension + dimension_start;
             const double probability = static_cast<double>(scores[score_offset + key_index]);

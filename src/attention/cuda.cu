@@ -56,7 +56,8 @@ __global__ void attention_scores_kernel(const float* query, const float* key, fl
 
 __global__ void attention_values_kernel(const float* probabilities, const float* value,
                                         float* output, std::size_t tasks, std::size_t queries,
-                                        std::size_t keys, std::size_t value_dimension) {
+                                        std::size_t keys, std::size_t query_position_offset,
+                                        std::size_t value_dimension) {
   std::size_t task = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   const std::size_t stride = static_cast<std::size_t>(gridDim.x) * blockDim.x;
   for (; task < tasks; task += stride) {
@@ -65,8 +66,9 @@ __global__ void attention_values_kernel(const float* probabilities, const float*
     const std::size_t query_index = query_and_head % queries;
     const std::size_t head = query_and_head / queries;
     const std::size_t probability_offset = (head * queries + query_index) * keys;
+    const std::size_t visible_keys = query_position_offset + query_index + 1;
     float accumulator = 0.0F;
-    for (std::size_t key_index = 0; key_index < keys; ++key_index) {
+    for (std::size_t key_index = 0; key_index < visible_keys; ++key_index) {
       const std::size_t value_offset = (head * keys + key_index) * value_dimension + dimension;
       accumulator += probabilities[probability_offset + key_index] * value[value_offset];
     }
@@ -139,7 +141,7 @@ void require_shape(const Tensor& tensor, const Shape& expected, std::string_view
 
 void require_no_alias(const Tensor& tensor, const Tensor& output, std::string_view tensor_name,
                       std::string_view output_name, std::string_view operation) {
-  HELIX_CHECK(tensor.nbytes() == 0 || tensor.data() != output.data(), ErrorCode::kInvalidArgument,
+  HELIX_CHECK(!tensor.overlaps_logical_range(output), ErrorCode::kInvalidArgument,
               tensor_error(operation, output_name,
                            std::string("must not alias ") + std::string(tensor_name)));
 }
@@ -158,6 +160,15 @@ void check_launch(std::string_view kernel_name) {
   std::ostringstream context;
   context << "launching " << kernel_name;
   HELIX_CUDA_CHECK_CONTEXT(cudaGetLastError(), context.str());
+}
+
+void synchronize_before_unwind(const helix::cuda::Stream& stream) noexcept {
+  try {
+    stream.synchronize();
+  } catch (...) {
+    // Preserve the operation's original exception. Cleanup below remains
+    // nonthrowing even when the CUDA context cannot be drained.
+  }
 }
 
 } // namespace
@@ -229,7 +240,8 @@ void scaled_dot_product_attention_out(const Tensor& query, const Tensor& key, co
   attention_values_kernel<<<block_count(output_tasks), kThreadsPerBlock, 0,
                             stream.native_handle()>>>(
       score_workspace.data_as<float>(), value.data_as<float>(), output.data_as<float>(),
-      output_tasks, dimensions.queries, dimensions.keys, dimensions.value_dimension);
+      output_tasks, dimensions.queries, dimensions.keys, query_position_offset,
+      dimensions.value_dimension);
   check_launch("attention_values_kernel");
 }
 
@@ -243,10 +255,15 @@ Tensor scaled_dot_product_attention(const Tensor& query, const Tensor& key, cons
                                 DType::kFloat32, query.device());
   Tensor score_workspace = Tensor::empty({query.shape()[0], query.shape()[1], key.shape()[1]},
                                          DType::kFloat32, query.device());
-  scaled_dot_product_attention_out(query, key, value, query_position_offset, output,
-                                   score_workspace, stream);
-  if (score_workspace.numel() != 0) {
-    stream.synchronize();
+  try {
+    scaled_dot_product_attention_out(query, key, value, query_position_offset, output,
+                                     score_workspace, stream);
+    if (score_workspace.numel() != 0) {
+      stream.synchronize();
+    }
+  } catch (...) {
+    synchronize_before_unwind(stream);
+    throw;
   }
   return output;
 }

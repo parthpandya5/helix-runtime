@@ -15,6 +15,26 @@ Current environment at project creation:
 
 No performance values are recorded until an actual benchmark is run.
 
+## Publication snapshot — 2026-10-12
+
+The current publication scope is the validated synchronous CPU runtime plus
+experimental, previously compile-validated CUDA layers. It does not mark the
+full GPU roadmap complete.
+
+Fresh local checks passed 199/199 registered tests in each of Debug, Release,
+and ASan/UBSan CPU configurations, including downstream package and benchmark
+smoke tests. Formatting and Git whitespace checks passed; the tensor and CPU
+kernel examples built and ran. NumPy was unavailable, so the optional converter
+integration test was not registered. CUDA compilation, physical GPU execution,
+and performance measurements were not rerun for this snapshot.
+
+Next work follows the existing milestone gates: validate the CUDA foundations on
+NVIDIA hardware, complete GPU model/cache validation, then integrate GPU request
+execution and allocator ownership. Tokenizer integration and broader checkpoint
+validation remain usability work. M20 overlap needs hardware measurements;
+fusion, preemption, additional precision, and multi-GPU work remain optional.
+The README summarizes these open items for readers of the published repository.
+
 ## Quality gates shared by every milestone
 
 1. Public invariants and ownership are documented.
@@ -582,6 +602,50 @@ not execution evidence. Runtime correctness, event timing, coalescing/occupancy
 profiling, a GPU-resident KV pool, and allocator/executor integration remain gated
 on NVIDIA hardware and later work.
 
+CUDA transactional-tail follow-up (2026-08-24): the device baseline can now read
+an immutable packed history together with an uncommitted contiguous current K/V
+tail. Query row `q` sees all history plus tail rows through `q`; zero history uses
+a valid allocation-free empty device table. The asynchronous `_out` form makes all
+input/output/workspace lifetimes explicit, while the allocating form drains the
+stream before private scratch is reclaimed, including exceptional unwind.
+
+Three new GPU-gated tests compare empty, decode, and odd chunked tails with the
+contiguous CPU oracle, reject shape/device/partial-overlap/moved-stream failures,
+and prove a masked future NaN cannot contaminate an earlier causal row. A four-case
+benchmark performs ten warmups, validates output and workspace before timing, uses
+same-stream CUDA events, and revalidates output afterward. NVCC 12.6.85 compiles
+all paths with warnings as errors; static `sm_52` reports 30/32 registers per tail
+score/value thread and no spills, stack, or static shared memory. No GPU test or
+benchmark has executed, and no speedup is claimed.
+
+CUDA GPU-pool follow-up (2026-08-31): block-table ownership moved from attention
+into the lower KV layer, with a source-compatible attention alias. The new
+`CudaPagedKvCache` owns fixed per-layer Float32 pages shaped
+`[physical_blocks,heads,block_tokens,head_dimension]`, cache-tagged sequence
+handles, a deterministic allocation-free FIFO reclamation queue, exact accounting,
+and debug ownership invariants. Prefix sharing is deliberately absent from this
+first device path.
+
+One-token append validates all metadata and page aliasing, reserves sequence-table
+capacity, enqueues `2 * layers * heads` contiguous D2D vector copies on the caller
+stream, synchronizes, and only then commits mapping, length, and statistics. A
+partially written uncommitted slot stays logically invisible; an undrainable stream
+poisons the cache against reuse. A move-only decode view pins implementation,
+mapping, page tensors, uploaded device table, and the cache-wide mutex through the
+synchronous model call.
+
+Six hardware-gated cache tests cover exact odd-page layout, partial-page progress,
+transactional exhaustion, FIFO reuse, stale/cross-cache handles, tensor/device/
+stream/alias failures, view moves/facade lifetime, and cross-thread release
+serialization. The sixth quarantines a failed consumer's table, permanently
+blocks page reuse, and permits metadata release. A model test runs five
+decode/commit steps against CPU full-prefix
+recomputation. The three-case append benchmark performs ten warmups, byte-checks
+before and after timing, and uses host wall time for the internally synchronized
+append boundary. CUDA 12.6.85/GCC 13.2 compile Release and Debug targets with
+warnings as errors. No test/benchmark has
+executed without NVIDIA hardware, so runtime validity and performance remain open.
+
 ## Phase E: requests and continuous execution
 
 ### M14 — Request model — Implemented, CPU-validated, and sanitized
@@ -673,7 +737,7 @@ benchmark-observer correction.
 
 ## Phase F: narrow end-to-end inference
 
-### M17 — Minimal transformer runtime — CPU measured; CUDA prefill compile-validated
+### M17 — Minimal transformer runtime — CPU measured; CUDA prefill/decode compile-validated
 
 - one precisely documented Llama-style architecture
 - embedding, pre-norm blocks, Q/K/V, RoPE, attention, projection, SwiGLU,
@@ -790,13 +854,36 @@ Three deterministic GPU tests compare single-token and odd-length outputs with t
 CPU model, cover host/device metadata and moved-stream errors, and verify that a
 device OOV ID propagates the embedding kernel's safe NaN sentinel rather than an
 out-of-bounds read. A matching device-input benchmark preloads weights/IDs/RoPE,
-performs ten warmups, checks the CPU oracle before and after timing, and uses same-
-stream events for three disclosed synthetic geometries. The benchmark has not run.
-Debug, Release, and ASan/UBSan CPU suites pass 197/197. CUDA 12.6.85/GCC 13.2
-compile and link all targets with warnings as errors; 196 hardware-independent
-tests pass and 75 GPU-required tests/benchmark gates skip without a driver/device
-(271 registered total). Thus CUDA full-prefill correctness, sanitizer status, and
-performance remain pending physical NVIDIA hardware.
+performs ten warmups, checks the CPU oracle before and after timing, and uses host
+wall time for three disclosed synchronized-call geometries. The benchmark has not
+run.
+CUDA full-prefill correctness, sanitizer status, and performance remain pending
+physical NVIDIA hardware.
+
+CUDA paged-decode follow-up (2026-08-24): `CudaLlamaModel` now composes one-token
+decode over the M13 immutable page table and uncommitted-tail attention contract.
+The caller supplies one packed device K/V pair per layer and the exact history
+length. The model validates the complete cross-layer geometry before execution,
+uses position-specific RoPE, and returns `[layers,heads,head_dimension]` K/V plus
+`[1,vocabulary]` logits only after the whole step succeeds. It never mutates cache
+state; the later CUDA paged cache explicitly commits or discards the result at a
+separate transaction boundary.
+
+Two new GPU-gated tests compare position zero and an odd five-token/reversed-page
+history with the CPU paged-cache oracle, including every returned K/V element and
+NaN-poisoned page slack, then reject invalid layer/device/dtype/page/table/context/
+stream contracts. A three-case device-input benchmark performs ten warmups,
+checks the complete CPU oracle before and after timing, uses host wall time for the
+complete synchronized call, and reports physical K/V, table, and score-workspace
+bytes. It has not run.
+
+Debug, Release, and ASan/UBSan CPU suites pass 200/200. CUDA 12.6.85/GCC 13.2
+compile and link all targets with warnings as errors; 199 hardware-independent
+tests pass and 93 GPU-required tests/benchmark gates skip without a driver/device
+(292 registered total). Thus CUDA prefill/decode/cache/generation correctness, sanitizer
+status, and performance remain pending physical NVIDIA hardware. GPU page append
+and reclamation are compile-validated; scheduling, batching, allocator integration,
+and multi-request runtime sessions remain subsequent gates.
 
 ### M18 — Autoregressive generation — Implemented, CPU-validated, sanitized, and benchmarked
 
@@ -854,6 +941,26 @@ checkpoint, prompt `1,42,7` produced the identical eight-token trace
 same maximum-token stop and cached count of 10. This is raw-token parity for one
 random model, not tokenizer, text-generation quality, intermediate-logit parity
 at every public decode step, or CUDA execution.
+
+CUDA generation follow-up (2026-08-31): `CudaLlamaGenerator` now owns one
+`CudaLlamaModel`, a device-local stream, a fixed `CudaPagedKvCache`, and its
+cache-tagged sequence. Prompt prefill is the correctness-first sequential baseline:
+it decodes each prompt token through paged history and commits into a private
+staging table, replacing the session's empty table only after every token succeeds.
+Decode retains the model-result/cache-append transaction boundary. Greedy selection
+performs an explicit synchronized logits readback and reuses the CPU finite-value,
+lowest-index rule; maximum-token, EOS, and context-limit semantics match the CPU
+session.
+
+Three GPU-gated tests compare prefill and decode logits with CPU full-prefix
+recomputation, use exact-zero LM-head logits to make greedy parity independent of
+rounding ties, cover EOS/zero-budget/context behavior, and prove validation errors
+do not advance pages. Release and Debug CUDA 12.6.85/GCC 13.2 builds pass with
+warnings as errors, and the installed-package consumer compiles the public header.
+The tests remain among the 93 explicitly skipped GPU cases on this device-less
+host. No CUDA generation correctness, latency, or throughput result is claimed;
+bulk prefill, device-side selection, reusable workspace, and batched scheduling are
+the measured follow-ups.
 
 ### M19 — CPU runtime execution engine — Implemented, CPU-validated, sanitized, and benchmarked
 

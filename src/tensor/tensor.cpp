@@ -136,6 +136,19 @@ const void* Tensor::data() const noexcept {
                                   storage_offset_bytes_);
 }
 
+bool Tensor::overlaps_logical_range(const Tensor& other) const noexcept {
+  if (nbytes_ == 0 || other.nbytes_ == 0 || device_ != other.device_) {
+    return false;
+  }
+  const auto begin = reinterpret_cast<std::uintptr_t>(data());
+  const auto other_begin = reinterpret_cast<std::uintptr_t>(other.data());
+  const auto maximum = std::numeric_limits<std::uintptr_t>::max();
+  if (begin > maximum - nbytes_ || other_begin > maximum - other.nbytes_) {
+    return true;
+  }
+  return begin < other_begin + other.nbytes_ && other_begin < begin + nbytes_;
+}
+
 Tensor& Tensor::zero_() {
   require_writable("Tensor::zero_");
   HELIX_CHECK(is_contiguous(), ErrorCode::kUnsupported,

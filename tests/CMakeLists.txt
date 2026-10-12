@@ -297,6 +297,18 @@ if(HELIX_ENABLE_CUDA)
     DISCOVERY_MODE PRE_TEST
     PROPERTIES LABELS gpu TIMEOUT 180)
 
+  add_executable(helix_cuda_paged_kv_cache_tests cuda_paged_kv_cache_test.cpp)
+  target_link_libraries(
+    helix_cuda_paged_kv_cache_tests
+    PRIVATE helix::kv_cache helix::cuda_runtime GTest::gtest_main)
+  helix_configure_target(helix_cuda_paged_kv_cache_tests)
+
+  gtest_discover_tests(
+    helix_cuda_paged_kv_cache_tests
+    TEST_PREFIX "cuda_paged_kv."
+    DISCOVERY_MODE PRE_TEST
+    PROPERTIES LABELS gpu TIMEOUT 180)
+
   add_executable(helix_cuda_llama_model_tests cuda_llama_model_test.cpp)
   target_link_libraries(
     helix_cuda_llama_model_tests
@@ -306,6 +318,18 @@ if(HELIX_ENABLE_CUDA)
   gtest_discover_tests(
     helix_cuda_llama_model_tests
     TEST_PREFIX "cuda_llama_model."
+    DISCOVERY_MODE PRE_TEST
+    PROPERTIES LABELS gpu TIMEOUT 300)
+
+  add_executable(helix_cuda_generation_tests cuda_generation_test.cpp)
+  target_link_libraries(
+    helix_cuda_generation_tests
+    PRIVATE helix::model helix::cuda_runtime GTest::gtest_main)
+  helix_configure_target(helix_cuda_generation_tests)
+
+  gtest_discover_tests(
+    helix_cuda_generation_tests
+    TEST_PREFIX "cuda_generation."
     DISCOVERY_MODE PRE_TEST
     PROPERTIES LABELS gpu TIMEOUT 300)
 

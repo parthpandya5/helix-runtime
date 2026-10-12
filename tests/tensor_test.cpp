@@ -157,6 +157,29 @@ TEST(TensorTest, OwnsCanonicalContiguousMetadata) {
   EXPECT_NE(tensor.data(), nullptr);
 }
 
+TEST(TensorTest, DetectsLogicalRangeOverlapAcrossIndependentStorageWrappers) {
+  struct alignas(256) Buffer final {
+    std::array<std::byte, 1'024> bytes{};
+  };
+  const auto owner = std::make_shared<Buffer>();
+  const Tensor first =
+      Tensor::from_mutable_cpu_buffer({128}, DType::kFloat32, owner->bytes.data(), 512, owner, 256);
+  const Tensor overlapping = Tensor::from_mutable_cpu_buffer(
+      {128}, DType::kFloat32, owner->bytes.data() + 256, 512, owner, 256);
+  const Tensor adjacent = Tensor::from_mutable_cpu_buffer(
+      {64}, DType::kFloat32, owner->bytes.data() + 512, 256, owner, 256);
+  const Tensor independent = Tensor::zeros({128});
+  const Tensor empty = Tensor::zeros({0});
+
+  EXPECT_TRUE(first.overlaps_logical_range(first));
+  EXPECT_TRUE(first.overlaps_logical_range(overlapping));
+  EXPECT_TRUE(overlapping.overlaps_logical_range(first));
+  EXPECT_FALSE(first.overlaps_logical_range(adjacent));
+  EXPECT_FALSE(adjacent.overlaps_logical_range(first));
+  EXPECT_FALSE(first.overlaps_logical_range(independent));
+  EXPECT_FALSE(first.overlaps_logical_range(empty));
+}
+
 TEST(TensorTest, SupportsScalarAndZeroSizedTensors) {
   const Tensor scalar = Tensor::zeros({});
   EXPECT_EQ(scalar.rank(), 0U);

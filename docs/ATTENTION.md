@@ -4,14 +4,14 @@
 
 The Milestone 10 contiguous CPU reference, Milestone 13 direct paged CPU path, and
 post-M19 paged-history-plus-tail decode path are **implemented, CPU-validated,
-sanitizer-validated, and benchmarked**. Ten focused attention tests and the full
-197-test CPU suite pass in Debug, Release, and ASan/UBSan builds. The contiguous
-and paged CUDA baselines, eight attention GPU tests, and CUDA-event benchmark
-fixtures compile with NVCC 12.6.85 and warnings as errors, but have not run without
-an NVIDIA driver/device. The CUDA-on build passes 196 hardware-independent tests
-and explicitly skips 75 GPU-required tests/benchmark gates (271 total); the Python
-converter test is unavailable in that container. No GPU correctness or performance
-claim is made.
+sanitizer-validated, and benchmarked**. Twelve focused attention tests and the full
+200-test CPU suite pass in Debug, Release, and ASan/UBSan builds. The contiguous,
+paged, and paged-history-plus-tail CUDA baselines, eleven attention GPU tests, and
+CUDA-event benchmark fixtures compile with NVCC 12.6.85 and warnings as errors, but
+have not run without an NVIDIA driver/device. The CUDA-on build passes 199
+hardware-independent tests and explicitly skips 93 GPU-required tests/benchmark
+gates (292 total); the Python converter test is unavailable in that container. No
+GPU correctness or performance claim is made.
 
 ## Tensor contract
 
@@ -69,9 +69,9 @@ allocating convenience API creates both internally. On CUDA, that convenience fo
 explicitly synchronizes before releasing its private workspace; callers that need
 asynchronous execution use `_out` and own both lifetimes.
 
-All input/output/workspace aliasing is rejected. The current Tensor API cannot
-construct partial overlapping slices, but exact pointer checks make the present
-contract explicit and remain safe if views expand later.
+All input/output/workspace aliasing is rejected by logical byte range, including
+partial overlap across independently wrapped storage. Zero-byte tensors and
+tensors on distinct devices do not overlap.
 
 ## CPU reference
 
@@ -82,6 +82,9 @@ to Helix's stable CPU softmax. The default value stage accumulates 32 adjacent
 output coordinates at a time while each V row is hot. A named dimension-major path
 retains the original loop for correctness comparison and benchmarking. Both keep
 each coordinate's KV accumulation order unchanged and allocate no hidden memory.
+Value accumulation reads only the causally visible prefix rather than multiplying
+masked zero probabilities by future values; this prevents a masked future NaN from
+contaminating an otherwise finite row through IEEE `0 * NaN`.
 
 Known-value tests check causal probabilities and outputs by hand. A separate
 single-token case verifies decode offset semantics against a three-token KV
@@ -152,7 +155,7 @@ The CUDA path preserves the three stages as separate same-stream launches:
    traverses `head_dimension`.
 2. The existing block-per-row shared-memory stable softmax runs in place.
 3. One grid-stride thread computes one `(head, query, value_dimension)` output and
-   serially traverses all KV tokens.
+   serially traverses only that query row's causally visible KV prefix.
 
 The score mapping is intentionally naive. Adjacent threads own adjacent key rows;
 for a fixed dot-product dimension their K addresses are separated by
@@ -223,14 +226,32 @@ out-of-range table from launching; each device kernel also converts a corrupted
 physical ID to NaN without dereferencing outside the packed pool. This defensive
 check is not a substitute for stream-safe ownership.
 
+`paged_scaled_dot_product_attention_with_tail_out` extends the immutable packed
+history with `tail_key[H,T,D]` and `tail_value[H,T,DV]`, where query is also
+`[H,T,D]`. Row `q` sees all `history_tokens` plus tail rows through `q`; the score
+workspace is `[H,T,history_tokens+T]`. Empty history is represented by a valid
+zero-entry `PagedBlockTable` with positive physical capacity and no device-table
+allocation, so position zero uses the same path without a null dereference. The
+operation never writes the history pages or table. `CudaLlamaModel` composes this
+path across every layer and returns aggregate tail K/V only after all layers and
+final projection succeed; actual page commit remains outside the model.
+
+The `_out` path is asynchronous on one validated stream; history pages, the block
+table, query/tail inputs, output, and workspace must all outlive completion. The
+allocating wrapper owns its output and scratch and synchronizes before return. If
+a later launch fails after earlier work was accepted, it makes a best-effort stream
+drain before scratch unwinds while preserving the original exception.
+
 GPU tests compare reordered, non-identity page tables with the contiguous CPU
 oracle, poison unwritten tail slots, cover multiple heads and odd widths through
 key/value dimensions 37/41, accept empty query work, and reject invalid tables,
 capacities, devices, shapes, offsets, and aliases. The allocating and preallocated
-APIs share the same validation. CUDA 12.6 static `sm_52` inspection reports 31
-registers/thread for the paged score kernel and 29 for the paged value kernel, with
-no static shared/local memory or spills. That does not establish occupancy or
-runtime performance.
+APIs share the same validation. Tail cases add empty history, single-token decode,
+odd three-token continuation, partial-overlap rejection, moved-stream rejection,
+and a masked-future-NaN boundary. CUDA 12.6 static `sm_52` inspection reports 31/29
+registers per thread for ordinary paged score/value and 30/32 for tail score/value,
+with no stack, static shared memory, or spills. That does not establish occupancy
+or runtime performance.
 
 ## CPU benchmark results
 
@@ -256,6 +277,9 @@ stream CUDA events and stop-event synchronization. The paged fixture uses revers
 non-identity mappings, a 16-token page for the standard shapes (8 for the odd
 case), and two spare physical pages; allocation and table upload are outside the
 timed region. The fixtures have not executed, so there are no GPU result rows.
+The tail fixture separately covers histories 0, 127, 1,023, and an odd 26-token
+history with one- and three-token tails. It checks output and probability workspace
+against the contiguous CPU oracle before timing and rechecks output afterward.
 
 The M13 same-process run retained both dimension-major baselines and applied the
 same 32-coordinate value tile to contiguous and paged storage. Median CPU times:
@@ -294,12 +318,13 @@ timing boundaries, and commands are in `docs/PERFORMANCE.md`.
 - CPU and CUDA paths are Float32 only,
 - the CUDA dot products are educational serial-per-output baselines,
 - the CPU paged path uses one exclusive cache-wide read lease,
-- the CUDA paged baseline uses a direct `cudaMalloc` table and caller-packed layer
-  tensors; it is not integrated with `PagedKvCache` or `HelixAllocator`,
-- no attention fusion, GQA, GPU page-pool lifetime, or measured page-table analysis
-  is claimed.
+- the CUDA table still uses a direct allocation/upload per cache lease; pages may
+  be caller-packed or owned/committed/reclaimed by `CudaPagedKvCache`, but neither
+  storage path is `HelixAllocator`-backed,
+- no attention fusion, GQA, asynchronous multi-stream page lifetime, or measured
+  page-table analysis is claimed.
 
 GPU runtime correctness against the CPU oracle is the next mandatory gate before
-optimizing this paged baseline. Integrating it into a concurrent GPU executor also
-requires device-resident KV allocation and a stream/event lifetime mechanism rather
-than the CPU cache's coarse read lease.
+optimizing this paged baseline. Integrating the compiled model/cache path into a
+concurrent GPU executor still requires scheduler-owned sessions and a stream/event
+lifetime mechanism rather than the cache's coarse synchronous decode lease.

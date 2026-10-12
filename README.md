@@ -13,15 +13,51 @@ reproducible benchmark evidence.
 
 ## Current status
 
+**Portfolio snapshot: CPU-validated inference runtime with an experimental,
+compile-validated CUDA backend.** The full GPU runtime is still in development.
+
+Local verification on 2026-10-12 passed all 199 registered tests in Debug,
+Release, and ASan/UBSan CPU builds, plus formatting and whitespace checks. The
+optional Python converter integration test was not registered because NumPy was
+unavailable; earlier 200-test results below describe their original environment.
+Tensor and CPU-kernel examples also built and ran. This verification did not rerun
+CUDA compilation, GPU tests, or performance measurements.
+
+### Remaining work
+
+- **Validation pending:** run CUDA correctness/oracle tests, Compute Sanitizer,
+  and reproducible benchmarks on named NVIDIA hardware before making GPU
+  correctness or performance claims.
+- **Planned:** connect CUDA generation to the request scheduler and paged-cache
+  lifecycle, then integrate allocator-backed storage with tested stream-safe
+  ownership. GPU batching and asynchronous execution require their own gates.
+- **Planned:** add tokenizer/text-prompt support and validate additional model
+  checkpoints; the current generation CLI accepts raw token IDs.
+- **Planned:** validate and measure transfer/compute overlap before adopting it
+  in the runtime; CUDA prefix reuse and general multi-stream pooling remain
+  future work.
+- **Optional:** profile-driven kernel fusion, additional arithmetic precision or
+  quantization, request preemption, and multi-GPU support. These are not required
+  to use the current CPU runtime.
+
+See the [roadmap](docs/ROADMAP.md) for milestone order and acceptance criteria,
+and [limitations](#limitations) for the detailed support boundary.
+
+### Implementation and validation history
+
 Milestones 0–2, the host-testable portions of Milestones 7–8, the CPU paths of
 Milestones 9–10, the M11–M12 KV caches, the M13 direct paged-attention CPU path,
 the M14–M16 request and continuous-batching scheduler, the M17 narrow Llama-style
 CPU prefill runtime, the M18 single-sequence cached generation path, and the M19
 synchronous multi-request CPU execution engine are implemented and CPU-validated.
-M17 also has a synchronous single-stream CUDA full-prefill composition baseline:
-it deep-copies validated weights to one device and connects the custom embedding,
-transformer, GEMM, layout, and attention paths with explicit layer-lifetime
-barriers. That path is compile-validated only; its GPU oracle tests have not run.
+M17 also has synchronous single-stream CUDA full-prefill and one-token paged-
+decode composition baselines. They deep-copy validated weights to one device and
+connect the custom embedding, transformer, GEMM, layout, and attention paths with
+explicit layer-lifetime barriers. Decode reads per-layer pages plus an uncommitted
+current K/V tail and returns transactional all-layer K/V without mutating history.
+Pages may be caller-owned directly or borrowed from the new CUDA paged cache; the
+integration test commits them only after successful model return. These paths are
+compile-validated only; their GPU oracle tests have not run.
 The narrow M17 model path now has an offline Hugging Face Llama safetensors
 converter with an independent source-layout logits oracle. A revision-pinned
 public tiny-random Llama checkpoint has been converted and all 128,000 logits from
@@ -58,7 +94,7 @@ weight format, performs greedy generation through a contiguous KV cache, and
 executes scheduler batches against a shared paged KV pool with optional prompt-
 prefix reuse. On
 2026-08-24, Apple Clang 17 built the project on macOS arm64 with warnings as
-errors; 197/197 CPU tests passed in Debug, Release, and ASan/UBSan configurations.
+errors; 200/200 CPU tests passed in Debug, Release, and ASan/UBSan configurations.
 
 CUDA is optional at configure time. The current Apple Silicon development host has
 no NVIDIA GPU or native CUDA toolkit, so no CUDA execution or performance claim is
@@ -68,11 +104,18 @@ compile-validated in an ARM64 CUDA 12.6 development container without a
 driver/device. The M8 stream-ordered allocator and M9 UInt32/Float32 embedding,
 head-layout transforms, block-reduced RMSNorm, grid-stride SwiGLU, adjacent-pair
 RoPE, and projection adapter are also compile-validated, as are the M10 contiguous
-and M13 paged three-stage attention
-baselines and the synchronous M17 full-prefill model composition. None is runtime-
-validated on a GPU. The CUDA-on build passes 196 hardware-independent tests and
-explicitly skips 75 GPU-required tests without a driver/device (271 registered
-tests total). Its container lacks Python/NumPy, so the separate converter
+and M13 paged three-stage attention baselines, including an immutable paged
+history plus uncommitted contiguous K/V tail, and the synchronous M17 full-prefill
+and paged-decode model compositions. A CUDA-only paged cache now owns fixed layer-
+local device pages, deterministic sequence tables, synchronous transactional D2D
+append, reclamation, and a decode lease that uploads the immutable device table.
+`CudaLlamaGenerator` now composes those pieces into a one-sequence token-ID
+session with staged prompt commit, cached decode, greedy readback, and explicit
+EOS/context stops. None is runtime-validated on a GPU. The CUDA-on build passes
+199 hardware-independent tests and explicitly skips 93 GPU-required
+tests/benchmark gates without a driver/device (292 registered tests total). Its container
+lacks Python/NumPy, so
+the separate converter
 integration test is not registered there; it passes in all three native CPU
 configurations.
 
@@ -93,9 +136,11 @@ flowchart TD
 ```
 
 The M19 CPU engine implements the scheduler/model/paged-cache path in this diagram.
-The CUDA executor branch now reaches isolated full-prefill composition, but it is
-not connected to the allocator, paged cache, scheduler, or request engine and has
-not run on hardware.
+The CUDA branch now reaches isolated full-prefill plus transactional one-token
+decode against a GPU-owned paged pool. A tested transaction boundary runs model
+decode under a mapping lease and commits returned all-layer K/V only after model
+success. This path is not connected to the allocator, scheduler, or request engine,
+and none of it has run on hardware.
 
 The full dependency, ownership, request-lifecycle, and memory designs are in
 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
@@ -184,7 +229,7 @@ cmake --build build --target format-check
 Helix targets. `HELIX_BUILD_TOOLS=OFF` omits the model pack/inspection utilities;
 it does not affect the runtime libraries. The one Python converter integration
 test auto-registers only when the selected Python 3 interpreter can import NumPy;
-otherwise the 195-test C++/benchmark suite remains available.
+otherwise the 199-test C++/benchmark suite remains available.
 
 ## Benchmarks
 
@@ -219,11 +264,12 @@ compaction: direct block-table attention reduced isolated layer median CPU time 
 trace medians improved by only 0.08%–6.23%. Methodology and measurements live in
 [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md).
 
-CUDA builds register a separate synchronized full-prefill fixture for the same
-three synthetic geometries. It preloads weights, token IDs, and RoPE tables,
-performs ten untimed warmups, checks the CPU oracle before and after measurement,
-and uses same-stream CUDA events. No result is published because that fixture has
-not run on an NVIDIA device.
+CUDA builds register separate synchronized full-prefill and one-token paged-decode
+fixtures. Both preload weights, token IDs, and RoPE tables, perform ten untimed
+warmups, check the CPU oracle before and after measurement, and use host wall time
+for the complete synchronized calls. Decode additionally uses reversed page mappings, NaN-poisoned slack,
+and reports table, workspace, and physical-KV bytes. No result is published because
+neither fixture has run on an NVIDIA device.
 
 Allocator workload fixtures now replay identical deterministic randomized,
 small-heavy, large-heavy, bursty, and LLM-like traces through direct host/CUDA
@@ -372,9 +418,11 @@ CPU value path uses a measured 32-coordinate stack tile; the original dimension-
 major loop remains benchmarkable. The M13 CPU path reads written K/V spans directly
 through a paged cache read lease without compacting history. A separate M13 CUDA
 baseline resolves logical token positions through an immutable device block table
-into layer-local `[physical_blocks, heads, block_tokens, width]` K/V tensors. CPU
-paths are tested, sanitized, and benchmarked; both CUDA paths are compile-validated
-with hardware-gated CPU-oracle tests and event-timed fixtures.
+into layer-local `[physical_blocks, heads, block_tokens, width]` K/V tensors. Its
+tail variant reads current-token K/V separately and leaves page mutation to the
+caller after the larger model step succeeds. CPU paths are tested, sanitized, and
+benchmarked; all CUDA paths are compile-validated with hardware-gated CPU-oracle
+tests and event-timed fixtures.
 See [`docs/ATTENTION.md`](docs/ATTENTION.md).
 
 ## KV cache
@@ -427,6 +475,16 @@ limitation, not an asynchronous GPU lifetime mechanism. The default paged model
 decode consumes the cached spans plus the current uncommitted K/V tail directly;
 the older compact-copy path remains selectable for correctness and measurement.
 
+CUDA builds additionally expose `CudaPagedKvCache`. It owns one physical-major
+key/value page tensor per model layer, cache-tagged sequence mappings, deterministic
+FIFO reclamation, and exact pool statistics. One-token append copies aggregate
+`[layers,heads,head_dimension]` K/V on a caller stream, synchronizes, and publishes
+metadata only after payload completion. A move-only decode view pins pages and an
+uploaded device block table across synchronous model execution; uncertain
+exceptional completion quarantines that table and blocks page reuse. Six cache
+tests, one model integration test, and a warmed wall-clock benchmark are hardware-
+gated and compile-validated; none has executed on the current non-NVIDIA host.
+
 ## Request lifecycle and continuous batching
 
 The M14 host-only `Request` uses strong request/token IDs and a move-only state
@@ -465,6 +523,13 @@ transfers IDs/RoPE tables; a preloaded-device overload exposes an honest benchma
 boundary. Both return only after synchronizing the caller's stream. The deliberate
 per-layer barriers make every temporary and attention workspace lifetime correct,
 but also make this a baseline to profile—not an optimized asynchronous executor.
+The matching paged-decode overloads accept one shared immutable block table and a
+layer-local `[physical_blocks,heads,block_tokens,head_dimension]` K/V pair for
+each layer. They return `[layers,heads,head_dimension]` current K/V and `[1,V]`
+logits only after the complete step succeeds. `CudaPagedKvCache` supplies a pinned
+mapping/page lease and synchronously commits those K/V as a separate transaction;
+`CudaLlamaGenerator` owns that model/cache/stream composition for one synchronous
+sequence. Scheduler-driven CUDA batching remains future work.
 
 The little-endian `HELIXLM1` weight container has a versioned fixed header, exact
 tensor-role/shape directory, 64-byte payload alignment, checked nonoverlapping
@@ -544,6 +609,13 @@ uses the last logits row, rejects non-finite values, and chooses the lowest toke
 ID on a tie. Maximum-new-token, optional EOS, and context-capacity stops are
 explicitly reported.
 
+CUDA builds also expose `CudaLlamaGenerator`, a synchronous one-sequence baseline
+that owns its model, device-local stream, and paged cache. It stages the whole
+prompt in a private page table, commits one-token decode results only after model
+success, and copies each logits row to CPU for the same greedy rule. Its three
+CPU-oracle tests compile and remain hardware-gated; no CUDA generation result is
+claimed.
+
 The minimal CLI deliberately accepts token IDs because Helix does not yet ship a
 tokenizer:
 
@@ -593,21 +665,23 @@ Ownership, protocol, measurements, and limitations are in
 
 ## Limitations
 
-The CUDA runtime, M4–M6/M9–M10/M13 kernels, M7–M8 allocator adapters, and M17
-prefill composition are compile-validated only; physical GPU correctness, timing,
-and resource validation remain pending. KV caches and continuous batching are
-host-only; the CUDA paged-attention baseline consumes separately packed layer-
-local device pages but is not wired to a GPU-resident cache, allocator, scheduler,
-or the contiguous-prefill model path. The CPU
+The CUDA runtime, M4–M6/M9–M10/M13 kernels, M7–M8 allocator adapters, GPU paged
+cache, and M17 prefill/decode compositions are compile-validated only; physical GPU
+correctness, timing, and resource validation remain pending. Continuous batching
+remains host-only. CUDA model decode can consume a `CudaPagedKvCache` lease and its
+result can be synchronously committed to that pool, but this transaction is not
+wired to the allocator, scheduler, or request engine. The CPU
 engine integrates the scheduler with physical paged-KV capacity and model
 execution, but scheduled work items run serially and no tensor batch is formed.
 Transformer execution currently supports CPU Float32 prefill, contiguous-KV
-single-sequence generation, paged-KV multi-request orchestration, and a separately
-compile-validated CUDA Float32 full-prefill baseline. The narrow Hugging Face Llama
+single-sequence generation, paged-KV multi-request orchestration, and separately
+compile-validated CUDA Float32 prefill and paged one-token decode baselines. The
+narrow Hugging Face Llama
 converter has one revision-pinned public tiny-random checkpoint
 validated from raw token IDs, but tokenizer/text-prompt integration, additional
-checkpoint architectures, CUDA model runtime validation/decode, and GPU-resident
-paged KV remain roadmap work. CPU prefix reuse is exact-content, block-aligned, bounded,
+checkpoint architectures, CUDA model/cache runtime validation, GPU session
+orchestration, and CUDA prefix reuse remain roadmap work. CPU prefix reuse is exact-content,
+block-aligned, bounded,
 and opt-in; it stores only one maximum reusable prefix per completed prompt, uses
 an engine-local namespace, and does not cache next-token logits or run on the GPU.
 Partial-page sharing, model-global cache namespaces, and request preemption remain

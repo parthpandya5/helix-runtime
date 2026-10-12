@@ -76,6 +76,10 @@ public:
   [[nodiscard]] bool is_read_only() const noexcept {
     return storage_->is_read_only();
   }
+  // Reports overlap between the logical byte ranges visible through two
+  // tensors. Different devices and zero-byte ranges never overlap. Invalid
+  // address arithmetic is treated conservatively as overlap.
+  [[nodiscard]] bool overlaps_logical_range(const Tensor& other) const noexcept;
 
   [[nodiscard]] void* data();
   [[nodiscard]] const void* data() const noexcept;

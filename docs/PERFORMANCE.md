@@ -111,10 +111,14 @@ remains pending NVIDIA hardware.
 | M10 contiguous CPU attention | No earlier attention path | Materialize scaled/masked scores, stable softmax in place, then probabilities x V with reusable output/workspace | Median CPU time: 8x1x128x64x64 76.371 us; 8x1x1,024x64x64 825.128 us; 3x17x29x37x41 46.284 us; 8x128x128x64x64 8.164 ms | Workspace is exactly `4*H*Q*K` bytes. These single-threaded results include softmax but the reported dot FLOP/s numerator does not; they are correctness baselines. |
 | M11 contiguous CPU KV cache | No earlier KV storage | Reserve per-sequence K/V tensors, append complete tokens, and copy a compact layer history into preallocated outputs | Lifecycle median CPU time: 26.898 us (2x2x64, capacity/append 128), 63.700 us (4x8x64, capacity 512/append 32), 7.853 us (odd 3x3x37, 29); layer-copy median: 1.595 us (128 KiB), 29.609 us (2 MiB), 613 ns (25,752 B) | Lifecycle includes sequence allocation, appends, and release. Layer copy excludes output allocation. This is a contiguous baseline under high host load, not evidence that paging or another layout is faster. |
 | M12 paged CPU KV cache | Same-run M11 contiguous fixtures | Use a long-lived fixed-token pool, allocate logical blocks on append boundaries, and compact through block tables | Paged/contiguous lifecycle medians: 25.784/28.485 us, 18.016/64.400 us, 6.869/8.074 us. Paged/contiguous layer-copy medians: 3.684/1.568 us (128 KiB), 57.690/33.032 us (2 MiB), 540/554 ns (25,752 B). | Pool construction is outside paged lifecycle timing while per-sequence contiguous storage is inside; the 72% lifecycle reduction also uses 16x less assigned capacity. Paged copying is 2.35x and 1.75x slower for the large histories because it traverses 8 and 32 blocks. |
+| M12 CUDA paged-KV ownership | Model tests fabricate and retain packed device pages externally | Own fixed per-layer pages, transactional synchronous D2D append, FIFO reclamation, accounting, and a lock-pinned decode table | Runtime result pending NVIDIA hardware; CUDA 12.6 compiles the three-case warmed, byte-checked wall-time fixture in Release and Debug modes with warnings as errors. | This closes an ownership/measurement-harness gap, not an optimization result. Append still uses `2*L*H` D2D copies, one synchronization, direct pool allocations, and a cache-wide mutex. |
 | M13 CPU attention value traversal | Dimension-major probability-times-V for contiguous and direct paged storage | Accumulate fixed 32-coordinate tiles while each V row/page is hot; retain both baselines | Contiguous speedup 1.31x–2.47x and paged speedup 2.36x–2.99x across four paired cases. With equal tiling, paged CPU time was 2.1%–6.7% higher. | The original apparent paged win was confounded by a general loop-locality improvement. Applying the same traversal to both paths isolates a modest end-to-end paging cost on this CPU; it is not GPU evidence. |
+| M13 CUDA paged history plus uncommitted tail | Ordinary paged CUDA attention requires every visible K/V token in packed pages | Read immutable paged history plus a separate causal tail, retain caller-owned async scratch, and defer cache mutation | Runtime result pending NVIDIA hardware; NVCC 12.6 `sm_52` reports 30/32 registers per tail score/value thread with zero spills, stack, or static shared memory. | This establishes a transactional kernel and benchmark contract, not an optimization result. The CPU-oracle event fixture must execute before latency or throughput is published. |
 | M15 FIFO scheduler host trace | No earlier scheduler implementation | Schedule and complete deterministic mixed prefill/decode traces under token, running-request, and logical KV-block limits | Corrected median CPU time per complete trace: 48.777 us (16 requests/256 tokens) through 1.342 ms (128 requests/6,144 tokens) | A first fixture revision accidentally polled the O(N) statistics snapshot inside timing; those values were discarded. The corrected trace measures host policy and completion-vector work, not inference. |
 | M16 continuous batching policy | Static cohorts on the same mixed-length request sequence | Refill finished slots between iterations and aggregate lifecycle metrics | Under an explicit constant-1-ms iteration model, continuous/static makespans were 48/132 ms and 92/260 ms (2.75x and 2.83x modeled rates). Median host control CPU times differed by 1.3% and 4.1%. | Modeled results demonstrate policy utilization only; they are not measured model throughput. Host differences are small relative to local variation and do not establish a CPU optimization. |
 | M17 CPU Llama-style prefill and model load | No earlier complete model path | Compose the tested CPU kernels into full causal prefill and add checked `HELIXLM1` deserialization | Prefill medians: 97.942 us, 2.099 ms, and 34.104 ms for the three disclosed tiny configurations; checked in-memory load: 183.744 us, 640.046 us, and 3.967 ms | These establish single-threaded Float32 reference baselines, including forward temporaries or loader validation/allocation as specified. They do not demonstrate an optimization, GPU performance, disk-loading speed, or production model throughput. |
+| M17 CUDA paged one-token decode | Standalone CUDA paged-tail attention with no model composition | Compose caller-owned device pages, current-token projection/RoPE, transactional all-layer K/V results, and final logits | Runtime result pending NVIDIA hardware; CUDA 12.6 compiled the three-case CPU-oracle wall-time fixture with warnings as errors. | This is a measurement gate, not an optimization result. It still uses direct temporary allocation, two K/V result copies per layer, and `L+1` stream barriers. |
+| M18 CUDA generation session | Caller manually pairs the CUDA model, stream, cache lease, append, and logits readback | Own one sequence, stage prompt pages transactionally, decode/commit, and reuse CPU greedy/stop semantics | Three CPU-oracle GPU tests are compile-validated only; no generation benchmark is registered and no runtime result is claimed. | Sequential prompt decode and per-token logits D2H are disclosed correctness baselines. Bulk prefill and device selection should precede a meaningful throughput comparison. |
 | M17 immutable mapped model loading | Portable filesystem loader with owned aligned payload allocations and little-endian copies | Retain identical validation but expose payload-sized read-only Tensor views over one RAII POSIX mapping | Copied/mapped median CPU times: 203.835/161.110 us, 673.728/571.736 us, and 4.333277/3.779571 ms; reductions 20.96%, 15.14%, and 12.78% | This warm-page paired fixture includes open/map-or-read, full validation, assembly, and destruction. It is not cold-disk latency, an RSS result, model execution, or evidence for non-POSIX hosts. |
 | M18 cached CPU next-position execution | Full-prefix recomputation for the identical prompt plus one input token | Reuse prefill K/V and execute only the new position | Cached/full-recompute median CPU times: 32.100/118.420 us, 89.580 us/2.113 ms, and 646.960 us/36.741 ms (3.69x, 23.59x, and 56.79x) | The growing advantage demonstrates avoided prefix model work in three tiny single-sequence CPU fixtures. It is not a production model, batched-runtime, tokenizer, or GPU result. |
 | M18 contiguous-KV decode staging | Allocate a compact owning history snapshot, then copy it into the final history-plus-tail buffers | Copy the locked cache prefix directly into the final buffers | Two-stage/direct median CPU times: 858/466 ns, 1,161/634 ns, and 3,784/1,587 ns; reductions 45.7%, 45.4%, and 58.1% | Both paths include final-buffer allocation and current-tail writes. Direct copy removes two temporary tensors and one full history pass; the paired algorithm benchmark isolates this change from model math. |
@@ -872,6 +876,42 @@ table fetches, warp grouping, coalescing, register pressure, occupancy, or GPU
 latency. A CUDA baseline now exists, but those questions still require physical
 NVIDIA execution.
 
+## M12 CUDA paged-KV append benchmark gate — pending NVIDIA hardware
+
+`BM_CudaPagedKvSynchronousAppend` measures the first GPU-owned page commit boundary
+at `(layers,heads,head_dimension,block_tokens)` geometries `(1,1,32,8)`,
+`(2,4,16,8)`, and `(16,32,128,16)`. Cache construction and its `2 * layers`
+direct device allocations are outside timing. Input K/V is preloaded once as
+contiguous `[layers,heads,head_dimension]` Float32 tensors.
+
+Each warmup and measured sample creates one logical sequence, commits its first
+token, and releases it so the deterministic FIFO exercises both physical pages
+without growing the pool. Ten lifecycle warmups precede timing. A separate append
+is copied back and checked byte-for-byte before the measured loop and again after
+it; final statistics must show no live sequence or page ownership.
+
+The measured interval uses `steady_clock` immediately before and after append.
+Append enqueues one key and one value D2D vector copy for every layer/head,
+synchronizes, and publishes metadata before returning. This is deliberately host
+wall time for the complete synchronous commit boundary, not kernel-only or
+asynchronous launch latency. A CUDA stop event would have to be submitted after
+append's internal barrier and would include an uncontrolled idle gap between
+device completion and event submission. Counters expose token bytes, `2*L*H`
+copy calls, one synchronization, and total physical-pool bytes.
+
+Run after the GPU correctness suite:
+
+```bash
+ctest --test-dir build-cuda -R cuda_paged_kv --output-on-failure
+./build-cuda/benchmarks/helix_benchmarks \
+  --benchmark_filter='BM_CudaPagedKvSynchronousAppend' \
+  --benchmark_repetitions=5 \
+  --benchmark_report_aggregates_only=true
+```
+
+The current environment compiled and discovered the fixture but has no NVIDIA
+driver/device. No latency, bandwidth, comparison, or improvement is reported.
+
 ## M13 CUDA paged-attention benchmark gate — pending NVIDIA hardware
 
 The compile-validated fixture pairs contiguous and paged three-stage attention at
@@ -889,20 +929,32 @@ block-table bytes, active logical K/V bytes, and reserved physical K/V bytes. Th
 nominal numerator is comparable between paths but includes causally masked score
 coordinates that the score kernel skips; it is not an instruction count.
 
+A second four-case fixture measures immutable paged history plus an uncommitted
+contiguous tail. Its `(H,history,T,D,DV,page)` cases are
+`(8,0,1,64,64,16)`, `(8,127,1,64,64,16)`, `(8,1023,1,64,64,16)`, and
+`(3,26,3,37,41,8)`. Deterministic host history/tail tensors are combined for the
+contiguous CPU oracle, while only history is packed through a reversed page table;
+padding is poisoned and two physical pages remain unused. Device allocation,
+packing, transfer, and table upload are outside timing. Output and the complete
+probability workspace are checked after ten warmups, and output is checked again
+after the event-timed loop. A failed oracle marks the benchmark invalid instead of
+emitting a performance result.
+
 On a CUDA host, first pass the GPU oracle tests and then run paired repetitions:
 
 ```bash
 ctest --test-dir build-cuda -L gpu --output-on-failure
 ./build-cuda/benchmarks/helix_benchmarks \
-  --benchmark_filter='BM_Cuda(Contiguous|Paged)Attention' \
+  --benchmark_filter='BM_Cuda.*Attention' \
   --benchmark_repetitions=5 \
   --benchmark_report_aggregates_only=true
 ```
 
 No benchmark has executed in the current environment, so this section contains no
 latency, bandwidth, or speedup result. CUDA 12.6 `sm_52` compiler inspection found
-31/29 registers per thread for the paged score/value kernels and no static shared/
-local memory or spills. Architecture-specific profiler data and
+31/29 registers per thread for ordinary paged score/value and 30/32 for tail
+score/value, with no stack, static shared memory, or spills. Architecture-specific
+profiler data and
 `compute-sanitizer` must still gate any optimization.
 
 ## M15 FIFO scheduler host-policy baseline — 2026-08-21
@@ -1143,20 +1195,20 @@ Deterministic CPU and CUDA models are constructed from identical weight seeds.
 Model construction, CPU-to-device weight copies, token-ID upload, RoPE-table
 generation/upload, and the CPU oracle are outside timing. The device-input path is
 executed once and compared with the CPU oracle, then warmed for ten complete
-prefills. Every measured iteration records start and stop events on the same
-caller stream around one `forward_device` call; the stop event is synchronized and
-Google Benchmark consumes the event duration as manual time. A second complete
-prefill is compared with the CPU oracle after all measurement iterations. The
+prefills. Every measured iteration uses `steady_clock` around one complete,
+synchronous `forward_device` call, and Google Benchmark consumes that host-wall
+duration as manual time. A second complete prefill is compared with the CPU oracle
+after all measurement iterations. The
 comparison uses `atol=2e-4`, `rtol=2e-3` for accumulated Float32 CPU/CUDA
 differences.
 
 The timed call includes activation/workspace device allocation, all custom-kernel
 stages, layer-local Tensor destruction, one explicit stream synchronization after
 each of `L` layers, final normalization/projection, and the final synchronization.
-Because the start event is enqueued before host-side allocation/submission and the
-stop event only afterward, device idle gaps between the two event executions can
-contribute. This is still not complete host wall latency: preloading and the final
-returned-logits destruction are excluded. The fixture intentionally measures the
+This is call-level host latency: preloading and the final returned-logits
+destruction are excluded. CUDA events are intentionally not used around this
+baseline because the call synchronizes internally before a stop event could be
+submitted, producing an uncontrolled device-idle gap. The fixture intentionally measures the
 current direct-allocation, synchronization-heavy correctness baseline; it must not
 be compared with the allocation-free standalone kernel fixtures as if their scopes
 were equal.
@@ -1175,8 +1227,73 @@ A valid publication must additionally record GPU, driver, CUDA toolkit, CPU/RAM,
 compiler, architecture target, clocks/power policy where available, load,
 repetition variation, and peak memory. The first optimization candidate is a
 reusable allocator-backed workspace that removes per-layer barriers; no such
-change may be called faster until this exact baseline runs and a comparable event
-and host-wall-time experiment is repeated.
+change may be called faster until this exact baseline runs and a comparable
+call-level experiment is repeated. Kernel-only follow-up timing should use events
+inside a future asynchronous execution API.
+
+## M17 CUDA synchronized paged-decode gate — pending NVIDIA hardware
+
+The one-token `CudaLlamaModel::decode_one_paged_device` fixture is a measurement
+gate, not a result. CUDA 12.6.85/GCC 13.2 compile it with warnings as errors, but
+the development container has no NVIDIA driver/device. Its GPU-labeled CTest smoke
+therefore remains skipped and no decode latency, tokens/s, memory, or speedup value
+is published.
+
+The three registered problems are:
+
+| H / I / L / heads / history / V / block tokens | Parameters / bytes | Physical K/V bytes | Table / per-layer score bytes | Status |
+|---|---:|---:|---:|---|
+| 32 / 64 / 2 / 4 / 0 / 128 / 8 | 28,832 / 115,328 B | 8,192 B | 0 / 16 B | compile-validated; execution pending |
+| 64 / 128 / 2 / 4 / 31 / 256 / 8 | 115,008 / 460,032 B | 49,152 B | 16 / 512 B | compile-validated; execution pending |
+| 128 / 256 / 4 / 8 / 127 / 512 / 16 | 787,584 / 3,150,336 B | 655,360 B | 32 / 4,096 B | compile-validated; execution pending |
+
+Setup constructs deterministic identical CPU/CUDA models, evaluates the prefix on
+the CPU, and packs every layer into reversed physical pages with two deliberately
+unused pages. Unwritten page slack is NaN-poisoned. A CPU `PagedKvCache` plus
+direct block-table decode supplies the oracle for the complete `[L,A,D]` new K/V
+and `[1,V]` logits. Weights, pages, block table, token ID, position-specific RoPE
+row, and oracle construction are outside timing.
+
+The device path is checked once, warmed for ten complete decodes, timed with
+`steady_clock` around the complete synchronous call, then checked again. Each call
+includes all model kernels,
+temporary/output device allocations, two D2D K/V-result copies per layer, `L`
+layer lifetime synchronizations, and the final projection synchronization. The
+returned-result destruction after the measured call is excluded. As with prefill,
+CUDA events are inappropriate around the current internally synchronized API;
+kernel-only timing awaits an asynchronous execution boundary.
+
+Command for a future named NVIDIA system:
+
+```bash
+./build-cuda/benchmarks/helix_benchmarks \
+  '--benchmark_filter=BM_CudaLlamaSynchronousPagedDecode' \
+  --benchmark_min_time=0.1s \
+  --benchmark_repetitions=9 \
+  --benchmark_report_aggregates_only=true
+```
+
+Publishing results requires the same GPU/driver/toolchain/clocks/load/variation
+record as the prefill gate. The first comparable follow-up should retain this
+baseline while replacing direct temporaries and per-layer barriers with an
+allocator-backed workspace; no benefit is assumed before comparable host-wall
+measurements execute.
+
+## M18 CUDA generation measurement status — pending NVIDIA hardware
+
+`CudaLlamaGenerator` intentionally has no benchmark yet. Its first implementation
+executes prompt tokens sequentially through one-token paged decode, performs one
+synchronous page append per input token, and copies every generated logits row to
+CPU for selection. A single aggregate number would mostly restate these disclosed
+baseline costs before their GPU correctness tests have executed.
+
+The three generation tests compile with CUDA 12.6 in Release and Debug modes and
+are hardware-gated. After they pass on a named device, the next measurement gate
+should separately report prompt tokens/s, decode inter-token latency, logits D2H
+and selection cost, page-append cost, synchronization count, and peak memory.
+Bulk prefill and device-side greedy selection should be added as retained paired
+baselines, not silently replace the sequential/readback paths. No CUDA generation
+latency or throughput result is currently claimed.
 
 ## M17 immutable mapped model loading — 2026-08-24
 
@@ -1691,9 +1808,11 @@ required synchronization is never reported as execution latency.
 
 CUDA event fixtures now exist for M4 elementwise kernels, every M5
 reduction/softmax variant, both M6 SGEMM implementations, and the M9 embedding and
-transformer primitives, plus the M17 synchronized full-prefill composition. Their
-CUDA 12.6 compile validation is not a benchmark; result rows will be added only
-after execution on a named NVIDIA GPU and driver.
+transformer primitives. The internally synchronized M12 cache append and M17 model
+composition fixtures instead use host wall time around the complete call; a future
+asynchronous model API can add event-timed kernel-only intervals. Their CUDA 12.6
+compile validation is not a benchmark; result rows will be added only after
+execution on a named NVIDIA GPU and driver.
 
 M8's CUDA event-backed reclamation path likewise has correctness fixtures but no
 published timing. Direct, Helix, and supported `cudaMallocAsync` fixtures now make

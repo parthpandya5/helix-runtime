@@ -7,6 +7,7 @@
 #include <cmath>
 #include <cstddef>
 #include <gtest/gtest.h>
+#include <limits>
 #include <span>
 
 namespace helix::attention::cpu {
@@ -30,8 +31,10 @@ Tensor concatenate_token_axis(const Tensor& history, const Tensor& tail) {
   for (std::size_t head = 0; head < heads; ++head) {
     float* destination =
         result.data_as<float>() + head * (history_tokens + tail_tokens) * dimensions;
-    std::copy_n(history.data_as<float>() + head * history_tokens * dimensions,
-                history_tokens * dimensions, destination);
+    if (history_tokens != 0) {
+      std::copy_n(history.data_as<float>() + head * history_tokens * dimensions,
+                  history_tokens * dimensions, destination);
+    }
     std::copy_n(tail.data_as<float>() + head * tail_tokens * dimensions, tail_tokens * dimensions,
                 destination + history_tokens * dimensions);
   }
@@ -178,6 +181,42 @@ TEST(PagedAttentionTest, TailContinuationSupportsEmptyHistoryAndRejectsInvalidCo
   EXPECT_THROW(paged_scaled_dot_product_attention_with_tail_out(query, view, tail_key, tail_value,
                                                                 output, wrong_workspace),
                Error);
+}
+
+TEST(PagedAttentionTest, TailCausalMaskDoesNotReadFutureNonFiniteValues) {
+  kv_cache::PagedKvCache cache(kv_cache::PagedKvCacheConfig{1, 1, 1, 2, 1});
+  const kv_cache::PagedSequenceHandle sequence = cache.create_sequence();
+  auto view = cache.read_layer(sequence, 0);
+  const float nan = std::numeric_limits<float>::quiet_NaN();
+  const Tensor query = Tensor::zeros({1, 2, 1});
+  const Tensor tail_key = Tensor::from_values({1, 2, 1}, std::array{0.0F, nan});
+  const Tensor tail_value = Tensor::from_values({1, 2, 1}, std::array{3.0F, nan});
+  Tensor output = Tensor::empty({1, 2, 1});
+  Tensor workspace = Tensor::empty({1, 2, 2});
+
+  paged_scaled_dot_product_attention_with_tail_out(query, view, tail_key, tail_value, output,
+                                                   workspace);
+  EXPECT_FLOAT_EQ(output.data_as<float>()[0], 3.0F);
+  EXPECT_TRUE(std::isnan(output.data_as<float>()[1]));
+  EXPECT_FLOAT_EQ(workspace.data_as<float>()[0], 1.0F);
+  EXPECT_FLOAT_EQ(workspace.data_as<float>()[1], 0.0F);
+
+  kv_cache::PagedKvCache history_cache(kv_cache::PagedKvCacheConfig{1, 1, 1, 1, 2});
+  const kv_cache::PagedSequenceHandle history_sequence = history_cache.create_sequence();
+  const Tensor zero_key = Tensor::zeros({1, 1, 1});
+  history_cache.append(history_sequence, zero_key,
+                       Tensor::from_values({1, 1, 1}, std::array{3.0F}));
+  history_cache.append(history_sequence, zero_key, Tensor::from_values({1, 1, 1}, std::array{nan}));
+  auto history_view = history_cache.read_layer(history_sequence, 0);
+  Tensor history_output = Tensor::empty({1, 1, 1});
+  Tensor history_workspace = Tensor::empty({1, 1, 2});
+  const Tensor single_query = Tensor::zeros({1, 1, 1});
+  paged_scaled_dot_product_attention_out(single_query, history_view, 0, history_output,
+                                         history_workspace);
+  EXPECT_FLOAT_EQ(history_output.data_as<float>()[0], 3.0F);
+  paged_scaled_dot_product_attention_dimension_major_out(single_query, history_view, 0,
+                                                         history_output, history_workspace);
+  EXPECT_FLOAT_EQ(history_output.data_as<float>()[0], 3.0F);
 }
 
 TEST(PagedAttentionTest, SupportsZeroQueriesWithPositiveKvHistory) {

@@ -179,6 +179,14 @@ add_library(helix_kv_cache
 add_library(helix::kv_cache ALIAS helix_kv_cache)
 target_compile_features(helix_kv_cache PUBLIC cxx_std_20)
 target_link_libraries(helix_kv_cache PUBLIC helix::tensor)
+if(HELIX_ENABLE_CUDA)
+  target_sources(
+    helix_kv_cache
+    PRIVATE
+      src/kv_cache/cuda_block_table.cpp
+      src/kv_cache/cuda_paged.cpp)
+  target_link_libraries(helix_kv_cache PUBLIC helix::cuda_runtime)
+endif()
 target_include_directories(
   helix_kv_cache
   PUBLIC
@@ -234,7 +242,11 @@ add_library(helix::model ALIAS helix_model)
 target_compile_features(helix_model PUBLIC cxx_std_20)
 target_link_libraries(helix_model PUBLIC helix::attention helix::cpu_kernels helix::kv_cache)
 if(HELIX_ENABLE_CUDA)
-  target_sources(helix_model PRIVATE src/model/cuda_llama.cpp)
+  target_sources(
+    helix_model
+    PRIVATE
+      src/model/cuda_generation.cpp
+      src/model/cuda_llama.cpp)
   target_link_libraries(helix_model PUBLIC helix::cuda_kernels helix::cuda_runtime)
 endif()
 target_include_directories(

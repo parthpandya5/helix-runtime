@@ -2,6 +2,8 @@
 #include "helix/kernels/cpu/reference.hpp"
 
 #if HELIX_CONSUMER_EXPECT_CUDA
+#include "helix/kv_cache/cuda_paged.hpp"
+#include "helix/model/cuda_generation.hpp"
 #include "helix/model/cuda_llama.hpp"
 #endif
 
@@ -11,6 +13,9 @@
 #include <type_traits>
 
 #if HELIX_CONSUMER_EXPECT_CUDA
+static_assert(!std::is_copy_constructible_v<helix::kv_cache::CudaPagedKvCache>);
+static_assert(!std::is_copy_constructible_v<helix::kv_cache::CudaPagedKvCache::DecodeView>);
+static_assert(!std::is_move_constructible_v<helix::model::CudaLlamaGenerator>);
 static_assert(!std::is_copy_constructible_v<helix::model::CudaLlamaModel>);
 #endif
 

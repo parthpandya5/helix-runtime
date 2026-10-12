@@ -15,11 +15,12 @@ evict those anchors when they prevent scheduling progress. This path is CPU-
 validated, sanitized, and benchmarked; it is disabled by default because measured
 short prompts regress.
 
-This is not yet a CUDA execution engine. It has no device-resident block table,
-CUDA stream, event dependency, allocator-backed Tensor storage, or fused model
-batch. Scheduled work items execute serially on the calling thread using Float32
-CPU reference kernels. Those boundaries are deliberate and are not hidden by the
-`Runtime` name.
+This is not yet a CUDA execution engine. The separately compile-validated CUDA
+model can decode against caller-owned pages or a `CudaPagedKvCache` lease, but this
+engine owns no device cache/session, CUDA stream, event dependency, allocator-
+backed Tensor storage, or fused model batch. Scheduled work items execute serially on the calling thread
+using Float32 CPU reference kernels. Those boundaries are deliberate and are not
+hidden by the `Runtime` name.
 
 ## Ownership
 
@@ -267,10 +268,10 @@ Eleven engine tests exercise:
 - automatic LRU-anchor eviction and continued progress in a three-block pool.
 
 The bulk cache, scheduler final-token rule, and paged model decode have additional
-focused tests. The full Debug, Release, and ASan/UBSan CPU suites pass 197/197,
+focused tests. The full Debug, Release, and ASan/UBSan CPU suites pass 200/200,
 including the independent model-converter integration test. A CUDA 12.6 warnings-
-as-errors build passes 196 hardware-independent tests and registers 75 GPU-required
-tests/benchmark gates, all explicitly skipped without an NVIDIA driver/device (271
+as-errors build passes 199 hardware-independent tests and registers 93 GPU-required
+tests/benchmark gates, all explicitly skipped without an NVIDIA driver/device (292
 total); Python/NumPy is not installed in that compile container.
 
 ## Current limitations
@@ -290,6 +291,7 @@ total); Python/NumPy is not installed in that compile container.
 - Host allocation failure while constructing an error message is not a recoverable
   fault boundary; ordinary model/cache failures are handled and tested.
 
-The next execution-engine step is a CUDA model path with device-resident paged K/V
-and explicit stream ownership. Stream overlap is considered only after that path
-is correct and measured on NVIDIA hardware.
+The next execution-engine step is a GPU-owned paged K/V manager that can commit the
+CUDA model's transactional decode result, followed by explicit stream ownership
+and scheduler integration. Stream overlap is considered only after that path is
+correct and measured on NVIDIA hardware.

@@ -8,14 +8,15 @@ that into a GPU performance claim.
 
 - Engineered a CPU-first C++20/CUDA inference runtime with checked Tensor/storage
   ownership, deterministic reference kernels, causal attention, contiguous and
-  paged KV caches, request scheduling, and continuous batching; maintained 196
+  paged KV caches, request scheduling, and continuous batching; maintained 200
   passing Debug, Release, and ASan/UBSan CPU tests.
 - Implemented manual CUDA elementwise, reduction, stable-softmax, naive/tiled
   SGEMM, embedding, layout, RMSNorm, RoPE, SwiGLU, and attention paths with RAII
-  streams/events; composed them into a synchronous full-prefill model with owned
-  device weights and explicit temporary-lifetime barriers, then compile-validated
-  all CUDA targets and CPU-oracle tests with NVCC 12.6 while explicitly deferring
-  runtime/performance claims until GPU access.
+  streams/events; composed them into synchronous full-prefill and transactional
+  paged one-token decode plus a model/stream/cache-owning generation session with
+  explicit temporary-lifetime barriers, then compile-validated all CUDA targets and CPU-oracle tests
+  with NVCC 12.6 while explicitly deferring runtime/performance claims until GPU
+  access.
 - Designed a best-fit caching allocator with aligned split/coalesce, reservation
   limits, generation-tagged stale/double-free protection, internal/external
   fragmentation metrics, and event-backed deferred reuse for stream-ordered CUDA
@@ -24,9 +25,12 @@ that into a GPU performance claim.
   small-allocation regressions as an explicit limitation.
 - Built a paged KV manager with fixed physical blocks, logical block tables,
   deterministic FIFO reclamation, transactional exhaustion, cache-tagged handles,
-  and copy-free read leases; optimized CPU attention value traversal by 2.36x–
-  2.99x, then measured the remaining paged-layout overhead at 2.1%–6.7% against an
-  equally optimized contiguous baseline.
+  and copy-free read leases; added a separately labeled GPU-resident sibling with
+  transactional same-stream append and decode/commit ownership, then compile-
+  validated its oracle tests and wall-time benchmark gate without claiming GPU execution.
+  Optimized CPU attention value traversal by 2.36x–2.99x, then measured the
+  remaining paged-layout overhead at 2.1%–6.7% against an equally optimized
+  contiguous baseline.
 - Added reference-counted, block-aligned KV prefix forks with immutable shared
   pages, divergence-safe exclusive tails, and logical-versus-resident accounting;
   measured 11.02x–320.67x lower child lifecycle time than copying 32 KiB–1 MiB

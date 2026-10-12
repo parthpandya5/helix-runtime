@@ -46,9 +46,12 @@ The implemented synchronous CPU runtime executes one scheduling iteration at a
 time: admit requests, construct prefill/decode work within token and KV-memory
 budgets, optionally seed exact cached prefixes, execute the model serially, append
 paged K/V state, select tokens, and retire or requeue requests. CUDA model
-execution now has an isolated synchronous full-prefill composition baseline;
-CUDA-backed K/V, scheduling, and asynchronous iterations remain later layers of
-this architecture.
+execution now has isolated synchronous full-prefill and one-token decode
+composition baselines. Decode can borrow pages from a CUDA-owned fixed pool and
+returns uncommitted K/V; a tested boundary appends only after successful model
+return. A compile-validated single-sequence CUDA session now owns that model,
+stream, and cache lifecycle. CUDA scheduler/batched orchestration and asynchronous
+iterations remain later layers of this architecture.
 
 ## Layering and dependency direction
 
@@ -466,10 +469,14 @@ dimension-major baselines, equal tiled traversals, and the page-table overhead.
 A compile-validated CUDA baseline instead consumes layer-local device tensors
 `K/V[physical_blocks,heads,block_tokens,width]` and a move-only immutable device
 table. Kernels translate each logical token to `(physical block, token offset)` and
-bound the final partial page by the explicit logical KV length. This establishes a
-visible device traversal contract, but it is not connected to the CPU
-`PagedKvCache`, `HelixAllocator`, or model executor. Its compiler resource report is
-not GPU coalescing or performance evidence.
+bound the final partial page by the explicit logical KV length. A second CUDA entry
+point appends an uncommitted contiguous tail logically without writing those pages;
+an allocation-free empty table represents position-zero history. This establishes
+a visible device traversal and transaction contract. The block-table owner now
+lives in the lower KV layer, and `CudaPagedKvCache` supplies compatible page tensors
+and a mapping lease to the model executor. It remains separate from the CPU
+`PagedKvCache`, `HelixAllocator`, scheduler, and runtime dispatcher. Its compiler
+resource report is not GPU coalescing or performance evidence.
 
 The runtime decode variant logically extends the leased history with an
 uncommitted contiguous `[heads,tail_tokens,head_dimension]` K/V tail. Tail query
@@ -478,6 +485,13 @@ mutated while attention runs. The model returns all-layer tail K/V and the engin
 appends it only after successful execution. This removes two combined-history
 tensors per layer while retaining the compact-copy implementation as an explicit
 oracle and benchmark baseline.
+
+Both CPU and CUDA value stages traverse only the key prefix visible to each causal
+query row. Masked probabilities remain materialized as zero for inspection, but
+future V rows are not read, so a future non-finite value cannot leak through IEEE
+`0 * NaN`. Attention rejects any overlapping logical byte ranges among read-only
+inputs and writable output/scratch, including partial overlap through independent
+Storage wrappers.
 
 ## KV cache
 
@@ -518,6 +532,27 @@ or pool exhaustion preserves the prior mapping and logical length. Release
 prevalidates references and returns a block without allocating only when its last
 sequence reference disappears.
 
+The compile-validated CUDA manager owns one key and value tensor per layer with
+layout `[physical_blocks,kv_heads,block_tokens,head_dimension]`. This `2 * layers`
+allocation baseline makes every layer directly consumable by paged attention.
+`CudaPagedSequenceHandle` separates device-pool identity from CPU cache handles;
+exclusive pages use the same deterministic FIFO policy without prefix sharing.
+One-token append validates the complete `[layers,kv_heads,head_dimension]` input,
+reserves table capacity, enqueues `2 * layers * heads` contiguous D2D vector copies
+on one caller stream, synchronizes, and only then publishes ownership and length.
+Failure before that boundary leaves metadata unchanged. An undrainable stream
+poisons the cache against future use rather than risking uncertain page reuse.
+
+`CudaPagedKvCache::DecodeView` holds the cache mutex, implementation ownership,
+sequence pointer, layer tensors, and an immutable uploaded device block table.
+Borrowed inputs must complete before the view dies; synchronous CUDA model decode
+satisfies this rule on success. A consumer that cannot trust exceptional stream
+completion can transfer the table into cache quarantine and poison future
+admission/reuse before unlocking; the CUDA generator does so conservatively around
+model calls. Append/release and unrelated sequence mutation wait behind the lease,
+which is deliberately correct and coarse. General asynchronous execution
+will require event-tracked page/table lifetime instead of this host lock boundary.
+
 The M19 bulk append accepts one `[kv_heads,tokens,head_dimension]` key/value pair
 per layer. It validates the entire layer-major input, checks capacity, and reserves
 the final block-table size before assigning any block. Copies then traverse maximal
@@ -552,9 +587,10 @@ The first memory-pressure policy rejects append with a typed resource error whil
 preserving current sequences; an append within an already-owned partial block can
 still proceed. Debug builds re-derive ownership and accounting invariants after
 every mutation. Both contiguous and paged CPU caches use one mutex per instance.
-The M13 read lease lets attention traverse written block spans without compaction;
-its exclusive lifetime lock is the current invalidation boundary. GPU-resident pool
-integration and request preemption remain separate milestones. In the CPU runtime,
+The M13 read leases let attention traverse written block spans without compaction;
+their exclusive lifetime locks are the current invalidation boundary. CUDA pool
+integration with the allocator/runtime and request preemption remain separate
+milestones. In the CPU runtime,
 retained prefix anchors are evicted in LRU order only when their page ownership
 prevents the scheduler from making any progress.
 
@@ -717,8 +753,9 @@ flowchart LR
 
 These barriers are a correctness baseline, not a proposed throughput design. The
 path uses ordinary Tensor device allocation rather than `HelixAllocator`, exposes
-the existing token/head copies and unfused attention stages, and has no K/V decode,
-batch construction, graph capture, or overlap. Replacing the barriers requires an
+the existing token/head copies and unfused attention stages. Its paged K/V decode
+remains one-token and synchronous, with no batch construction, graph capture, or
+overlap. Replacing the barriers requires an
 explicit long-lived workspace or stream-aware allocator ownership; merely deleting
 them would permit asynchronous use-after-free.
 
@@ -753,6 +790,30 @@ still selectable. Both paths return new K/V separately, and their caller appends
 only after the entire token step and final logits projection succeed. This keeps
 model failures from advancing logical cache length. Multi-call execution assumes
 the caller does not mutate the same sequence concurrently.
+
+`CudaLlamaGenerator` is the corresponding compile-validated CUDA session owner.
+It contains one move-only model, one device-local stream, one fixed paged cache,
+and one sequence handle. Prompt prefill currently executes the one-token paged
+path repeatedly into a private staging sequence; only a fully successful prompt
+replaces the session's original empty sequence. Decode leases pages/table under
+the cache mutex, runs the synchronous model, releases the lease, and commits the
+returned K/V synchronously. Greedy selection copies the completed `[1,V]` logits
+to CPU and applies the shared finite-value/lowest-index rule. This is explicit
+baseline orchestration, not device-side sampling or continuous batching.
+
+```mermaid
+flowchart LR
+    Prompt[Prompt token IDs] --> Session[CudaLlamaGenerator]
+    Session --> Stream[Owned CUDA stream]
+    Session --> Lease[CudaPagedKvCache lease]
+    Lease --> Decode[CudaLlamaModel paged decode]
+    Stream --> Decode
+    Decode --> Pending[Uncommitted K/V + device logits]
+    Pending --> Commit[Synchronous page commit]
+    Pending --> Readback[Logits D2H]
+    Readback --> Greedy[CPU greedy selection]
+    Commit --> Lease
+```
 
 The `HELIXLM1` container is a deterministic little-endian format with a fixed
 128-byte versioned header, fixed-size tensor directory, exact role/layer/shape
@@ -813,11 +874,32 @@ The current CPU path performs full causal prefill and single-token decode agains
 either contiguous or paged K/V storage, using the shared layout kernels to repack
 token-major Q/K/V tensors around the existing head-major attention API. Greedy
 selection, EOS/length/context stops, a token-ID CLI, and scheduler-driven multi-
-request paged decode are implemented.
-The runtime schedules several requests per iteration but executes their model work
-serially; a fused tensor batch, tokenizer integration, validation of additional
-checkpoint architectures, CUDA cached decode, and GPU runtime dispatch remain
-later work. The
+request paged decode are implemented. The CUDA model composes the same one-token
+math against layer-local pages and returns aggregate current K/V only after
+success. `CudaPagedKvCache` can own those pages and commit the result as a separate
+synchronous transaction; direct caller-owned pages remain valid for isolated
+kernel/model tests.
+
+```mermaid
+flowchart LR
+    Token[Current token + absolute RoPE row] --> Model[CudaLlamaModel decode]
+    Cache[CudaPagedKvCache lease] --> Pages[Layer-local K/V pages]
+    Cache --> Table[Immutable device block table]
+    Pages --> Tail[Paged history + uncommitted tail attention]
+    Table --> Tail
+    Model --> Tail
+    Tail --> Rest[Attention output + MLP + LM head]
+    Model --> Pending[Uncommitted all-layer K/V]
+    Rest --> Logits[Device logits]
+    Pending -->|only after complete success| Commit[Synchronous cache append]
+    Commit --> Cache
+```
+
+The CPU runtime schedules several requests per iteration but executes their model
+work serially. CUDA has a separate one-sequence generation owner, but a fused
+tensor batch, tokenizer integration, validation of additional checkpoint
+architectures, GPU scheduler ownership, and CUDA runtime dispatch remain later
+work. The
 implemented converter supports only the documented ordinary Hugging Face Llama
 safetensors layout and rejects GQA/MQA, biases, scaled/partial RoPE, quantization,
 and arbitrary model graphs rather than guessing compatibility.
@@ -910,8 +992,12 @@ cross-model prefix namespaces, partial-page prefix sharing, preemption, or
 multi-GPU inference. Each can be considered only after the core runtime is correct
 and measured.
 
-The CUDA full-prefill composition is compile-validated but has not executed on an
-NVIDIA device. It synchronizes per layer, allocates temporaries directly, and is
-not connected to paged K/V, the scheduler, or the runtime engine. No correctness,
-latency, throughput, occupancy, or memory-capacity inference is drawn from CUDA
-compilation alone.
+The CUDA full-prefill and paged one-token decode compositions are compile-validated
+but have not executed on an NVIDIA device. Both synchronize per layer and allocate
+temporaries directly. Decode can consume externally packed K/V or a synchronous
+`CudaPagedKvCache` lease; that cache owns page admission, append, and reclamation,
+and `CudaLlamaGenerator` owns a single-sequence stream/cache/model session. No
+component owns scheduler-driven multi-request CUDA execution, and the session is
+not connected to the runtime engine. No
+correctness, latency, throughput, occupancy, or memory-capacity inference is drawn
+from CUDA compilation alone.

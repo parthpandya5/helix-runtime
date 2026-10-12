@@ -15,10 +15,13 @@ KV caches, direct block-table attention, and a deterministic continuous-batching
 scheduler. The current end-to-end path loads a checksummed native model format,
 runs a narrowly defined Float32 Llama-style model on CPU, performs single-sequence
 greedy generation, and drives multiple scheduled requests through a shared paged
-KV pool with transactional prefill/decode/reclamation. A separate synchronous
-CUDA baseline now composes the custom kernels through complete causal prefill with
-device-owned weights and explicit per-layer lifetime barriers; it is not yet the
-scheduler/KV runtime path.
+KV pool with transactional prefill/decode/reclamation. Separate synchronous CUDA
+baselines compose the custom kernels through complete causal prefill and one-token
+decode over caller-owned or cache-owned paged history, with device-owned weights,
+uncommitted result K/V, explicit per-layer lifetime barriers, and a separate
+synchronous cache commit. A one-sequence CUDA generator now owns that
+model/stream/cache lifecycle and performs explicit logits readback for greedy
+selection; it is not yet the GPU scheduler or batched-runtime path.
 CPU paths pass normal and sanitizer suites and have reproducible benchmarks. CUDA
 paths compile under CUDA 12.6, but I do not claim GPU correctness or performance
 because this development environment has no NVIDIA device.
@@ -31,11 +34,17 @@ kernels for a layer use the caller's one stream. The model synchronizes at the e
 of the layer before destroying projections, repacked Q/K/V, attention scratch, or
 the old hidden state, and synchronizes final logits before returning. Its exception
 path also tries to drain accepted work before unwinding. That is correct but
-intentionally expensive: `layers+1` barriers, direct temporary allocation, no K/V
-decode, and no overlap. A production follow-up needs persistent workspace or
-stream-aware deferred release; simply removing synchronization would create
-device use-after-free risk. This design is compile-validated only until the GPU
-oracle and sanitizer tests run.
+intentionally expensive: `layers+1` barriers, direct temporary allocation, and no
+overlap. Paged decode additionally retains borrowed history/table lifetime through
+synchronous return and copies each layer's current K/V into one aggregate
+transaction result. `CudaPagedKvCache` can pin that history with a mutex-owning
+lease and commit the result after return, but append adds another synchronization
+and `2*layers*heads` D2D copies. If exceptional completion cannot be trusted, the
+generation session moves the device table into cache quarantine and permanently
+blocks page reuse instead of unlocking uncertain pointers. A production follow-up needs persistent workspace,
+batched runtime ownership, and stream-aware deferred release; simply removing
+synchronization would create device use-after-free risk. This design is compile-
+validated only until the GPU oracle and sanitizer tests run.
 
 ## Why build an inference runtime rather than use PyTorch?
 
@@ -255,8 +264,15 @@ decrements once per table entry, and returns a page to the FIFO only at zero. A
 move-only read lease pins storage/table state while direct paged attention traverses
 spans. The separate CUDA baseline currently accepts one layer already packed as
 `[block,head,token_in_block,dimension]`; its move-only table owns an immutable
-device copy and must outlive all enqueued stream work. That kernel contract is not
-yet a GPU cache-manager integration.
+device copy and must outlive all enqueued stream work. Its tail entry point accepts
+current K/V separately, including with an allocation-free empty table at position
+zero. `CudaLlamaModel` now composes that contract across every layer and returns
+aggregate K/V only after the complete step succeeds. The model still consumes
+ordinary externally packed pages in isolated tests, while `CudaPagedKvCache` now
+owns compatible per-layer tensors, uploads each leased sequence table, commits K/V
+after successful synchronous decode, and reclaims pages through a deterministic
+FIFO. The cache path has no prefix sharing or scheduler/runtime session yet, and
+neither compilation nor the pending event fixture is a runtime-performance claim.
 
 ## How does Helix share a KV prefix?
 
@@ -418,8 +434,10 @@ tokenization, and other model layouts remain outside the supported boundary.
 Helix implements Tensor/storage metadata, CPU kernels, CUDA elementwise/reduction/
 softmax/GEMM/transformer/attention kernels, allocator metadata and deferred reuse,
 KV layouts, paged attention, requests, scheduling/metrics, the CPU transformer,
-cached generation session, exact bounded prefix index/LRU, paged multi-request CPU
-engine with suffix reuse, greedy selection, native file parser/packer, and the
+CUDA prefill/paged-decode composition, CPU and compile-validated CUDA
+single-sequence generation sessions, exact bounded
+prefix index/LRU, paged multi-request CPU engine with suffix reuse, greedy
+selection, native file parser/packer, and the
 narrow safetensors metadata/layout converter. It also implements read-only
 external Tensor ownership, the checked POSIX model-mapping path, and an independent
 bounded source-layout oracle. It delegates numerical array transposition and

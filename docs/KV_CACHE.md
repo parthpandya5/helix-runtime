@@ -8,11 +8,16 @@ sharing plus bounded exact-content cache are implemented, CPU-validated,
 sanitized, and benchmarked in Float32. The CPU runtime can opt into longest-prefix
 reuse and pressure-driven LRU anchor eviction. These paths expose the memory-
 capacity, compaction, direct-traversal, lookup-scaling, and reuse tradeoffs between
-a per-sequence allocation and a global fixed-block pool. There is not yet a GPU-
-resident KV cache or CUDA prefix-reuse path. A compile-validated CUDA paged-
-attention baseline accepts separately packed layer-local device pages and an
-immutable uploaded block table; it is deliberately not presented as cache/runtime
-integration.
+a per-sequence allocation and a global fixed-block pool. A CUDA-only
+`CudaPagedKvCache` now owns layer-local device pages, sequence mappings, a FIFO
+free-block pool, synchronous transactional append, and reclamation. Its decode
+lease supplies the existing CUDA model with an immutable uploaded table and pins
+the pool until synchronous model completion; a GPU-gated integration test commits
+returned K/V only after successful decode. Failed-consumer quarantine prevents
+uncertain table/page reuse, and `CudaLlamaGenerator` owns the cache for one
+synchronous sequence. This path is compile-validated but has not run on an NVIDIA
+GPU. CUDA prefix reuse, allocator integration, and scheduled multi-request runtime
+ownership remain later gates.
 
 ## Why cache keys and values?
 
@@ -129,6 +134,14 @@ into mutable pool storage. Callers must not invoke another operation on the same
 cache from the lock-owning thread while the view exists; doing so would attempt to
 reacquire the non-recursive mutex. The lease also serializes unrelated sequences,
 which is safe but may become a measured scheduler bottleneck.
+
+The CUDA cache follows the same one-mutex boundary. `append` retains it across all
+D2D copies and the caller-stream synchronization, so a successful metadata commit
+means the payload is complete. `DecodeView` retains it while device tensors and the
+uploaded block table are borrowed. Callers must finish all asynchronous consumers
+before destroying that view; the current CUDA model is synchronous and satisfies
+that contract. The cache is therefore thread-safe at its public boundary but
+coarse-grained, not an overlap-optimized scheduler primitive.
 
 ## Contiguous correctness coverage
 
@@ -386,10 +399,93 @@ eviction, explicit erase/clear, invalid/stale/foreign sources, anchor lifetime,
 destructor reclamation, and concurrent lookup/fork/release lifecycles. Runtime
 tests compare reused-suffix output with full recomputation, verify cancellation
 ownership, and force anchor eviction in a three-page pool. The complete native
-Debug, Release, and ASan/UBSan suites pass 197/197. The CUDA-on compile-validation
-suite passes 196 hardware-independent tests and explicitly skips 75 GPU-required
-tests/benchmark gates without a device (271 total); its missing Python/NumPy omits
+Debug, Release, and ASan/UBSan suites pass 200/200. The CUDA-on compile-validation
+suite passes 199 hardware-independent tests and explicitly skips 93 GPU-required
+tests/benchmark gates without a device (292 total); its missing Python/NumPy omits
 the separate converter integration test.
+
+## CUDA GPU-resident paged baseline
+
+`CudaPagedKvCache` uses the same checked `PagedKvCacheConfig` geometry but stores
+two device tensors per layer:
+
+```text
+layer_keys[L]   [physical_blocks, kv_heads, block_tokens, head_dimension]
+layer_values[L] [physical_blocks, kv_heads, block_tokens, head_dimension]
+```
+
+The per-layer split is intentional for the first correct baseline: each tensor can
+be passed directly to the existing paged-attention/model API without a slice type
+or pointer-offset wrapper. It costs `2 * layers` direct CUDA allocations at cache
+construction. Pool allocation is outside append timing, and integrating these
+long-lived tensors with `HelixAllocator` is a later ownership change.
+
+`CudaPagedSequenceHandle` has its own cache-instance identity and cannot be mixed
+with CPU handles. Sequence tables store 32-bit physical IDs, and a fixed circular
+FIFO owns every unassigned page. One-token append accepts aggregate device tensors
+`[layers,kv_heads,head_dimension]`. Because a fixed token position is strided
+across heads in `[page,head,token,dimension]` layout, the correctness baseline
+issues two contiguous D2D copies per layer/head—one key and one value vector—on the
+caller's same-device stream.
+
+The commit protocol is explicit:
+
+```mermaid
+sequenceDiagram
+    participant Model
+    participant Cache
+    participant Stream
+    Model-->>Cache: completed [L,H,D] current K/V
+    Cache->>Cache: validate handle, shape, device, aliasing, capacity
+    Cache->>Cache: reserve block-table metadata; peek free page
+    Cache->>Stream: enqueue 2 x L x H D2D vector copies
+    Cache->>Stream: synchronize
+    Stream-->>Cache: payload complete
+    Cache->>Cache: publish page ID, length, and statistics
+```
+
+No logical length, page ownership, or success counter changes before the stream
+completes. A copy failure drains already accepted work before returning; if the
+stream cannot be drained, the cache marks itself unusable so an uncertain page is
+never reassigned. Bytes written into an uncommitted slot remain invisible and are
+fully overwritten by a later successful retry. Release performs no allocation,
+clears written-token ownership metadata, and returns all pages to the FIFO.
+
+`read_sequence` synchronously uploads the current logical table into the canonical
+move-only `kv_cache::cuda::PagedBlockTable` while holding the cache mutex. Its
+`DecodeView` then pins the table, sequence metadata, all page tensors, and the lock.
+The CUDA Llama integration executes paged-tail decode inside that lease, drops the
+lease after synchronous return, and only then calls append. A model failure leaves
+cache length unchanged. `CudaLlamaGenerator` owns this sequence for a complete
+single-session lifecycle and builds a prompt in a private staging table before
+publishing it as the active history.
+
+An exceptional consumer also needs a lifetime decision. If completion cannot be
+trusted, `DecodeView::poison_after_consumer_failure` moves its device table into a
+cache-owned quarantine before unlocking and marks stream state uncertain. The
+cache remains inspectable and sequences can be logically released, but create,
+append, and new read leases permanently reject reuse. The CUDA generator invokes
+this conservative path for any model exception inside a lease; ordinary
+prevalidated token/session errors occur before a lease or launch. `is_healthy()`
+exposes the terminal poison state without probing a mutating operation.
+
+Six GPU-gated cache tests cover empty/odd page layouts, every visible K/V value,
+exact statistics, partial-page progress under zero free pages, transactional
+exhaustion, FIFO reuse, invalid configuration/handle/dtype/device/shape/stream and
+alias contracts, moved-view behavior, facade lifetime, and cross-thread release
+blocking. The final case explicitly quarantines a failed consumer's device table,
+poisons admission/reuse, and still permits logical sequence release. A separate
+model test compares five successive decode/commit steps with CPU
+full-prefix recomputation. They compile in CUDA Release and Debug modes but remain
+unexecuted without a device.
+
+The warmed `BM_CudaPagedKvSynchronousAppend` fixture byte-checks the cache before
+and after timing, measures one complete synchronized append with `steady_clock`,
+and reports token bytes, D2D copy count, synchronization count, and physical pool
+bytes for three geometries. Host wall time is intentional: append synchronizes
+internally, so a CUDA stop event could only be submitted after that barrier and
+would include an uncontrolled device-idle gap. It is a measurement gate only; no
+latency, bandwidth, or improvement is claimed.
 
 ## Direct block-table attention lease
 
@@ -411,14 +507,14 @@ logical block, and per-head key/value spans. A complete block span contains
 derived with checked pool geometry at construction and bounded indices at access;
 no pointer to an unwritten slot is returned.
 
-The M13 CPU attention implementation holds this lease while it computes scaled
+The M13 CPU attention implementation holds its CPU lease while it computes scaled
 scores, stable softmax, and probability-times-V directly from pages. That removes
 the two compact-history copies measured in M12. It does not make attention
 workspace-free: probabilities still use the explicit `[heads, queries, length]`
-Float32 workspace. It also does not establish asynchronous GPU safety. A future
-device view needs a device-resident table and stream-ordered ownership whose
-lifetime extends through kernel completion, not a host mutex held across an
-asynchronous launch.
+Float32 workspace. The CUDA `DecodeView` establishes the analogous ownership
+boundary only for synchronous consumers: its table and pages stay alive through
+model return. General asynchronous execution still needs event/stream-ordered page
+and table lifetime rather than a host mutex released after an unjoined launch.
 
 The runtime's default one-token paged decode now uses the same lease without first
 committing the current token. The attention API consumes cached pages plus
@@ -432,7 +528,8 @@ benefit and the much smaller end-to-end effect in `docs/PERFORMANCE.md`.
 
 ## Current limitations
 
-- Float32 CPU tensors only; no GPU-resident cache or asynchronous copy contract.
+- Float32 only. The CUDA cache has a synchronous same-stream append/lease contract,
+  not asynchronous multi-stream use tracking.
 - Keys and values use the same head dimension.
 - Compact retrieval still copies; direct CPU attention consumes a read lease
   instead.
@@ -445,11 +542,15 @@ benefit and the much smaller end-to-end effect in `docs/PERFORMANCE.md`.
 - The CPU runtime stores only the maximum reusable prefix published by each
   completed prompt, uses one engine-local namespace, and does not cache logits.
   Cross-model/shared-runtime namespace management is not implemented.
-- Prefix lookup and reuse are CPU-only and opt-in; GPU-resident anchors and a
-  device block table do not exist.
+- Prefix lookup and reuse are CPU-only and opt-in; GPU-resident anchors do not
+  exist. CUDA sequence views upload one private immutable table per lease.
 - No request preemption exists; only retained prefix anchors can be evicted.
-- One mutex serializes all sequences, and a direct read lease holds it for the
-  complete attention call.
+- One mutex per cache serializes all sequences, and a direct read/decode lease
+  holds it for the complete attention/model call.
+- The CUDA baseline owns `2 * layers` direct allocations and performs
+  `2 * layers * heads` D2D copies plus one stream synchronization per committed
+  token. It is not connected to `HelixAllocator`, the scheduler, prefix reuse, or
+  runtime request sessions.
 
 The implementation is original. Fixed-size blocks, block tables, and KV reuse are
 standard inference-runtime concepts; Helix keeps its own layout, ownership,

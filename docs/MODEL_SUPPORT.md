@@ -10,10 +10,12 @@ of compatibility with every model whose configuration contains the word “Llama
 The implementation, native weight container, unit tests, sanitizer suite, CPU
 benchmarks, and a narrowly checked Hugging Face Llama safetensors conversion path
 are complete. Native files can be loaded through either portable owned copies or
-an opt-in immutable POSIX mapping. A synchronous CUDA full-prefill composition is
-compile-validated, with physical-GPU correctness and timing still pending. CUDA
-cached decode, fused tensor batching, and tokenizer/text-prompt integration remain
-later gates. One revision-pinned
+an opt-in immutable POSIX mapping. Synchronous CUDA full-prefill and one-token
+paged-decode compositions are compile-validated, with physical-GPU correctness and
+timing still pending. A compile-validated GPU paged cache now owns/commits decode
+history through a synchronous lease, and a one-sequence CUDA generation session
+owns that model/cache/stream composition. Fused tensor batching, scheduler-driven
+CUDA execution, and tokenizer/text-prompt integration remain later gates. One revision-pinned
 public tiny-random checkpoint has been validated at the raw-token/logit boundary;
 that single artifact does not imply broad checkpoint compatibility.
 
@@ -26,7 +28,7 @@ attention heads `A`, head dimension `D = H/A`, and prompt length `T`, Helix acce
 - one Q, K, and V head per attention head; grouped-query and multi-query attention
   are not supported;
 - contiguous row-major Float32 weights and activations; CPU execution is validated,
-  while CUDA full prefill is compile-validated only;
+  while CUDA full prefill and paged one-token decode are compile-validated only;
 - bias-free embedding/projection/MLP operations;
 - pre-attention and pre-MLP RMSNorm;
 - full adjacent-pair RoPE across each head dimension;
@@ -73,7 +75,7 @@ primitives.
 final normalized state. Tests compare all of those stages with an independent
 `std::vector<float>` oracle; the ordinary forward path does not retain them.
 
-### CUDA full-prefill baseline
+### CUDA synchronous prefill and paged-decode baseline
 
 `CudaLlamaModel` implements the same full causal equations without delegating
 GEMM or attention to a library. Construction validates CPU Float32 weights, deep-
@@ -99,11 +101,33 @@ costs `L+1` stream barriers and prevents overlap. An optimized follow-up must us
 an explicit reusable workspace and stream-aware allocation; removing the barriers
 alone would be incorrect because asynchronous kernels could retain freed inputs.
 
-Three hardware-gated tests compare single-token and odd-five-token logits with
-the CPU model at `atol=2e-4`, `rtol=2e-3`, validate host/device metadata and a
-moved stream before execution, and require an invalid device ID to propagate only
-NaN logits. They compile and discover successfully but have not executed without
-an NVIDIA device. No CUDA correctness or performance result is claimed.
+One-token decode remains cache-explicit. `decode_one_paged_device` accepts one
+preloaded UInt32 ID, the RoPE row for absolute position `P`, one packed
+`[physical_blocks,A,block_tokens,D]` K/V pair per layer, a shared immutable device
+block table, and an exact history length. Every layer reads the packed history plus
+its uncommitted current K/V through paged-tail attention. Two same-stream D2D
+copies per layer assemble the returned `[L,A,D]` K/V; `[1,V]` logits and K/V are
+returned only after all work succeeds. The model never changes page mappings or
+payloads. `CudaPagedKvCache` can lend those inputs under a mapping lease and commit
+the result only after this synchronous call returns successfully.
+
+Before the embedding launch, the model validates the complete history: layer
+count, device, dtype, rank, contiguity, common physical/page geometry, head width,
+table device/capacity, exact logical coverage, and remaining context capacity.
+Visible page slots are a caller initialization contract. Every input and the table
+must remain alive through the call; the synchronous return is their lifetime
+boundary. The host overload additionally validates the token and constructs the
+position-specific RoPE row before delegating to the device path.
+
+Six hardware-gated model tests cover full prefill plus paged decode at position
+zero and across three odd/reversed pages. Decode compares logits and all-layer K/V
+with the CPU paged-cache oracle, poisons unused page slack with NaNs, validates
+host/device metadata and a moved stream before execution, and retains the invalid-
+device-ID NaN sentinel test. The additional integration case executes five
+successive cache-lease/decode/commit transactions against CPU full-prefix
+recomputation and verifies a failed decode cannot advance cache length. They compile
+and discover successfully but have not executed without an NVIDIA device. No CUDA
+correctness or performance result is claimed.
 
 ## Prefill, cached decode, and generation
 
@@ -122,6 +146,25 @@ appending prompt tokens. Decode computes the complete token result before append
 Therefore ordinary validation/model failures leave cache length unchanged. Cache
 append itself is a prevalidated, fixed-capacity copy with no allocation after the
 model step.
+
+`CudaLlamaGenerator` provides the same token-ID session boundary as a
+compile-validated CUDA baseline. It owns a move-only `CudaLlamaModel`, one stream
+created on that model's device, a fixed `CudaPagedKvCache` sized for the context,
+and one cache-tagged sequence. Prompt prefill is intentionally sequential until a
+bulk CUDA prefill artifact path exists: each prompt token runs paged decode and
+commits into a private staging sequence. Only the fully completed table replaces
+the session's original empty table, so input/model/cache failures cannot expose a
+partial prompt as prefilled state. One-token decode retains the same model-result
+then cache-append transaction boundary.
+
+Greedy CUDA generation copies each completed logits row to CPU and calls the
+shared finite-value, lowest-index selector. This makes the transfer and
+synchronization cost explicit; no device-side sampler is implied. Three
+hardware-gated tests compare prefill/decode with CPU full-prefix recomputation,
+force exact tied greedy outcomes with a zero LM head, exercise maximum/EOS/context
+stops, and reject invalid session/token/block geometry without page advancement.
+They compile in CUDA Release and Debug modes but have not run on an NVIDIA device.
+No CUDA generation correctness or performance result is claimed.
 
 The first decode baseline retrieved an owning compact K/V snapshot per layer and
 then copied that snapshot into a second buffer with a current-token tail.
@@ -562,15 +605,14 @@ evidence. The separate bounded validator then exercises the exact source-layout
 math, failure detection, and the revision-pinned public checkpoint described
 above; tokenizer/text-prompt behavior remains untested.
 
-Validation on 2026-08-24 through CUDA-prefill test commit `ecce37d`
-(implementation commit `8706c8e`):
+Repository-wide validation on 2026-08-24:
 
-- Debug, Release, and Apple Clang ASan/UBSan CPU suites: 197/197 tests passed;
+- Debug, Release, and Apple Clang ASan/UBSan CPU suites: 200/200 tests passed;
 - all Release tests and benchmark smoke workloads passed;
 - CUDA 12.6.85/GCC 13.2 warnings-as-errors build: all targets compiled and all
-  196 hardware-independent tests passed;
-- 75 GPU-required tests/benchmark gates remained explicitly skipped because the
-  compile container has no NVIDIA driver or device (271 registered tests total);
+  199 hardware-independent tests passed;
+- 93 GPU-required tests/benchmark gates remained explicitly skipped because the
+  compile container has no NVIDIA driver or device (292 registered tests total);
 - the CUDA container lacks Python/NumPy, so its converter integration test was not
   registered; that test passed in every native CPU configuration.
 
@@ -616,7 +658,9 @@ results, not evidence about a future CUDA paged-attention kernel.
 ## Deliberate limitations
 
 - CPU Float32 is the only hardware-validated complete model execution path. CUDA
-  Float32 full prefill is compile-validated only and has no decode/session path.
+  Float32 full prefill and one-token paged decode are compile-validated only and
+  have a compile-validated synchronous GPU-owned cache path but no runtime session
+  or physical-hardware validation.
 - Complete new prompts use one full prefill; chunked runtime prefill falls back to
   sequential one-token execution rather than a multi-token continuation kernel.
 - The standalone generator's contiguous-cache decode materializes one
@@ -625,9 +669,12 @@ results, not evidence about a future CUDA paged-attention kernel.
 - The standalone generator supports one sequence and greedy selection only. The
   runtime supports several paged sessions but executes work items serially and has
   no sampling or fused tensor batch.
-- CUDA prefill synchronizes after every layer and final projection, uses direct
-  Tensor allocations for all temporaries, and is not connected to HelixAllocator,
-  a K/V cache, scheduler, prefix reuse, generation, or the runtime engine.
+- CUDA prefill and decode synchronize after every layer and final projection, use
+  direct Tensor allocations for all temporaries, and are not connected to
+  HelixAllocator, the scheduler, prefix reuse, generation, or the runtime engine.
+  Decode may borrow already packed page tensors directly or from
+  `CudaPagedKvCache`; cache append adds another synchronization and `2*L*H` D2D
+  copies per token.
 - No tokenizer or text-prompt path. One public tiny-random checkpoint is validated
   from raw token IDs through full logits, not through meaningful text generation.
 - The offline converter supports only the documented standard Llama safetensors

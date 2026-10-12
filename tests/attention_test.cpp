@@ -4,6 +4,8 @@
 #include <cmath>
 #include <cstddef>
 #include <gtest/gtest.h>
+#include <limits>
+#include <memory>
 #include <span>
 
 namespace helix::attention::cpu {
@@ -58,6 +60,22 @@ TEST(AttentionTest, QueryOffsetModelsSingleTokenDecodeAgainstFullKvHistory) {
   const float expected_second =
       static_cast<float>((2.0 + 20.0 * std::exp(1.0) + 200.0 * std::exp(2.0)) / denominator);
   expect_values_near(output, std::array{expected_first, expected_second}, 2.0e-5F);
+}
+
+TEST(AttentionTest, CausalMaskDoesNotReadFutureNonFiniteValues) {
+  const float nan = std::numeric_limits<float>::quiet_NaN();
+  const Tensor query = Tensor::from_values({1, 1, 1}, std::array{1.0F});
+  const Tensor key = Tensor::from_values({1, 2, 1}, std::array{0.0F, nan});
+  const Tensor value = Tensor::from_values({1, 2, 2}, std::array{3.0F, 4.0F, nan, nan});
+
+  Tensor output = Tensor::empty({1, 1, 2});
+  Tensor workspace = Tensor::empty({1, 1, 2});
+  scaled_dot_product_attention_out(query, key, value, 0, output, workspace);
+  expect_values_near(output, std::array{3.0F, 4.0F});
+  expect_values_near(workspace, std::array{1.0F, 0.0F});
+
+  scaled_dot_product_attention_dimension_major_out(query, key, value, 0, output, workspace);
+  expect_values_near(output, std::array{3.0F, 4.0F});
 }
 
 TEST(AttentionTest, HandlesMultipleHeadsOddDimensionsAndEmptyOutput) {
@@ -131,6 +149,20 @@ TEST(AttentionTest, RejectsShapeOffsetDTypeAndAliasingViolations) {
 
   Tensor wrong_output = Tensor::zeros({1, 2, 3});
   EXPECT_THROW(scaled_dot_product_attention_out(query, key, value, 0, wrong_output, workspace),
+               Error);
+
+  struct alignas(256) Buffer final {
+    std::array<std::byte, 768> bytes{};
+  };
+  const auto owner = std::make_shared<Buffer>();
+  const Tensor partial_query = Tensor::from_mutable_cpu_buffer(
+      {1, 1, 128}, DType::kFloat32, owner->bytes.data(), 512, owner, 256);
+  Tensor partial_output = Tensor::from_mutable_cpu_buffer(
+      {1, 1, 128}, DType::kFloat32, owner->bytes.data() + 256, 512, owner, 256);
+  Tensor partial_workspace = Tensor::zeros({1, 1, 1});
+  EXPECT_THROW(scaled_dot_product_attention_out(partial_query, Tensor::zeros({1, 1, 128}),
+                                                Tensor::zeros({1, 1, 128}), 0, partial_output,
+                                                partial_workspace),
                Error);
 }
 
